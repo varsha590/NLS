@@ -1,0 +1,16 @@
+{
+  "catalog": {
+    "orders.status": [
+      "cancelled",
+      "completed",
+      "pending",
+      "refunded"
+    ],
+    "payments.payment_status": [
+      "cancelled",
+      "paid",
+      "pending",
+      "refunded"
+    ]
+  }
+}

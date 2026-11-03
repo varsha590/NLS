@@ -1,0 +1,429 @@
+thresholds:
+  accept_score: 0.88
+  ambiguous_gap: 0.08
+  min_score: 0.65
+  max_candidates: 5
+
+# Columns whose distinct values are worth indexing for value matching.
+# Library schema: books.language/format, members.membership_type/status,
+# loans.status, fines.status, book_copies.condition/status, staff.role/position,
+# branches.city, publishers.country, authors.nationality, categories.category_name
+value_column_patterns:
+  suffixes:
+    - _status
+    - _type
+    - _category
+    - _genre
+    - _language
+    - _format
+    - _condition
+    - _role
+  exact_names:
+    - city
+    - country
+    - state
+    - region
+    - status
+    - category
+    - genre
+    - language
+    - format
+    - condition
+    - role
+    - position
+    - nationality
+    - location
+
+excluded_column_names:
+  - table_name
+  - column_name
+  - description
+  # - name
+  # - first_name
+  # - last_name
+  # - full_name
+  - email
+  - phone
+  - phone_number
+  - address
+  - street
+  - postal_code
+  - zip_code
+  - isbn
+  - notes
+  - embedding
+  - relationships
+  - business_relevance
+
+# Generic aggregation vocabulary. These words are never treated as values and
+# never become mentions.
+metric_value_names:
+  - total
+  - totals
+  - count
+  - counts
+  - counting
+  - sum
+  - sums
+  - average
+  - averages
+  - avg
+  - mean
+  - means
+  - median
+  - medians
+  - minimum
+  - minimums
+  - maximum
+  - maximums
+  - min
+  - max
+  - percentage
+  - percent
+  - amount
+  - amounts
+
+# Words that double as a metric and as a real value. They only produce a hint
+# when an adjacent cue word names the semantic type they belong to.
+# No such ambiguous terms in the library schema, so this is empty.
+# Example if you ever need one: "fiction": [category]
+cued_metric_terms: {}
+
+excluded_terms:
+  - a
+  - about
+  - above
+  - after
+  - again
+  - against
+  - all
+  - also
+  - am
+  - an
+  - and
+  - another
+  - any
+  - are
+  - around
+  - as
+  - at
+  - be
+  - because
+  - been
+  - before
+  - being
+  - below
+  - between
+  - both
+  - but
+  - by
+  - can
+  - cannot
+  - could
+  - date
+  - dates
+  - day
+  - days
+  - daily
+  - december
+  - each
+  - either
+  - else
+  - etc
+  - even
+  - ever
+  - every
+  - february
+  - for
+  - from
+  - further
+  - generated
+  - give
+  - given
+  - gives
+  - had
+  - has
+  - have
+  - having
+  - he
+  - her
+  - here
+  - hers
+  - herself
+  - him
+  - himself
+  - his
+  - hour
+  - hours
+  - how
+  - i
+  - if
+  - in
+  - into
+  - is
+  - it
+  - its
+  - itself
+  - january
+  - july
+  - june
+  - last
+  - least
+  - less
+  - let
+  - like
+  - list
+  - made
+  - make
+  - many
+  - march
+  - "may"
+  - me
+  - might
+  - mine
+  - month
+  - monthly
+  - months
+  - more
+  - most
+  - much
+  - must
+  - my
+  - myself
+  - near
+  - need
+  - neither
+  - never
+  - "no"
+  - nor
+  - not
+  - now
+  - number
+  - numbers
+  - of
+  - "off"
+  - "on"
+  - once
+  - one
+  - only
+  - onto
+  - or
+  - other
+  - others
+  - our
+  - ours
+  - ourselves
+  - out
+  - over
+  - own
+  - part
+  - per
+  - period
+  - please
+  - quarterly
+  - rather
+  - same
+  - second
+  - seconds
+  - see
+  - set
+  - several
+  - she
+  - should
+  - show
+  - shows
+  - since
+  - so
+  - some
+  - something
+  - soon
+  - still
+  - such
+  - sum
+  - sums
+  - than
+  - that
+  - the
+  - their
+  - theirs
+  - them
+  - themselves
+  - then
+  - there
+  - these
+  - they
+  - this
+  - those
+  - though
+  - through
+  - time
+  - times
+  - to
+  - today
+  - together
+  - tomorrow
+  - too
+  - total
+  - totals
+  - under
+  - until
+  - up
+  - us
+  - use
+  - used
+  - very
+  - was
+  - we
+  - week
+  - weekend
+  - weekly
+  - weeks
+  - were
+  - what
+  - when
+  - where
+  - which
+  - while
+  - who
+  - whom
+  - whose
+  - why
+  - will
+  - with
+  - within
+  - without
+  - would
+  - year
+  - yearly
+  - years
+  - yesterday
+  - you
+  - your
+  - yours
+  - yourself
+  - yourselves
+  - highest
+  - average
+  - avg
+  - lowest
+  - quarter
+  - quarters
+  - annual
+  - annually
+  - got
+  - jan
+  - feb
+  - mar
+  - apr
+  - jun
+  - jul
+  - aug
+  - sep
+  - sept
+  - oct
+  - nov
+  - dec
+  - august
+  - september
+  - october
+  - november
+  - monday
+  - tuesday
+  - wednesday
+  - thursday
+  - friday
+  - saturday
+  - sunday
+  # Library schema nouns/verbs: these name tables or actions, not values.
+  # Status-like words (borrowed, returned, overdue, paid, unpaid, active) are
+  # deliberately NOT listed because they are real values.
+  # - book
+  # - books
+  # - author
+  # - authors
+  # - member
+  # - member_name
+  # - name
+  # # - members
+  # - loan
+  # - loans
+  # - fine
+  # - fines
+  # - branch
+  # - branches
+  # - publisher
+  # - publishers
+  # - staff
+  # - library
+  # - libraries
+  # - copy
+  # - copies
+  # - title
+  # - titles
+  # - written
+  # - wrote
+  # - published
+  # - borrow
+  # - borrows
+  # - issued
+  # - category
+  # - categories
+  # - genre
+  # - genres
+
+cue_aliases:
+  category:
+    - category
+    - categories
+    - genre
+    - genres
+    - subject
+  publisher:
+    - publisher
+    - publishers
+    - press
+    - imprint
+  branch:
+    - branch
+    - branches
+    - library
+    - libraries
+  city:
+    - city
+    - cities
+    - location
+    - town
+  country:
+    - country
+    - countries
+    - nation
+  role:
+    - role
+    - position
+    - designation
+  language:
+    - language
+    - languages
+
+# Explicit allowlist for value columns (replaces generic _name suffix)
+value_column_allowlist:
+  - category_name
+  - publisher_name
+  - branch_name
+  - author_name
+  - city
+  - country
+  - state
+  - region
+  - status
+  - category
+  - genre
+  - language
+  - format
+  - condition
+  - role
+  - position
+  - nationality
+  - membership_type
+  - location
+  - name

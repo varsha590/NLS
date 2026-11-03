@@ -1,0 +1,74 @@
+{
+  "schema_hash": "9bc83152b5ae58a831b642766da9d3c221dbe3e30ad01210e42d3981894365cd",
+  "model_name": "sentence-transformers/all-MiniLM-L6-v2",
+  "embedding_dim": 384,
+  "top_k": 10,
+  "schema_version": "1.0",
+  "documents": [
+    {
+      "id": "table:departments",
+      "table_name": "departments",
+      "description": "Organizational departments within the company (Engineering, Sales, Marketing, Human Resources, Finance).",
+      "business_relevance": "- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "doc_text": "Table: departments\nDescription: Organizational departments within the company (Engineering, Sales, Marketing, Human Resources, Finance).\n\nColumns:\n- department_id: INTEGER (primary key)\n- department_name: VARCHAR(100)\n- description: VARCHAR(255)\n- created_at: TIMESTAMP\n\nRelationships:\n\nBusiness relevance:\n- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "embedding_id": "table:departments"
+    },
+    {
+      "id": "table:employees",
+      "table_name": "employees",
+      "description": "Company employees assigned to departments.",
+      "business_relevance": "- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "doc_text": "Table: employees\nDescription: Company employees assigned to departments.\n\nColumns:\n- employee_id: INTEGER (primary key)\n- employee_name: VARCHAR(100)\n- department_id: INTEGER (foreign key \u2192 departments.department_id)\n- salary: DOUBLE PRECISION\n- hire_date: TIMESTAMP\n- created_at: TIMESTAMP\n\nRelationships:\n- employees.department_id \u2192 departments.department_id\n\nBusiness relevance:\n- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "embedding_id": "table:employees"
+    },
+    {
+      "id": "table:categories",
+      "table_name": "categories",
+      "description": "Product categories (Electronics, Clothing, Books, Home & Garden, Sports & Outdoors).",
+      "business_relevance": "- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "doc_text": "Table: categories\nDescription: Product categories (Electronics, Clothing, Books, Home & Garden, Sports & Outdoors).\n\nColumns:\n- category_id: INTEGER (primary key)\n- category_name: VARCHAR(100)\n- description: VARCHAR(255)\n- created_at: TIMESTAMP\n\nRelationships:\n\nBusiness relevance:\n- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "embedding_id": "table:categories"
+    },
+    {
+      "id": "table:products",
+      "table_name": "products",
+      "description": "Products available for purchase (e.g., Laptop Pro, Mechanical Keyboard, Wireless Mouse, etc.).",
+      "business_relevance": "- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "doc_text": "Table: products\nDescription: Products available for purchase (e.g., Laptop Pro, Mechanical Keyboard, Wireless Mouse, etc.).\n\nColumns:\n- product_id: INTEGER (primary key)\n- product_name: VARCHAR(100)\n- category_id: INTEGER (foreign key \u2192 categories.category_id)\n- price: DOUBLE PRECISION\n- created_at: TIMESTAMP\n\nRelationships:\n- products.category_id \u2192 categories.category_id\n\nBusiness relevance:\n- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "embedding_id": "table:products"
+    },
+    {
+      "id": "table:customers",
+      "table_name": "customers",
+      "description": "Customer records for the e-commerce platform.",
+      "business_relevance": "- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "doc_text": "Table: customers\nDescription: Customer records for the e-commerce platform.\n\nColumns:\n- customer_id: INTEGER (primary key)\n- customer_name: VARCHAR(100)\n- email: VARCHAR(200)\n- city: VARCHAR(100)\n- created_at: TIMESTAMP\n\nRelationships:\n\nBusiness relevance:\n- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "embedding_id": "table:customers"
+    },
+    {
+      "id": "table:orders",
+      "table_name": "orders",
+      "description": "Customer orders placed on the platform.",
+      "business_relevance": "- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "doc_text": "Table: orders\nDescription: Customer orders placed on the platform.\n\nColumns:\n- order_id: INTEGER (primary key)\n- customer_id: INTEGER (foreign key \u2192 customers.customer_id)\n- order_date: TIMESTAMP\n- status: VARCHAR(50)\n- created_at: TIMESTAMP\n\nRelationships:\n- orders.customer_id \u2192 customers.customer_id\n\nBusiness relevance:\n- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "embedding_id": "table:orders"
+    },
+    {
+      "id": "table:order_items",
+      "table_name": "order_items",
+      "description": "Individual products purchased within an order.",
+      "business_relevance": "- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "doc_text": "Table: order_items\nDescription: Individual products purchased within an order.\n\nColumns:\n- order_item_id: INTEGER (primary key)\n- order_id: INTEGER (foreign key \u2192 orders.order_id)\n- product_id: INTEGER (foreign key \u2192 products.product_id)\n- quantity: INTEGER\n- unit_price: DOUBLE PRECISION\n- created_at: TIMESTAMP\n\nRelationships:\n- order_items.order_id \u2192 orders.order_id\n- order_items.product_id \u2192 products.product_id\n\nBusiness relevance:\n- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "embedding_id": "table:order_items"
+    },
+    {
+      "id": "table:payments",
+      "table_name": "payments",
+      "description": "Payment records associated with orders.",
+      "business_relevance": "- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "doc_text": "Table: payments\nDescription: Payment records associated with orders.\n\nColumns:\n- payment_id: INTEGER (primary key)\n- order_id: INTEGER (foreign key \u2192 orders.order_id)\n- amount: DOUBLE PRECISION\n- payment_status: VARCHAR(50)\n- payment_date: TIMESTAMP\n- created_at: TIMESTAMP\n\nRelationships:\n- payments.order_id \u2192 orders.order_id\n\nBusiness relevance:\n- Can be used to calculate item-level sales using quantity multiplied by unit_price.",
+      "embedding_id": "table:payments"
+    }
+  ],
+  "embeddings_stored": 8
+}

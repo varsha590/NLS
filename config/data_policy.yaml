@@ -1,0 +1,17 @@
+columns:
+  customers.email: block
+default_mask: "partial"
+auto_block_patterns:
+  - email
+  - phone 
+  - contact
+  - mobile
+  - address
+  - password
+  - ssn
+  - aadhaar
+  - pan
+  - token
+  - secret
+value_index:
+  allowed_name_columns: []
