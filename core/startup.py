@@ -3,26 +3,81 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from catalog.introspect import introspect_catalog
 from config.settings import Settings
-from db.adapter import DatabaseAdapter, EmbeddingStore
+from db.adapter import DatabaseAdapter
 from llm.generator import GroqGenerator
 from pipeline.orchestrator import TextToSQLPipeline
 from retrieval.embeddings import EmbeddingModel
 from retrieval.examples import ExampleStore
+from retrieval.local_store import LocalVectorStore
 from retrieval.schema_retriever import HybridSchemaRetriever
 from retrieval.value_index import ValueIndex
+from schema.documents import (
+    build_column_document,
+    build_relationship_document,
+    build_table_document,
+)
+from schema.metadata import is_internal_table_name
+
 LOGGER = logging.getLogger(__name__)
 _runtime: dict[str, Any] = {}
-_catalog_fingerprints: set[tuple[str, str]] = set()
+
+
+def _config_policy_hash(threshold: int) -> str:
+    """Fingerprint policy/config inputs that affect index eligibility and content."""
+    digest = hashlib.sha256()
+    root = Path(__file__).resolve().parents[1]
+    for relative_path in ("config/data_policy.yaml", "config/value_resolution.yaml"):
+        digest.update((root / relative_path).read_bytes())
+    digest.update(str(threshold).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _schema_records(metadata: Any) -> list[dict[str, Any]]:
+    """Build schema-only documents from unprotected catalog structure."""
+    records: list[dict[str, Any]] = []
+    for table in metadata.tables.values():
+        if is_internal_table_name(table.name):
+            continue
+        records.append({
+            "table_name": table.name,
+            "column_name": None,
+            "metadata_type": "table_ddl",
+            "content": build_table_document(table),
+        })
+        for column in table.columns:
+            content = build_column_document(table, column)
+            if content:
+                records.append({
+                    "table_name": table.name,
+                    "column_name": column.name,
+                    "metadata_type": "column_description",
+                    "content": content,
+                })
+        for index, relation in enumerate(table.foreign_keys):
+            content = build_relationship_document(table, relation)
+            if content:
+                column_name = (
+                    relation.get("column")
+                    or relation.get("local_column")
+                    or f"relationship_{index}"
+                )
+                records.append({
+                    "table_name": table.name,
+                    "column_name": column_name,
+                    "metadata_type": "relationship",
+                    "content": content,
+                })
+    return records
 
 
 def init_app(force: bool = False) -> dict[str, Any]:
-    """Connect, introspect, and locally index the configured database schema."""
+    """Connect read-only, introspect, and locally index the configured database."""
     settings = Settings.from_env()
     adapter = DatabaseAdapter(settings.database_url, settings.query_timeout_seconds)
     connection = adapter.connect()
@@ -31,62 +86,50 @@ def init_app(force: bool = False) -> dict[str, Any]:
     finally:
         connection.close()
 
-    adapter.ensure_pgvector()
-
     metadata = introspect_catalog(
         adapter.engine,
         allowed_schemas=settings.allowed_schemas,
         excluded_tables=settings.excluded_tables,
+        sample_limit=0,
     )
-    schema_payload = metadata.to_dict()
-    schema_hash = hashlib.sha256(
-        json.dumps(schema_payload, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()
-    catalog_fingerprint = (adapter.namespace(), schema_hash)
-    previously_indexed = not force and catalog_fingerprint in _catalog_fingerprints
-
-    embedding_store = EmbeddingStore(adapter)
-
-    schema_count = embedding_store.count_schema()
-
-    cached_is_current = not force and schema_count > 0
-
     embedding_model = EmbeddingModel(settings.embedding_model)
+    local_store = LocalVectorStore(
+        root=settings.vector_store_path,
+        namespace=adapter.namespace(),
+        model_name=embedding_model.model_name,
+        dimension=embedding_model.dim,
+        policy_hash=_config_policy_hash(settings.value_cardinality_threshold),
+        example_candidate_limit=settings.example_candidate_limit,
+    )
+    had_local_index = local_store.count_schema() > 0 or local_store.count_values() > 0
+    if force:
+        local_store.clear_indexes()
 
-    if not cached_is_current:
-        # Build schema embeddings from introspected metadata
-        schema_ok = embedding_store.build_schema_embeddings(metadata)
-        # Build value embeddings from database values
-        value_ok = embedding_store.build_value_embeddings(metadata, embedding_model, settings.value_cardinality_threshold)
-    else:
-        # Refresh what changed - only update rows that differ
-        schema_ok = embedding_store.build_schema_embeddings(metadata)
-        value_ok = embedding_store.build_value_embeddings(metadata, embedding_model, settings.value_cardinality_threshold)
-
-    # Track whether the index build succeeded fully (0h fix: surface partial failures).
-    index_complete = schema_ok and value_ok
-    if not index_complete:
-        LOGGER.warning(
-            "Index build completed with errors; index may be incomplete",
-            extra={"dialect": adapter.get_dialect()},
-        )
-
-    # Create ValueIndex with embedding_store for value resolution
+    schema_ok = local_store.build_schema(_schema_records(metadata), embedding_model)
     value_index = ValueIndex(
         adapter=adapter,
         metadata=metadata,
         cardinality_threshold=settings.value_cardinality_threshold,
         embedder=embedding_model,
-        storage_path=settings.vector_store_path,
-        embedding_store=embedding_store,
+        local_store=local_store,
     )
     value_index.build()
-    _catalog_fingerprints.add(catalog_fingerprint)
+    value_ok = value_index.build_success
+    index_complete = schema_ok and value_ok
+    if not index_complete:
+        LOGGER.warning(
+            "Local index build completed with errors",
+            extra={"dialect": adapter.get_dialect()},
+        )
 
-    retriever = HybridSchemaRetriever(metadata, embedding_model, embedding_store=embedding_store)
-
+    retriever = HybridSchemaRetriever(metadata, embedding_model, local_store=local_store)
     generator = GroqGenerator(settings.groq_api_key, settings.llm_model)
-    examples = ExampleStore(settings.vector_store_path, adapter)
+    examples = ExampleStore(
+        settings.vector_store_path,
+        adapter,
+        local_store=local_store,
+        candidate_limit=settings.example_candidate_limit,
+    )
     pipeline = TextToSQLPipeline(
         adapter=adapter,
         metadata=metadata,
@@ -100,22 +143,19 @@ def init_app(force: bool = False) -> dict[str, Any]:
         value_top_k=settings.value_top_k,
     )
 
-    # Store resources in runtime
-    global _runtime
-    # Determine catalog status (0h fix: show "incomplete" when index build had errors).
-    if not index_complete:
-        catalog_status = "incomplete"
-    elif schema_count > 0 or previously_indexed:
-        catalog_status = "cached"
-    else:
-        catalog_status = "indexed"
-    _runtime = {
+    catalog_status = (
+        "incomplete"
+        if not index_complete
+        else "cached" if had_local_index and not force
+        else "indexed"
+    )
+    runtime = {
         "settings": settings,
         "adapter": adapter,
         "engine": adapter.engine,
         "metadata": metadata,
         "retriever": retriever,
-        "embedding_store": embedding_store,
+        "local_store": local_store,
         "value_index": value_index,
         "examples": examples,
         "pipeline": pipeline,
@@ -123,11 +163,13 @@ def init_app(force: bool = False) -> dict[str, Any]:
         "catalog_status": catalog_status,
         "index_complete": index_complete,
     }
+    _runtime.clear()
+    _runtime.update(runtime)
     LOGGER.info(
         "Application ready",
         extra={"dialect": adapter.get_dialect(), "indexed_tables": len(metadata.tables)},
     )
-    return _runtime
+    return runtime
 
 
 def get_runtime() -> dict[str, Any]:

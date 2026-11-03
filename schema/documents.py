@@ -9,7 +9,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from config.data_policy import is_blocked
+from config.data_policy import is_blocked, is_masked
+
+
+def _is_protected(table_name: str, column_name: str) -> bool:
+    column_key = f"{table_name}.{column_name}"
+    return is_blocked(column_key) or is_masked(column_key)
 
 
 def build_table_document(table: Any) -> str:
@@ -17,7 +22,7 @@ def build_table_document(table: Any) -> str:
     column_text = [
         f"{column.name} {column.data_type} {column.comment or ''}".strip()
         for column in table.columns
-        if not is_blocked(f"{table.name}.{column.name}")
+        if not _is_protected(table.name, column.name)
     ]
     parts = [table.name, table.description or f"Table {table.name}"]
     if column_text:
@@ -27,7 +32,7 @@ def build_table_document(table: Any) -> str:
 
 def build_column_document(table: Any, column: Any) -> str:
     """Return the retrievable text for one column, excluding sample values."""
-    if is_blocked(f"{table.name}.{column.name}"):
+    if _is_protected(table.name, column.name):
         return ""
     parts = [table.name, column.name, column.data_type, column.comment or ""]
     return " ".join(part for part in parts if part).strip()
@@ -38,6 +43,10 @@ def build_relationship_document(table: Any, relation: dict[str, Any]) -> str:
     local = relation.get("column") or relation.get("local_column") or ""
     remote_table = relation.get("remote_table") or ""
     remote_column = relation.get("remote_column") or ""
+    if (local and _is_protected(table.name, local)) or (
+        remote_table and remote_column and _is_protected(remote_table, remote_column)
+    ):
+        return ""
     return " ".join(
         [table.name, local, "references", remote_table, remote_column]
     ).strip()

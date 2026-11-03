@@ -1,37 +1,41 @@
 # Natural Language to SQL
 
-A modular text-to-SQL application built with Streamlit, SQLAlchemy, local sentence-transformer embeddings, Groq, and SQLGlot. The connected database dialect is detected from SQLAlchemy; schema and vector indexes are stored locally, not in the target database.
+A Streamlit text-to-SQL application using SQLAlchemy, local sentence-transformer embeddings, FAISS, Groq, and SQLGlot. Schema and value vectors and verified examples are stored in local namespace files; the target database is read-only.
 
 ## Configure a database
 
-Use Python 3.10 or newer. Copy `.env.example` to `.env`, set `DATABASE_URL`, and install the optional SQLAlchemy driver matching that URL. To switch between PostgreSQL, MySQL, SQLite, or SQL Server, change `DATABASE_URL` and install the corresponding driver; no application code or dialect setting needs to change.
-
-SQLite requires no external server or driver:
+Use Python 3.10 or newer. Copy `.env.example` to `.env`, set `DATABASE_URL` to a read-only account, add `GROQ_API_KEY`, and install the SQLAlchemy driver matching the URL. SQLite requires no external server:
 
 ```env
 DATABASE_URL=sqlite:///./example.db
 ```
 
-On first start, the app introspects the configured schema, samples up to five values from each column, builds local embeddings, and stores the catalog under a credential-free database namespace inside `VECTOR_STORE_PATH`. A schema hash and embedding-model name determine whether the index can be reused. Use **Re-index schema** in the sidebar or run `python reindex.py` to refresh it. The application does not create, alter, or seed target database tables.
+At startup the application runs metadata inspection and bounded `SELECT` queries to classify/index eligible columns. It does not create, alter, seed, or write target database objects. Introspection collects no sample values. Schema vectors, VALUE_LOW value vectors, metadata, embedding cache, and verified examples live in `.vector_store/<namespace>/`, where the namespace is a hash of the credential-free database URL.
 
-Table descriptions used for schema retrieval are taken from the database's own table comments where present. If a table has no comment, a neutral fallback description is generated. Business-relevance hints in schema documents are derived automatically from the table's foreign-key relationships; no domain-specific text is hard-coded. To provide richer descriptions, add comments directly to your database tables or run `catalog.describe.describe_catalog` to generate them with an LLM.
+The store uses exact cosine search over L2-normalized float32 vectors. The embedding dimension is read from the selected model. Unchanged content reuses the local embedding cache; startup still re-inspects the schema and scans eligible low-cardinality columns. Only VALUE_LOW canonical values are stored in the value metadata; BLOCKED, MASKED, and VALUE_HIGH values are not embedded or persisted.
 
-`GROQ_API_KEY` enables SQL generation. `LLM_MODEL` selects the Groq model. `EMBEDDING_MODEL`, `VECTOR_STORE_PATH`, `SCHEMA_TOP_K`, `VALUE_TOP_K`, `VALUE_CARDINALITY_THRESHOLD`, `MAX_ROWS`, `QUERY_TIMEOUT_SECONDS`, and `MAX_RETRIES` configure retrieval and execution. `ALLOWED_SCHEMAS` and `EXCLUDED_TABLES` are optional comma-separated lists. Use `EXCLUDED_TABLES` to hide internal, legacy, or system tables that should not be visible to the LLM.
+Use **Re-index schema** in the sidebar or run `python reindex.py` to clear and rebuild schema/value indexes and the embedding cache for the current namespace. Verified examples and hints are retained. To reset a database namespace completely, stop the app and delete only its `.vector_store/<namespace>/` directory.
+
+`EMBEDDING_MODEL`, `VECTOR_STORE_PATH`, `SCHEMA_TOP_K`, `VALUE_TOP_K`, `VALUE_CARDINALITY_THRESHOLD`, `EXAMPLE_CANDIDATE_LIMIT`, `MAX_ROWS`, `QUERY_TIMEOUT_SECONDS`, and `MAX_RETRIES` configure indexing, retrieval, and execution. `EXAMPLE_CANDIDATE_LIMIT` defaults to 500 most recently saved examples before lexical ranking. `ALLOWED_SCHEMAS` and `EXCLUDED_TABLES` are optional comma-separated lists.
 
 ## Security boundary
 
-**The database account in `DATABASE_URL` MUST be read-only.** This is the primary security boundary. SQL validation is a second layer: it permits one SELECT, checks referenced tables and columns against the catalog, and adds or caps a row limit. Where supported, the adapter also starts a read-only transaction and sets a statement timeout. Application validation is not a substitute for database permissions. Credentials are excluded from local index namespaces and masked in displayed URLs.
+**The account in `DATABASE_URL` must be read-only.** Startup and query execution use only metadata reads, `SELECT`, `EXPLAIN`, and supported read-only or timeout session settings. Database permissions remain the authoritative boundary; application validation is an additional layer. Credentials are excluded from local namespaces and masked in displayed URLs.
 
-## Domain hints and verified examples
+The application no longer provisions or uses PostgreSQL vector tables. If an older PostgreSQL database still contains application-created `system_*` tables, review and drop them manually with an administrator after confirming they are no longer needed. The app does not drop them.
 
-Add optional business definitions and vocabulary to a root-level `hints.md`; the prompt builder includes it when present. Because `hints.md` is a single global file, its content should match the connected database's domain. When switching databases, update or clear `hints.md` so that stale domain context from a previous database does not mislead the LLM. After reviewing an answer, use **This was correct** to save its question and SQL as a verified example. Examples are stored locally per database namespace and are not shared across databases. Optional LLM descriptions can be generated with `catalog.describe.describe_catalog`; completion keys can be persisted through `CatalogStore` so interrupted work can resume.
+## Hints and examples
+
+Optional database-specific guidance can be placed at `.vector_store/<namespace>/hints.md`. If that file is absent, the prompt builder falls back to the repository's root `hints.md`. Keep both files free of row data and credentials. After reviewing a successful query, **This was correct** saves the question and SQL to the namespace's local `examples.sqlite`; the UI reports failure if persistence fails.
+
+Table comments are read as schema metadata. `catalog.describe.describe_catalog`, `db/init_db.py`, and `seed_library.py` are developer utilities; application startup does not import or run them. The legacy `CatalogStore` is used only by the optional description utility and is not the application index store.
 
 ## Install and run
 
 ```bash
 python -m pip install -r requirements.txt
 cp .env.example .env
-# Edit .env: set DATABASE_URL and GROQ_API_KEY.
+# Set DATABASE_URL to a read-only account and configure GROQ_API_KEY.
 streamlit run app.py
 ```
 
@@ -47,28 +51,20 @@ python -m pip install pyodbc              # SQL Server; also needs Microsoft's O
 
 ```bash
 python -m pytest tests/ -v
-python -m pytest tests/test_validator.py tests/test_pipeline_sqlite.py -v
 python eval/run_eval.py
 streamlit run app.py
 ```
 
-## Read-only database role (recommended for production)
+The SQLite pipeline tests use a mocked LLM. Optional MySQL read-only integration tests use `NLS_READONLY_MYSQL_URL` and skip when the SELECT-only database is unavailable. The evaluation fixture is populated separately in `eval/questions.json`.
 
-Create a read-only role with column-level grants that exclude blocked columns.
-Run manually; the app never executes this automatically.
+## Read-only database role
+
+Create a read-only role with grants appropriate to the schema. Run provisioning manually; the application never runs these statements.
 
 ```sql
--- PostgreSQL example (replace <your_role>, <your_database>, and column names to match your schema)
-CREATE ROLE <your_role> LOGIN PASSWORD 'change_me';
-GRANT CONNECT ON DATABASE <your_database> TO <your_role>;
-GRANT USAGE ON SCHEMA public TO <your_role>;
--- Grant SELECT on all tables, then revoke blocked columns
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO <your_role>;
--- Revoke access to sensitive columns (adjust to your schema)
-REVOKE SELECT (sensitive_column) ON your_table FROM <your_role>;
--- Repeat for any other blocked columns listed in config/data_policy.yaml
+-- Replace placeholders for your environment.
+CREATE ROLE <read_only_role> LOGIN PASSWORD 'replace_me';
+GRANT CONNECT ON DATABASE <database_name> TO <read_only_role>;
+GRANT USAGE ON SCHEMA <schema_name> TO <read_only_role>;
+GRANT SELECT ON ALL TABLES IN SCHEMA <schema_name> TO <read_only_role>;
 ```
-
-The app reads the connection user from the `DATABASE_URL` environment variable.
-
-The SQLite pipeline test uses a mocked LLM and requires neither Groq credentials nor a separate database. Add objects to `eval/questions.json` with `question` and read-only `expected_sql` fields; the eval runner validates both generated and expected queries, then compares unordered result sets on the configured database. The starter eval file is empty and reports that evaluation cases need to be added.

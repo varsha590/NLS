@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 import sqlalchemy as sa
@@ -185,6 +186,7 @@ class TextToSQLPipeline:
                     if self.value_index is None
                     or v.get("column") in self.value_index.values
                 ]
+                local_store = getattr(self.retriever, "local_store", None)
                 messages = build_prompt(
                     question=question,
                     dialect=self.adapter.get_dialect(),
@@ -192,6 +194,12 @@ class TextToSQLPipeline:
                     resolved_values=llm_resolved_values,
                     examples=examples,
                     correction=correction,
+                    hints_path=(
+                        local_store.path / "hints.md"
+                        if local_store is not None
+                        else Path(__file__).resolve().parents[1] / "hints.md"
+                    ),
+                    fallback_hints_path=Path(__file__).resolve().parents[1] / "hints.md",
                 )
                 generation_started = time.monotonic()
                 try:

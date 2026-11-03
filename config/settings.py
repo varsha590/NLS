@@ -33,6 +33,7 @@ class Settings:
     allowed_schemas: tuple[str, ...]
     excluded_tables: tuple[str, ...]
     value_cardinality_threshold: int
+    example_candidate_limit: int = 500
 
     @classmethod
     def from_env(cls, dotenv_path: str | None = None) -> "Settings":
@@ -71,5 +72,8 @@ class Settings:
             excluded_tables=_csv_setting("EXCLUDED_TABLES"),
             value_cardinality_threshold=max(
                 1, int(os.environ["VALUE_CARDINALITY_THRESHOLD"])
+            ),
+            example_candidate_limit=max(
+                1, int(os.getenv("EXAMPLE_CANDIDATE_LIMIT", "500"))
             ),
         )

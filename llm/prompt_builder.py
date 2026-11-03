@@ -14,10 +14,14 @@ def build_prompt(
     examples: list[dict[str, str]] | None = None,
     correction: str | None = None,
     hints_path: str | Path = "hints.md",
+    fallback_hints_path: str | Path | None = None,
 ) -> list[dict[str, str]]:
     """Build system and user messages from current catalog context and hints."""
+    selected_hints_path = Path(hints_path)
+    if not selected_hints_path.exists() and fallback_hints_path is not None:
+        selected_hints_path = Path(fallback_hints_path)
     try:
-        domain_hints = Path(hints_path).read_text(encoding="utf-8").strip()
+        domain_hints = selected_hints_path.read_text(encoding="utf-8").strip()
     except OSError:
         domain_hints = ""
     value_text = "\n".join(

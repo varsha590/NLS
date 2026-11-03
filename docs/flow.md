@@ -1,62 +1,61 @@
 # Runtime and Query Workflow
 
-This document describes the workflow implemented by the current source code. It avoids treating observations from one database or one model run as universal behavior.
+This document describes the Phase 2 implementation. Persistent vectors, embedding cache, examples, and optional per-database hints live under the local namespace directory. The target database is never used as an index or example store.
 
-## 1. Startup
+## Startup
 
-1. `app.py` imports `ui.app` and calls `main()`.
-2. `ui.app:load_runtime()` calls `core.startup:init_app()` through Streamlit's `st.cache_resource`. The resulting engine, indexes, and pipeline are cached in the Streamlit process. Changing `.env` while the process is running does not invalidate this cache; restart the app or clear the runtime cache to switch connections.
-3. `Settings.from_env()` loads `.env` without overriding values already present in the process environment. `DATABASE_URL` selects the SQLAlchemy dialect and driver. The model, embedding, retrieval, cardinality, timeout, retry, and row-limit settings are also loaded here.
-4. `DatabaseAdapter` connects and checks the connection with `SELECT 1`.
-5. On PostgreSQL, startup calls `ensure_pgvector()`. It creates the `vector` extension if needed, creates the `system_schema_embeddings`, `system_value_embeddings`, and `system_examples` tables, attempts HNSW index creation, and commits. This PostgreSQL-only setup runs again when `EmbeddingStore` is constructed; the DDL uses `IF NOT EXISTS`.
-6. `introspect_catalog()` discovers tables, columns, keys, comments, and bounded sample values. `ALLOWED_SCHEMAS` and `EXCLUDED_TABLES` control the catalog. There is no populated global exclusion set, so pre-existing internal or legacy tables remain visible unless excluded. PostgreSQL `system_*` tables created before introspection can therefore appear in the catalog and retrieval context.
-7. `EmbeddingStore` counts existing PostgreSQL schema vectors, then startup calls the schema- and value-embedding builders. Both sides of the current `cached_is_current` branch call these builders, which compare hashes, upsert changed entries, and prune stale entries. The status label is not evidence that startup skipped all indexing work.
-8. `ValueIndex.build()` gathers bounded distinct values from text columns allowed by `config/value_resolution.yaml` and the configured cardinality threshold. It writes its values and vectors to `.vector_store/<database-namespace>/values.json`; this file is currently written, not restored, at startup.
-9. Startup constructs the hybrid schema retriever, the Groq generator, the example store, and the query pipeline.
+1. `app.py` enters `ui.app:main()`. `ui.app:load_runtime()` calls `core.startup:init_app()` through `st.cache_resource`; the runtime is shared by Streamlit sessions in the process.
+2. `config.settings:Settings.from_env()` reads `DATABASE_URL`, the model and retrieval settings, and `EXAMPLE_CANDIDATE_LIMIT` (default 500). Database identity for local storage comes from `db.adapter:DatabaseAdapter.namespace()`, a SHA-256 prefix of the credential-free URL.
+3. `core.startup:init_app()` creates `DatabaseAdapter` and checks connectivity with `SELECT 1`. It does not create database objects or write target data.
+4. `catalog.introspect:introspect_catalog()` discovers tables, columns, keys, comments, and relationships with `sample_limit=0`. `ALLOWED_SCHEMAS` and `EXCLUDED_TABLES` filter the catalog. No row samples are collected.
+5. `retrieval.embeddings:EmbeddingModel` loads the configured local model and reports its embedding dimension. `core.startup:_config_policy_hash()` hashes the active policy/config files and cardinality threshold.
+6. `core.startup:_schema_records()` builds table, column, and relationship documents from catalog structure. `schema.documents:build_table_document()`, `build_column_document()`, and `build_relationship_document()` omit protected columns/references. No introspection sample values enter schema documents.
+7. `retrieval.local_store:LocalVectorStore.__init__()` opens `.vector_store/<namespace>/`, checks the manifest and paired FAISS/metadata checksums, and loads only valid indexes. `LocalVectorStore.build_schema()` reuses cached embeddings for unchanged content and atomically writes the schema index/metadata pair.
+8. `retrieval.value_index:ValueIndex.build()` rechecks bounded distinct counts at startup. `ENUM`/`SET` values come from reflected type metadata; ordinary eligible columns use bounded `SELECT DISTINCT`. Only columns classified `VALUE_LOW` are passed to `LocalVectorStore.build_values()`. `VALUE_HIGH`, `BLOCKED`, and `MASKED` values are not embedded or persisted. The content-hash/model embedding cache avoids re-embedding unchanged text.
+9. `core.startup:init_app()` sets `index_complete` from the actual schema and value build results, creates `HybridSchemaRetriever` and `ExampleStore` over the same local namespace, and builds the pipeline. `force=True` clears this namespace's schema/value indexes and embedding cache before rebuilding; examples and hints are retained.
 
-## 2. Persistence and Side Effects
+## Namespace Files
 
-PostgreSQL is the only dialect for which `EmbeddingStore` persists and searches vectors or verified examples. It stores schema vectors, value vectors, and question/SQL examples in the three `system_*` tables above. The namespace is derived from a credential-free form of the database URL, so separate database URLs do not share these records. On non-PostgreSQL dialects these `EmbeddingStore` operations are no-ops; schema retrieval falls back to lexical ranking and verified-example storage is unavailable.
+Files are scoped to one credential-free database namespace. FAISS row `i` corresponds to metadata row `i`; both sides are validated before use. Temporary files used for atomic replacement are transient.
 
-`values.json` is namespaced by the same credential-free database identity and contains the runtime value-index values and vectors, but the current startup does not read it back. `CatalogStore` is a compatibility class and is not used by `core.startup:init_app()`; its current `save()` method does not persist catalogs. The root-level `schema_index.json` and `value_catalog.json` are not loaded by the current startup path.
+| File | Contents |
+|---|---|
+| `schema.faiss` | `IndexFlatIP` over L2-normalized float32 table, column, and relationship vectors; exact cosine search. |
+| `schema_meta.json` | One entry per schema vector: schema-qualified table key, column or null, metadata type, and content hash. Schema text is not copied into this metadata file. |
+| `values.faiss` | `IndexFlatIP` over L2-normalized float32 vectors for VALUE_LOW values only. |
+| `values_meta.json` | One entry per value vector: schema-qualified table key, column, value hash, and canonical VALUE_LOW value text. |
+| `manifest.json` | Store format, embedding model name, model dimension, normalization version, config/policy hash, build time, and checksums for both index/metadata pairs. |
+| `embed_cache.sqlite` | Parameterized content-hash/model-name cache of normalized float32 vectors and dimensions. |
+| `examples.sqlite` | Verified question/SQL pairs with update timestamps; retrieval reads only the configured most-recent candidate limit. |
+| `hints.md` | Optional per-database prompt guidance. If absent, the root `hints.md` is used. |
 
-**Important privilege mismatch:** query execution is restricted to validated `SELECT` statements and uses dialect-specific read-only or timeout controls where available. However, PostgreSQL startup creates database objects and writes embedding rows; saving a verified example also writes to PostgreSQL. Therefore the current PostgreSQL application cannot operate with a strictly read-only database account as its only role. The README's requirement that `DATABASE_URL` use a read-only account, and its statement that startup creates no target-database objects, do not match the implementation. To enforce a read-only application role, PostgreSQL provisioning and index/example writes must be moved out of this runtime or separately authorized.
+`retrieval.local_store:LocalVectorStore._write_part()` writes and fsyncs temporary index and metadata files, renames the pair, then atomically updates the manifest. `_load_part()` validates checksums, row counts, index type, and dimension. A damaged part is discarded and rebuilt without discarding the other valid index. Model, dimension, normalization, or policy/config mismatch invalidates the schema/value indexes. The per-namespace reentrant lock serializes writes and protects search reads while a replacement index is swapped in.
 
-Read-only execution controls differ by dialect: PostgreSQL sets a read-only transaction and statement timeout; MySQL requests a read-only transaction and configures a statement timeout where supported; SQLite enables `PRAGMA query_only` and a progress-handler deadline; SQL Server sets `READ COMMITTED` isolation but does not set a read-only transaction here. Database permissions remain the authoritative safety boundary.
+## Per-Question Flow
 
-## 3. Per-Question Flow
+1. `ui.app:main()` submits a question to `pipeline.orchestrator:TextToSQLPipeline.run()`.
+2. `retrieval.value_index:ValueIndex.resolve_question()` matches against its in-memory view of VALUE_LOW values. Vector scoring uses one `LocalVectorStore.search_values()` call per scored mention, with table/column filtering; high-cardinality values are not stored or searched in the local value index. Ambiguous values return for confirmation before SQL generation.
+3. `TextToSQLPipeline.run()` obtains schema context from `retrieval.schema_retriever:HybridSchemaRetriever.retrieve()`. That method embeds the query locally and calls `LocalVectorStore.search_schema()`; semantic results are associated by schema-qualified table key and combined with lexical ranking. `compact_ddl()` renders the selected tables from the in-memory catalog and omits BLOCKED columns.
+4. `retrieval.examples:ExampleStore.retrieve()` requests at most `EXAMPLE_CANDIDATE_LIMIT` recent pairs from `LocalVectorStore.get_examples()` and ranks that bounded set with the existing lexical scorer.
+5. `pipeline.orchestrator:TextToSQLPipeline.run()` calls `llm.prompt_builder:build_prompt()`. It reads `.vector_store/<namespace>/hints.md` first and falls back to root `hints.md` only when the local file is absent. The prompt receives the question, selected DDL, allowed resolved values, hints, examples, and any correction text.
+6. `llm.generator:GroqGenerator.generate()` returns SQL. `validation.validator:validate_sql()` checks one read-only SELECT against catalog and policy constraints, verifies indexed literals, and applies the row limit. It calls `db.adapter:DatabaseAdapter.explain()` when supported.
+7. `db.adapter:DatabaseAdapter.run_readonly_query()` applies supported read-only/timeout session controls, executes the validated query, and fetches at most `MAX_ROWS` results. `pipeline.orchestrator:_build_answer_text()` formats results locally; query result rows are not sent to the LLM.
+8. `ui.app:_render_result()` enables the verified-example action only after successful validation and execution. `ExampleStore.save()` writes to the namespace-local SQLite file and returns a boolean; the UI reports failure rather than claiming success.
 
-1. The UI accepts a question and calls `TextToSQLPipeline.run()`.
-2. `ValueIndex.resolve_question()` searches configured low-cardinality text values. Ambiguous values return before SQL generation so the UI can ask for confirmation. Confirmed or skipped mentions are passed back into the pipeline.
-3. For questions containing configured metric vocabulary, the pipeline appends the configured activity-expansion terms to the **schema retrieval query**. The original user question is retained for SQL generation.
-4. `HybridSchemaRetriever.retrieve()` ranks tables using PostgreSQL vector similarity when available and lexical relevance, then expands directly related tables through foreign keys. It renders a compact DDL subset for the prompt.
-5. `ExampleStore.retrieve()` gets examples from PostgreSQL and ranks them lexically. On non-PostgreSQL dialects it returns no examples.
-6. `build_prompt()` supplies the dialect, original question, selected DDL, accepted value mappings, optional `hints.md`, retrieved examples, and any correction text to `GroqGenerator.generate()`.
-7. `validate_sql()` parses the generated SQL with SQLGlot. It requires one `SELECT`, rejects comments and mutating statements, checks table and column references against both the catalog and retrieved-table allowlist, applies data-policy blocks, verifies string literals against indexed values, and adds or caps `LIMIT` at `MAX_ROWS`. It attempts `EXPLAIN` when the adapter supports it; unavailable plans do not replace database permissions or query validation.
-8. The pipeline applies an additional check for activity/metric questions: filters on configured current-status or availability columns are rejected as proxies for historical activity. Configured metric-word literal errors and ordinary validation/execution errors can enter the bounded `MAX_RETRIES` correction loop. Ambiguous values still require user confirmation.
-9. `DatabaseAdapter.run_readonly_query()` applies available dialect controls, executes the validated SQL, and fetches no more than `MAX_ROWS` rows.
-10. The pipeline formats returned columns and values locally with `_build_answer_text()`. It does not call `GroqGenerator.summarize()` for query results.
-11. The UI renders the answer, SQL, rows, errors, and run details. **This was correct** saves the question and SQL as a verified example where PostgreSQL example storage is enabled.
+## Read-Only Target Guarantee
 
-## 4. LLM and Data Boundary
+`core.startup:init_app()`, catalog introspection, value classification, schema retrieval, and example persistence do not issue target-database DDL or DML. Target connections are used for connection checks, metadata inspection, bounded `SELECT`/`SELECT DISTINCT`, `EXPLAIN`, and supported read-only or timeout settings. SQLite also uses `PRAGMA query_only`; its inspector issues read-only metadata PRAGMAs. MySQL startup can run with a SELECT-only account. PostgreSQL uses only read-only transaction/session settings and `SELECT`/`EXPLAIN` statements in the application path. The before-cursor contract tests enforce this boundary for SQLite and optional MySQL runs; a source-level test checks the PostgreSQL path.
 
-The SQL-generation request can contain the user's question, the selected tables' compact DDL, accepted value mappings, `hints.md`, retrieved verified examples, and correction messages. The compact DDL contains names, types, primary keys, and foreign keys; introspection samples and the full distinct-value index are not included in that DDL. Credentials and `DATABASE_URL` are not placed in the prompt.
+The configured database role must still be read-only. This permission boundary is authoritative even when application validation or session settings are bypassed.
 
-Query result rows are formatted in application code and are not sent to the LLM by the current pipeline. `GroqGenerator.summarize()` exists, but `TextToSQLPipeline.run()` does not call it. Resolved values, hints, and saved examples can still contain user or business data and are sent as part of SQL generation when relevant.
+## Re-index and Configuration
 
-The sentence-transformer model runs locally after its model files are available. SQL generation itself requires the configured Groq API key. The configured database driver must be installed for the selected `DATABASE_URL`.
+- `ui.app:_render_sidebar()` clears the cached runtime and sets `force_reindex`; the next `init_app(force=True)` resets only the current namespace's schema/value indexes and embedding cache. `reindex.py:main()` invokes the same forced build. Other database namespaces are untouched.
+- `Settings.from_env()` reads `DATABASE_URL`, `EMBEDDING_MODEL`, `VECTOR_STORE_PATH`, `SCHEMA_TOP_K`, `VALUE_TOP_K`, `VALUE_CARDINALITY_THRESHOLD`, `EXAMPLE_CANDIDATE_LIMIT`, `MAX_ROWS`, `QUERY_TIMEOUT_SECONDS`, `MAX_RETRIES`, `ALLOWED_SCHEMAS`, and `EXCLUDED_TABLES`.
+- `config/data_policy.yaml` controls protected columns; `config/value_resolution.yaml` supplies matching and language configuration. Their content and the cardinality threshold participate in the manifest policy/config hash.
+- The optional description utility still imports the legacy `CatalogStore` (`catalog/describe.py:describe_catalog()`); it is not part of application startup or indexing. `db/init_db.py` and `seed_library.py` are developer-only fixture utilities and are not imported by the application.
+- The compatibility modules `sql/validator.py` and `sql/executor.py` remain for Phase 6; the main pipeline uses `validation/validator.py` and `DatabaseAdapter` directly.
 
-## 5. Configuration and Database Switching
+## Changes in This Phase
 
-- `DATABASE_URL` selects the target database. Install its SQLAlchemy driver and restart Streamlit or clear its cached runtime after changing the URL.
-- `ALLOWED_SCHEMAS` and `EXCLUDED_TABLES` are comma-separated environment settings. Add internal, legacy, or sensitive tables to `EXCLUDED_TABLES`; the introspector does not automatically exclude arbitrary system tables.
-- `VALUE_CARDINALITY_THRESHOLD` bounds distinct-value indexing. `config/value_resolution.yaml` controls eligible value columns, excluded columns/terms, matching thresholds, metric vocabulary, activity-query expansion, and status columns guarded for metric questions.
-- `hints.md` is optional, global business context. Update or clear it when switching domains; status definitions, revenue rules, refunds, and other domain semantics are not inferred reliably from a schema alone.
-- `MAX_ROWS`, `QUERY_TIMEOUT_SECONDS`, and `MAX_RETRIES` constrain execution and recovery. `SCHEMA_TOP_K` and `VALUE_TOP_K` control retrieval breadth.
-- `config/data_policy.yaml` controls blocked and masked columns. Database grants should independently enforce access to sensitive fields.
-
-## 6. Verification
-
-Run the unit and integration suite with `python -m pytest tests/ -v`. The real-database laptop integration tests run only when the configured database exposes their required `orders`, `order_items`, and `products` fixture tables; otherwise they skip. Run `python eval/run_eval.py` to compare pipeline results with the configured cases in `eval/questions.json`. The starter fixture is empty until cases are added.
-
-The Streamlit app is launched with `streamlit run app.py`. The sidebar's **Re-index schema** action clears the cached runtime and forces startup indexing again.
+Phase 2 moved schema/value vectors and verified examples out of the target database into namespace-local FAISS/SQLite files, added cache-aware atomic rebuilds and bounded example retrieval, removed the target-database vector persistence path, wired all active dialects to local search, and established statement-capture tests for the read-only contract.

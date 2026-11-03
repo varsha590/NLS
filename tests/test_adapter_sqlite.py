@@ -5,6 +5,7 @@ import numpy as np
 
 from db.adapter import DatabaseAdapter
 from catalog.introspect import introspect_catalog
+from retrieval.local_store import LocalVectorStore
 from retrieval.value_index import ValueIndex
 
 
@@ -50,8 +51,6 @@ def test_catalog_introspection_reads_sqlite_columns_keys_and_samples():
 
 
 def test_value_index_stores_distinct_text_values_locally(tmp_path):
-    import json
-
     engine = sa.create_engine("sqlite:///:memory:")
     metadata = sa.MetaData()
     categories = sa.Table(
@@ -66,18 +65,30 @@ def test_value_index_stores_distinct_text_values_locally(tmp_path):
     catalog = introspect_catalog(engine)
 
     class TinyEmbedder:
+        model_name = "tiny-model"
+        dim = 2
+
         def embed(self, texts):
             return np.asarray([[len(text), sum(text.encode())] for text in texts], dtype=float)
 
+    embedder = TinyEmbedder()
+    local_store = LocalVectorStore(
+        tmp_path, adapter.namespace(), embedder.model_name, embedder.dim, "test-policy"
+    )
     value_index = ValueIndex(
-        adapter, catalog, embedder=TinyEmbedder(), storage_path=tmp_path
+        adapter, catalog, embedder=embedder, local_store=local_store
     )
 
     assert value_index.build() == {"categories.category_name": ["Electronics"]}
     resolved = value_index.resolve("electronics", "categories.category_name")
     assert resolved["resolved"]["value"] == "Electronics"
-    stored = json.loads(value_index.storage_path.read_text(encoding="utf-8"))
-    assert stored["embeddings"]["categories.category_name"]
+    stored = local_store.search_values(
+        embedder.embed(["electronics"])[0],
+        1,
+        table="categories",
+        column="category_name",
+    )
+    assert len(stored) == 1
 
 
 def test_url_display_and_namespace_exclude_credentials():

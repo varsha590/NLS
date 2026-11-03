@@ -1,6 +1,19 @@
 # Natural Language to SQL Gap Analysis
 
-Static source review only. No application, test, SQL, or database operation was run. No database row values were inspected or reproduced. The current pre-existing worktree modification to `config/value_resolution.yaml` was preserved; this report describes the file as read during this review.
+Historical baseline from before Phases 0–2. The static review below records the earlier implementation and must not be read as current runtime behavior. No row values were inspected or reproduced for that review. Current Phase 2 behavior is summarized here; see `docs/flow.md` and the Phase 2 entry in `docs/fix_log.md` for the maintained implementation record.
+
+## Phase 2 Reverification
+
+| Area | Current status |
+|---|---|
+| Persisted schema/value vectors | Stored in namespace-local FAISS indexes with paired metadata, checksums, model/dimension/policy manifest, and content/model embedding cache. Startup reloads valid pairs and rebuilds damaged or mismatched parts. |
+| Startup indexing work | Startup still introspects and performs bounded eligible-column scans, as allowed for this phase. Unchanged content reuses cached embeddings. |
+| Examples | Stored in namespace-local SQLite and retrieved from a bounded set of recent candidates before lexical ranking. |
+| Target database writes | Removed from application startup and index/example paths. SQLite startup plus a full question passed the statement-capture allowlist. The provided MySQL `nls_ro` contract attempt skipped because the local endpoint/account was unavailable; PostgreSQL is checked at source level. |
+| Dialect vector search | Active schema and value searches use the same local FAISS store for SQLite, MySQL, and PostgreSQL. |
+| Legacy modules | Dead schema indexing/value catalog modules were removed after reference checks. The CatalogStore description utility and SQL compatibility modules remain as recorded in `docs/fix_log.md`. |
+
+The detailed findings and examples below describe the earlier audited source state, not the current implementation.
 
 ## 1. Summary Table
 

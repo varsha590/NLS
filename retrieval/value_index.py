@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import re
 from pathlib import Path
@@ -14,15 +13,17 @@ import sqlalchemy as sa
 import yaml
 from rapidfuzz import fuzz, process
 
-from db.adapter import DatabaseAdapter, EmbeddingStore
+from db.adapter import DatabaseAdapter
+from retrieval.local_store import LocalVectorStore
 from schema.metadata import SchemaMetadata, is_internal_table_name
 from catalog.classifier import (
     ColumnClass,
     classify_column as classify_catalog_column,
     get_column_stats,
     is_candidate_text_column,
+    parse_enum_options,
 )
-from config.data_policy import get_policy_overrides, is_blocked
+from config.data_policy import get_policy_overrides
 
 LOGGER = logging.getLogger(__name__)
 _CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "value_resolution.yaml"
@@ -92,8 +93,7 @@ class ValueIndex:
         metadata: SchemaMetadata,
         cardinality_threshold: int = 500,
         embedder: Any = None,
-        storage_path: str | Path | None = None,
-        embedding_store: EmbeddingStore | None = None,
+        local_store: LocalVectorStore | None = None,
     ) -> None:
         self.adapter = adapter
         self.metadata = metadata
@@ -102,10 +102,8 @@ class ValueIndex:
         self.large_columns: set[str] = set()
         self.embeddings: dict[str, np.ndarray] = {}
         self.embedder = embedder
-        self.storage_path = (
-            Path(storage_path) / adapter.namespace() / "values.json"
-            if storage_path is not None else None
-        )
+        self.local_store = local_store
+        self.build_success = True
         self.config = _load_config()
         self.thresholds = self.config.get("thresholds", {})
         self.accept_score = float(self.thresholds.get("accept_score", 0.88))
@@ -161,7 +159,6 @@ class ValueIndex:
         self.activity_query_expansion = tuple(
             str(term) for term in self.config.get("activity_query_expansion", [])
         )
-        self.embedding_store = embedding_store
 
     def _is_internal_table(self, table: Any) -> bool:
         """Recognize common metadata/index structures by name or by structural columns."""
@@ -198,10 +195,12 @@ class ValueIndex:
         return bool(words) and words.issubset(self.schema_vocabulary)
 
     def build(self) -> dict[str, list[str]]:
-        """Index distinct values only from eligible reflected data columns using the unified classifier."""
+        """Index only VALUE_LOW data, using metadata options for ENUM/SET columns."""
         self.values.clear()
         self.large_columns.clear()
         self.embeddings.clear()
+        self.build_success = True
+        value_records: list[dict[str, str]] = []
         policy_overrides = get_policy_overrides()
 
         for table_info in self.metadata.tables.values():
@@ -232,14 +231,30 @@ class ValueIndex:
                 ):
                     continue
 
-                # 2. Single cheap bounded query for distinct count and average length
-                try:
-                    with self.adapter.engine.connect() as connection:
-                        cnt, avg_len = get_column_stats(connection, reflected, column_info.name, threshold=self.threshold)
-                except Exception:
-                    cnt, avg_len = None, None
+                options = parse_enum_options(column.type)
+                if options is not None:
+                    cnt = len(options)
+                    avg_len = (
+                        sum(len(option) for option in options) / cnt if cnt else 0.0
+                    )
+                else:
+                    stats_errors: list[str] = []
+                    try:
+                        with self.adapter.engine.connect() as connection:
+                            cnt, avg_len = get_column_stats(
+                                connection,
+                                reflected,
+                                column_info.name,
+                                threshold=self.threshold,
+                                on_error=stats_errors.append,
+                            )
+                    except sa.exc.SQLAlchemyError:
+                        cnt, avg_len = None, None
+                        stats_errors.append("database_error")
+                    if cnt is None:
+                        self.build_success = False
 
-                # 3. Final classification decision
+                # Final classification is shared with the report and policy boundary.
                 final_class, _ = classify_catalog_column(
                     table_name=table_key,
                     column_name=column_info.name,
@@ -258,85 +273,61 @@ class ValueIndex:
                 elif final_class != ColumnClass.VALUE_LOW:
                     continue
 
-                try:
-                    with self.adapter.engine.connect() as connection:
-                        query = (
-                            sa.select(column)
-                            .where(column.is_not(None))
-                            .distinct()
-                            .limit(self.threshold + 1)
-                        )
-                        raw_values = connection.execute(query).scalars().all()
+                if options is not None:
+                    values = [str(option) for option in options]
+                else:
+                    try:
+                        with self.adapter.engine.connect() as connection:
+                            query = (
+                                sa.select(column)
+                                .where(column.is_not(None))
+                                .distinct()
+                                .limit(self.threshold + 1)
+                            )
+                            raw_values = connection.execute(query).scalars().all()
+                    except sa.exc.SQLAlchemyError:
+                        self.build_success = False
+                        continue
                     if len(raw_values) > self.threshold:
                         self.large_columns.add(key)
                         continue
                     values = [str(value) for value in raw_values]
-                    values = [value for value in values if not self._is_schema_value(value)]
-                    if not values:
-                        continue
-                    self.values[key] = values
 
-                    # Upsert embeddings to PostgreSQL via EmbeddingStore
-                    if self.embedder is not None and self.embedding_store is not None:
-                        namespace = self.embedding_store.namespace
-                        embeddings_list = self.embedder.embed(values)
-                        for i, value in enumerate(values):
-                            content_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
-                            embedding = embeddings_list[i].tolist()
-                            self.embedding_store.upsert_value(
-                                table_name=bare_table_name,
-                                column_name=column_info.name,
-                                value=value,
-                                content_hash=content_hash,
-                                embedding=embedding,
-                            )
-                        # Load embeddings into memory for scoring
-                        value_embeddings = self.embedding_store.get_value_embeddings(
-                            bare_table_name, column_info.name
-                        )
-                        self.embeddings[key] = np.array([value_embeddings[v] for v in values if v in value_embeddings])
-                    elif self.embedder is not None:
-                        self.embeddings[key] = self.embedder.embed(values)
-                except (sa.exc.SQLAlchemyError, KeyError):
-                    LOGGER.debug("Value index skipped a column", extra={"column": key})
-        if self.storage_path is not None:
-            self.storage_path.parent.mkdir(parents=True, exist_ok=True)
-            self.storage_path.write_text(
-                json.dumps({
-                    "values": self.values,
-                    "embeddings": {
-                        key: vectors.tolist() for key, vectors in self.embeddings.items()
-                    },
-                }),
-                encoding="utf-8",
-            )
+                values = [value for value in values if not self._is_schema_value(value)]
+                if not values:
+                    continue
+                self.values[key] = values
+                for value in values:
+                    value_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
+                    value_records.append({
+                        "table_name": table_key,
+                        "column_name": column_info.name,
+                        "classification": ColumnClass.VALUE_LOW.value,
+                        "value_hash": value_hash,
+                        "value": value,
+                    })
+
+        if self.embedder is not None and self.local_store is not None:
+            self.build_success = self.local_store.build_values(value_records, self.embedder) and self.build_success
+        elif self.embedder is not None:
+            for key, values in self.values.items():
+                self.embeddings[key] = self.embedder.embed(values)
         return self.values
 
-    def report(self, sample_size: int = 5) -> list[dict[str, Any]]:
-        """Describe the index: value count and a small sample per configured column."""
+    def report(self) -> list[dict[str, Any]]:
+        """Describe indexed columns by count without returning row values."""
         rows: list[dict[str, Any]] = []
         for column, values in sorted(self.values.items()):
             rows.append({
                 "column": column,
                 "count": len(values),
-                "samples": list(values[:sample_size]),
             })
         for column in sorted(self.large_columns):
             rows.append({
                 "column": column,
                 "count": None,
-                "samples": [],
             })
         return rows
-
-    def forbidden_values(self) -> list[tuple[str, str]]:
-        """Return indexed values that are table, column, or metric vocabulary."""
-        forbidden: list[tuple[str, str]] = []
-        for column, values in self.values.items():
-            for value in values:
-                if self._is_schema_value(value):
-                    forbidden.append((column, value))
-        return forbidden
 
     def _score_candidates(self, mention: str, column: str | None, top_k: int) -> list[dict[str, Any]]:
         candidate_values = [
@@ -346,34 +337,6 @@ class ValueIndex:
             for value in values
             if not self._is_schema_value(value)
         ]
-        if column and column in self.large_columns:
-            table_name, column_name = column.rsplit(".", 1)
-            if self.embedding_store is not None:
-                # Use EmbeddingStore.search_values for high-cardinality columns (0b fix).
-                # Embed the mention once and search via the store.
-                if self.embedder is not None:
-                    span_embedding = self.embedder.embed([mention])[0].tolist()
-                    store_results = self.embedding_store.search_values(
-                        query_embedding=span_embedding,
-                        top_k=top_k,
-                    )
-                    candidate_values.extend(
-                        (column, result["value"])
-                        for result in store_results
-                        if result.get("table_name") == table_name
-                        and result.get("column_name") == column_name
-                        and not self._is_schema_value(result["value"])
-                    )
-                else:
-                    LOGGER.debug(
-                        "High-cardinality lookup skipped: no embedder",
-                        extra={"column": column},
-                    )
-            else:
-                LOGGER.debug(
-                    "High-cardinality lookup skipped: no embedding_store",
-                    extra={"column": column},
-                )
         unique = list(dict.fromkeys(candidate_values))
         if not unique:
             return []
@@ -385,33 +348,30 @@ class ValueIndex:
         )
         lexical_scores = {index: score / 100 for _, score, index in lexical_matches}
         query_embedding = self.embedder.embed([mention])[0] if self.embedder is not None else None
+        vector_scores: dict[tuple[str, str], float] = {}
+        if query_embedding is not None and self.local_store is not None:
+            table_filter, column_filter = (column.rsplit(".", 1) if column else (None, None))
+            search_results = self.local_store.search_values(
+                query_embedding,
+                top_k=len(unique),
+                table=table_filter,
+                column=column_filter,
+            )
+            vector_scores = {
+                (f"{item['table_name']}.{item['column_name']}", item["value"]): item["similarity"]
+                for item in search_results
+            }
         candidates = []
         for index, (candidate_column, value) in enumerate(unique):
             lexical_score = lexical_scores.get(index, 0.0)
-            vector_score = 0.0
-            indexed_values = self.values.get(candidate_column, [])
-            if query_embedding is not None and candidate_column in self.values:
+            vector_score = vector_scores.get((candidate_column, value), 0.0)
+            if query_embedding is not None and self.local_store is None and candidate_column in self.embeddings:
+                indexed_values = self.values.get(candidate_column, [])
                 try:
-                    value_index = indexed_values.index(value)
-                    # Try to get vector score from EmbeddingStore first
-                    if self.embedding_store is not None:
-                        namespace = self.embedding_store.namespace
-                        search_results = self.embedding_store.search_values(
-                            query_embedding=query_embedding.tolist(),
-                            top_k=1,
-                            namespace=namespace,
-                        )
-                        if search_results:
-                            for result in search_results:
-                                if result.get("value") == value:
-                                    vector_score = result.get("similarity", 0.0)
-                                    break
-                    else:
-                        # Fall back to numpy computation if no EmbeddingStore
-                        value_vector = self.embeddings[candidate_column][value_index]
-                        denominator = np.linalg.norm(query_embedding) * np.linalg.norm(value_vector)
-                        vector_score = max(0.0, float(np.dot(query_embedding, value_vector) / denominator)) if denominator else 0.0
-                except (ValueError, IndexError, KeyError):
+                    value_vector = self.embeddings[candidate_column][indexed_values.index(value)]
+                    denominator = np.linalg.norm(query_embedding) * np.linalg.norm(value_vector)
+                    vector_score = max(0.0, float(np.dot(query_embedding, value_vector) / denominator)) if denominator else 0.0
+                except (ValueError, IndexError):
                     vector_score = 0.0
             confidence = max(
                 lexical_score,
@@ -430,7 +390,7 @@ class ValueIndex:
         by_column: dict[str, list[int]] = defaultdict(list)
         for i, cand in enumerate(candidates):
             by_column[cand["column"]].append(i)
-        for col, indices in by_column.items():
+        for indices in by_column.values():
             subset_indices = [
                 i for i in indices
                 if _is_token_subset_or_prefix(mention, candidates[i]["value"])
@@ -487,7 +447,6 @@ class ValueIndex:
 
     def _candidate_spans(self, question: str) -> list[dict[str, Any]]:
         tokens = self._eligible_tokens(question)
-        all_tokens = list(_TOKEN_RE.finditer(question))
         spans: list[dict[str, Any]] = []
         seen: set[tuple[int, int]] = set()
         for first in range(len(tokens)):

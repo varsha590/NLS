@@ -1,4 +1,4 @@
-"""Hybrid schema retrieval with pgvector embeddings, lexical ranking, and FK expansion."""
+"""Hybrid schema retrieval with local FAISS embeddings, lexical ranking, and FK expansion."""
 
 from __future__ import annotations
 
@@ -8,11 +8,10 @@ from typing import Any, Protocol
 
 import numpy as np
 
-from db.adapter import EmbeddingStore
-from config.data_policy import is_blocked
+from config.data_policy import is_blocked, is_masked
 from config.settings import Settings
 from retrieval.embeddings import EmbeddingModel
-from schema.index_schema import cosine_similarity
+from retrieval.local_store import LocalVectorStore
 from schema.metadata import SchemaMetadata, is_internal_table_name
 
 DEFAULT_TOP_K = 8
@@ -32,17 +31,17 @@ def _lexical_tokens(value: str) -> list[str]:
 
 
 class HybridSchemaRetriever:
-    """Rank schema documents using pgvector embeddings and lexical relevance."""
+    """Rank schema documents using local FAISS vectors and lexical relevance."""
 
     def __init__(
         self, 
         metadata: SchemaMetadata, 
         embedding_model: Embedder, 
-        embedding_store: EmbeddingStore | None = None
+        local_store: LocalVectorStore | None = None
     ):
         self.metadata = metadata
         self.embedding_model = embedding_model
-        self.embedding_store = embedding_store
+        self.local_store = local_store
         self.documents = []
         for table in metadata.tables.values():
             if is_internal_table_name(table.name):
@@ -51,13 +50,13 @@ class HybridSchemaRetriever:
                 f"{column.name} {column.data_type} {column.comment or ''}".strip()
                 for column in table.columns
                 if not is_blocked(f"{table.name}.{column.name}")
+                and not is_masked(f"{table.name}.{column.name}")
             ]
             self.documents.append({
                 "table_name": table.name,
                 "text": " ".join([table.name, table.description or f"Table {table.name}", *column_text]),
                 "relationships": table.foreign_keys,
             })
-        # Embeddings are now fetched from EmbeddingStore as needed
 
     def retrieve(self, query: str, top_k: int = DEFAULT_TOP_K) -> dict[str, Any]:
         """Return semantically and lexically ranked tables plus FK neighbors."""
@@ -67,10 +66,10 @@ class HybridSchemaRetriever:
         query_tokens = _lexical_tokens(query)
         query_vector = self.embedding_model.embed([query])[0]
         
-        # Use EmbeddingStore to find similar schema embeddings if available
+        # Search local vectors and associate results by schema-qualified table key.
         semantic_results = []
-        if self.embedding_store is not None:
-            semantic_results = self.embedding_store.search_schema(
+        if self.local_store is not None:
+            semantic_results = self.local_store.search_schema(
                 query_vector.tolist(), top_k=max(top_k, MAX_TOP_K), metadata_type="table_ddl"
             )
         
@@ -134,6 +133,7 @@ class HybridSchemaRetriever:
             column.name
             for column in table.columns
             if not is_blocked(f"{table.name}.{column.name}")
+            and not is_masked(f"{table.name}.{column.name}")
         ]
         return {
             "table_name": table.name,
@@ -174,7 +174,7 @@ def retrieve_schema(engine, query: str, top_k: int = DEFAULT_TOP_K, indexer=None
     if indexer is not None:
         initial = indexer.search_similar(query, top_k=top_k)
         initial_tables = [document["table_name"] for document in initial]
-        retriever = HybridSchemaRetriever(metadata, indexer.embedding_model, embedding_store=indexer.embedding_store)
+        retriever = HybridSchemaRetriever(metadata, indexer.embedding_model, local_store=indexer.local_store)
         result = retriever.retrieve(query, top_k=top_k)
         if initial_tables:
             result["tables"] = list(dict.fromkeys(initial_tables + result["tables"]))

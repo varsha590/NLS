@@ -11,6 +11,7 @@ class FakeEmbeddingModel:
     """Deterministic embedding model for startup tests."""
 
     model_name = "fake-model"
+    dim = 4
 
     def __init__(self, model_name):
         self.model_name = model_name

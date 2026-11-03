@@ -1082,3 +1082,38 @@ Columns blocked by a short or generic token where manual review may be helpful:
 ### Unverified Items
 
 - Live generation responses from Groq with active API key for high-cardinality values (canonicalization logic tested with local fixtures and mocks; live Groq API requires user environment key).
+
+## Phase 2: Namespace-Local Vectors and Read-Only Target
+
+### What Changed
+
+1. **`retrieval/local_store.py`** adds `LocalVectorStore` under `.vector_store/<credential-free-namespace>/`. Schema and value vectors use normalized float32 FAISS `IndexFlatIP`; metadata pairs are checksum-validated and atomically replaced. The manifest tracks model, dimension, normalization, policy/config hash, build time, and format. The SQLite embedding cache keys by content hash and model. Invalid dimensions and zero vectors are rejected without replacing the prior index.
+2. **Local value and schema retrieval**: `core.startup:_schema_records()` builds schema-only content with blocked/masked fields omitted; `ValueIndex.build()` reads ENUM/SET options from reflected type metadata and stores only VALUE_LOW values. Value search is table/column filterable. `HybridSchemaRetriever.retrieve()` searches schema vectors by schema-qualified key. `ExampleStore` persists examples in the local namespace and ranks a bounded set of recent candidates.
+3. **Target database writes removed**: `db/adapter.py` now contains only connection/dialect identity, read-only settings, EXPLAIN, and bounded read-only query methods. Startup no longer provisions vector extensions/tables/indexes or saves vectors/examples in the database. Forced re-index resets only the current namespace's schema/value indexes and embedding cache; verified examples and hints remain.
+4. **Per-database hints and settings**: `.vector_store/<namespace>/hints.md` takes precedence over root `hints.md`. `EXAMPLE_CANDIDATE_LIMIT` configures the bounded recent example candidate set and defaults to 500. `.gitignore` excludes `.vector_store/` and FAISS files; requirements pin `faiss-cpu` and NumPy.
+5. **Documentation**: `README.md` and `docs/flow.md` describe the local artifact layout, read-only database contract, reset procedure, optional hints, and developer-only fixture utilities.
+
+### Tests Added or Updated
+
+- `tests/test_local_store.py`: round-trip/reload, cache hits and changed-content embedding, missing/corrupt pair recovery, manifest/model/dimension mismatch, zero-vector preservation, schema-qualified values, table/column filtering, VALUE_LOW-only admission, metadata-only ENUM/SET indexing, bounded examples, failure return, local hints fallback, and artifact sentinel scans for protected/high-cardinality content.
+- `tests/test_readonly_contract.py`: SQLite startup plus a full generated question under a SQLAlchemy statement listener; optional MySQL `nls_ro` startup/question contract; PostgreSQL source-path check for removed vector DDL/write SQL.
+- `tests/test_pipeline_sqlite.py`: asserts the full SQLite pipeline invokes local schema-vector search.
+- `tests/test_adapter_sqlite.py`, `tests/test_phase0_fixes.py`, and `tests/test_startup.py`: updated from the removed database vector/JSON persistence APIs to the local store while preserving earlier safety guarantees.
+
+### Legacy Cleanup Audit
+
+- Root `schema_index.json` and `value_catalog.json`: absent in this checkout; no runtime reader was found.
+- `.vector_store/<namespace>/values.json`: the writer in `ValueIndex.build()` was removed. Existing ignored namespace files were left untouched; the Phase 2 runtime does not read them.
+- `catalog/store.py` / `CatalogStore`: retained because `catalog/describe.py:describe_catalog()` still imports it. It is not imported by `core.startup:init_app()`; save/progress methods are compatibility no-ops.
+- `schema/index_schema.py`: removed with `git rm`; after the retriever no longer imported its cosine helper, no runtime or test caller remained.
+- `schema/value_catalog.py`: removed with `git rm`; its only references were in `tests/test_value_catalog.py`, which covered the obsolete helper/no-op index API and was removed with it.
+- `sql/validator.py`: retained for Phase 6; `tests/test_validator_lower.py` imports its comparison-rewrite helper. The application pipeline uses `validation/validator.py`.
+- `sql/executor.py`: retained for Phase 6 as a compatibility API; no in-repository runtime caller was found by the call-site search.
+- `db/init_db.py` and `seed_library.py`: neither is imported by application startup/UI/pipeline. README marks them developer-only fixture utilities.
+
+### Verification
+
+- `python -m pytest tests/ -v`: 155 passed, 3 skipped.
+- The SQLite startup-plus-question statement listener passed; no target statements outside the read-only/metadata allowlist were observed. The live MySQL `nls_ro` test was attempted with the provided hiresanta URL but skipped because the local SELECT-only MySQL endpoint/account was unavailable.
+- No live PostgreSQL server was available; the PostgreSQL target path passed the source-level check. Groq generation is mocked in contract tests.
+- `git diff --check`: clean after the final code/documentation edits.

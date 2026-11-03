@@ -1,14 +1,8 @@
-"""Credential-free local persistence for schema catalogs and embeddings.
-
-Note: Embedding data is now stored in PostgreSQL via EmbeddingStore.
-This class is kept for backwards compatibility but does not persist to local disk.
-"""
+"""Legacy optional catalog loader retained for the developer description utility."""
 
 from __future__ import annotations
 
 import json
-import os
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -16,22 +10,13 @@ from db.adapter import DatabaseAdapter
 
 
 class CatalogStore:
-    """Persist a database's catalog and vectors in its own local namespace.
-
-    .. note::
-        Embedding data is now stored in PostgreSQL via EmbeddingStore.
-        This class no longer writes to local disk.
-    """
+    """Read legacy catalog JSON; save and description-progress methods are no-ops."""
 
     def __init__(self, path: str | Path, adapter: DatabaseAdapter) -> None:
         self.path = Path(path) / adapter.namespace() / "catalog.json"
 
     def load(self) -> dict[str, Any] | None:
-        """Load a previously indexed catalog, if present and readable.
-
-        .. note::
-            Returns None as embedding data is now in PostgreSQL.
-        """
+        """Load a legacy catalog file if one exists."""
         try:
             if not self.path.exists():
                 return None
@@ -40,41 +25,20 @@ class CatalogStore:
             return None
 
     def is_current(self, schema_hash: str, embedding_model: str) -> bool:
-        """Check whether cached schema and embedding model match current settings.
-
-        .. note::
-            Always returns False as embedding data is now in PostgreSQL;
-            check via EmbeddingStore instead.
-        """
+        """Return False because this legacy file has no validity manifest."""
         return False
 
     def save(self, payload: dict[str, Any]) -> None:
-        """Atomically write a catalog payload to local storage.
-
-        .. note::
-            No longer writes to local disk; embedding data is upserted
-            into PostgreSQL by the caller.
-        """
-        # Embedding data is now stored in PostgreSQL via EmbeddingStore.upsert_schema()
-        pass
+        """Retained compatibility method; the application no longer saves catalogs here."""
 
     @property
     def description_progress_path(self) -> Path:
-        """Return the resumable description-progress file path."""
+        """Return the former description-progress file location."""
         return self.path.with_name("description-progress.json")
 
     def load_description_progress(self) -> set[str]:
-        """Load completed description keys for this database namespace.
-
-        .. note::
-            Returns empty set as description progress is no longer persisted to local disk.
-        """
+        """Return no progress because this legacy utility does not persist it."""
         return set()
 
     def save_description_progress(self, completed: set[str]) -> None:
-        """Persist completed description keys after each LLM call.
-
-        .. note::
-            No longer persists to local disk.
-        """
-        pass
+        """Retained compatibility method; no progress is written."""
