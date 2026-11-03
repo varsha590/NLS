@@ -6,7 +6,36 @@ from sqlalchemy.engine import Engine
 from typing import Dict, List, Any, Optional
 import json
 
+import fnmatch
 EXCLUDED_SCHEMA_OBJECTS: set[str] = set()
+
+DEFAULT_EXCLUDED_TABLE_PATTERNS: tuple[str, ...] = (
+    "system_*",
+    "*alembic*",
+    "*migration*",
+    "*migrations*",
+    "django_*",
+    "auth_*",
+    "*session*",
+    "*sessions*",
+    "*value_catalog*",
+    "*schema_embeddings*",
+    "*value_embeddings*",
+)
+
+
+def is_internal_table_name(table_name: str) -> bool:
+    """Return True if table name matches default internal/system patterns or exclusions."""
+    bare_name = table_name.rsplit(".", 1)[-1].casefold()
+    full_name = table_name.casefold()
+    if bare_name.startswith("system_") or bare_name.startswith("_"):
+        return True
+    if bare_name in EXCLUDED_SCHEMA_OBJECTS or full_name in EXCLUDED_SCHEMA_OBJECTS:
+        return True
+    for pat in DEFAULT_EXCLUDED_TABLE_PATTERNS:
+        if fnmatch.fnmatchcase(bare_name, pat.casefold()) or fnmatch.fnmatchcase(full_name, pat.casefold()):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------

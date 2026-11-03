@@ -16,10 +16,12 @@ from schema.metadata import SchemaMetadata
 try:
     from config.data_policy import is_blocked, blocked_columns_for_table
 except Exception:
+    # Fail closed: treat every column as blocked if policy cannot be imported
     def is_blocked(key: str) -> bool:
-        return False
+        return True
+
     def blocked_columns_for_table(table_name: str, column_names: list) -> set:
-        return set()
+        return set(column_names)
 
 
 class ValidationError(ValueError):

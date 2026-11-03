@@ -1,17 +1,39 @@
-columns:
-  customers.email: block
-default_mask: "partial"
-auto_block_patterns:
-  - email
-  - phone 
-  - contact
-  - mobile
-  - address
-  - password
-  - ssn
-  - aadhaar
-  - pan
-  - token
-  - secret
-value_index:
-  allowed_name_columns: []
+# Data policy: pattern list plus explicit overrides only.
+# Used by catalog/classifier.py to enforce privacy across the entire pipeline.
+
+patterns:
+  block:
+    - password
+    - passwd
+    - pwd
+    - token
+    - secret
+    - otp
+    - email
+    - phone
+    - mobile
+    - contact
+    - address
+    - ssn
+    - aadhaar
+    - aadhar
+    - pan
+    - card
+    - account_no
+    - ifsc
+    - upi
+    - api_key
+    - session
+    - ip_addr
+    - dob
+    - birth
+    - lat
+    - lng
+
+overrides:
+  force_block:
+    - customers.email
+  force_mask: []
+  force_allow: []
+  force_value_low: []
+  force_value_high: []

@@ -9,10 +9,11 @@ from typing import Any, Protocol
 import numpy as np
 
 from db.adapter import EmbeddingStore
+from config.data_policy import is_blocked
 from config.settings import Settings
 from retrieval.embeddings import EmbeddingModel
 from schema.index_schema import cosine_similarity
-from schema.metadata import SchemaMetadata
+from schema.metadata import SchemaMetadata, is_internal_table_name
 
 DEFAULT_TOP_K = 8
 MAX_TOP_K = 20
@@ -44,14 +45,16 @@ class HybridSchemaRetriever:
         self.embedding_store = embedding_store
         self.documents = []
         for table in metadata.tables.values():
+            if is_internal_table_name(table.name):
+                continue
             column_text = [
-                f"{column.name} {column.data_type} {column.comment or ''} "
-                f"{' '.join(column.sample_values)}"
+                f"{column.name} {column.data_type} {column.comment or ''}".strip()
                 for column in table.columns
+                if not is_blocked(f"{table.name}.{column.name}")
             ]
             self.documents.append({
                 "table_name": table.name,
-                "text": " ".join([table.name, table.description, *column_text]),
+                "text": " ".join([table.name, table.description or f"Table {table.name}", *column_text]),
                 "relationships": table.foreign_keys,
             })
         # Embeddings are now fetched from EmbeddingStore as needed
@@ -127,21 +130,29 @@ class HybridSchemaRetriever:
 
     @staticmethod
     def _document_for(table: Any) -> dict[str, Any]:
+        unblocked_columns = [
+            column.name
+            for column in table.columns
+            if not is_blocked(f"{table.name}.{column.name}")
+        ]
         return {
             "table_name": table.name,
-            "text": " ".join([table.name, table.description, *(column.name for column in table.columns)]),
+            "text": " ".join([table.name, table.description or f"Table {table.name}", *unblocked_columns]),
             "relationships": table.foreign_keys,
         }
 
     def compact_ddl(self, table_names: list[str]) -> str:
-        """Render exact names and types for only the selected tables."""
+        """Render exact names and types for only the selected tables, omitting BLOCKED columns."""
         definitions = []
         for table_name in table_names:
             table = self.metadata.tables.get(table_name)
-            if table is None:
+            if table is None or is_internal_table_name(table_name):
                 continue
             columns = []
             for column in table.columns:
+                # Omit BLOCKED columns completely from DDL
+                if is_blocked(f"{table.name}.{column.name}"):
+                    continue
                 details = f"{column.name} {column.data_type}"
                 if column.is_primary_key:
                     details += " PRIMARY KEY"

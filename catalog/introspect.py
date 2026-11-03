@@ -9,7 +9,8 @@ import sqlalchemy as sa
 from sqlalchemy import inspect
 from sqlalchemy.engine import Engine
 
-from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo
+from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo, is_internal_table_name
+from config.data_policy import is_blocked, is_masked
 
 LOGGER = logging.getLogger(__name__)
 
@@ -38,7 +39,12 @@ def introspect_catalog(
             continue
         for raw_table_name in table_names:
             table_name = _qualified_name(schema_name, raw_table_name)
-            if table_name in excluded or raw_table_name in excluded:
+            if (
+                is_internal_table_name(table_name)
+                or is_internal_table_name(raw_table_name)
+                or table_name in excluded
+                or raw_table_name in excluded
+            ):
                 continue
             try:
                 columns = inspector.get_columns(raw_table_name, schema=schema_name)
@@ -81,21 +87,24 @@ def introspect_catalog(
                         )
                         foreign_column = foreign_key["referred_columns"][index]
                     samples: list[Any] = []
-                    try:
-                        reflected_column = reflected.c[column_name]
-                        with engine.connect() as connection:
-                            values = connection.execute(
-                                sa.select(reflected_column)
-                                .where(reflected_column.is_not(None))
-                                .distinct()
-                                .limit(sample_limit)
-                            ).scalars().all()
-                        samples = [str(value) for value in values]
-                    except (sa.exc.SQLAlchemyError, KeyError):
-                        LOGGER.debug(
-                            "Column samples unavailable",
-                            extra={"table": table_name, "column": column_name},
-                        )
+                    col_key = f"{table_name}.{column_name}"
+                    # Never collect sample values for BLOCKED or MASKED columns
+                    if not is_blocked(col_key) and not is_masked(col_key) and sample_limit > 0:
+                        try:
+                            reflected_column = reflected.c[column_name]
+                            with engine.connect() as connection:
+                                values = connection.execute(
+                                    sa.select(reflected_column)
+                                    .where(reflected_column.is_not(None))
+                                    .distinct()
+                                    .limit(sample_limit)
+                                ).scalars().all()
+                            samples = [str(value) for value in values]
+                        except (sa.exc.SQLAlchemyError, KeyError):
+                            LOGGER.debug(
+                                "Column samples unavailable",
+                                extra={"table": table_name, "column": column_name},
+                            )
                     column_infos.append(
                         ColumnInfo(
                             name=column_name,

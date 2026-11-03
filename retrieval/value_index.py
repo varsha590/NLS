@@ -15,7 +15,14 @@ import yaml
 from rapidfuzz import fuzz, process
 
 from db.adapter import DatabaseAdapter, EmbeddingStore
-from schema.metadata import SchemaMetadata
+from schema.metadata import SchemaMetadata, is_internal_table_name
+from catalog.classifier import (
+    ColumnClass,
+    classify_column as classify_catalog_column,
+    get_column_stats,
+    is_candidate_text_column,
+)
+from config.data_policy import get_policy_overrides, is_blocked
 
 LOGGER = logging.getLogger(__name__)
 _CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "value_resolution.yaml"
@@ -157,29 +164,26 @@ class ValueIndex:
         self.embedding_store = embedding_store
 
     def _is_internal_table(self, table: Any) -> bool:
-        """Recognize common metadata/index structures by their structural columns."""
+        """Recognize common metadata/index structures by name or by structural columns."""
+        if is_internal_table_name(table.name):
+            return True
         names = {column.name.casefold() for column in table.columns}
         return (
-            {"table_name", "column_name", "values"}.issubset(names)
+            {"table_name", "column_name"}.issubset(names)
             or {"embedding", "relationships", "business_relevance"}.issubset(names)
         )
 
-    def _is_value_column(self, column: Any) -> bool:
-        """Check text type and configured semantics before indexing a column."""
-        column_name = column.name.casefold()
-        if column_name in self.excluded_column_names:
-            return False
-        if self.value_column_allowlist:
-            configured = column_name in self.value_column_allowlist
-        else:
-            configured = (
-                column_name in self.value_column_names
-                or column_name.endswith(self.value_column_suffixes)
-            )
-        if not configured:
-            return False
-        type_name = str(column.type).lower()
-        return any(marker in type_name for marker in ("char", "text", "string"))
+    def _is_value_column(self, column: Any, table_name: str = "") -> bool:
+        """Check column eligibility using the unified classifier."""
+        policy_overrides = get_policy_overrides()
+        col_class, _ = classify_catalog_column(
+            table_name=table_name,
+            column_name=column.name,
+            sql_type=column.type,
+            overrides=policy_overrides,
+            cardinality_threshold=self.threshold,
+        )
+        return col_class not in (ColumnClass.BLOCKED, ColumnClass.MASKED, ColumnClass.SKIP)
 
     def _is_schema_value(self, value: str) -> bool:
         """Reject values that are table/column/metric vocabulary, not row data."""
@@ -194,26 +198,66 @@ class ValueIndex:
         return bool(words) and words.issubset(self.schema_vocabulary)
 
     def build(self) -> dict[str, list[str]]:
-        """Index distinct values only from eligible reflected data columns."""
+        """Index distinct values only from eligible reflected data columns using the unified classifier."""
         self.values.clear()
         self.large_columns.clear()
         self.embeddings.clear()
+        policy_overrides = get_policy_overrides()
 
         for table_info in self.metadata.tables.values():
             if self._is_internal_table(table_info):
                 continue
-            table_name = table_info.name.rsplit(".", 1)[-1]
+            bare_table_name = table_info.name.rsplit(".", 1)[-1]
             reflected = sa.Table(
-                table_name,
+                bare_table_name,
                 sa.MetaData(),
                 schema=table_info.schema,
                 autoload_with=self.adapter.engine,
             )
+            table_key = table_info.name
             for column_info in table_info.columns:
                 column = reflected.c.get(column_info.name)
-                if column is None or not self._is_value_column(column):
+                if column is None:
                     continue
-                key = f"{table_info.name}.{column_info.name}"
+                key = f"{table_key}.{column_info.name}"
+
+                # 1. Preliminary check without DB query
+                if not is_candidate_text_column(
+                    table_name=table_key,
+                    column_name=column_info.name,
+                    sql_type=column.type,
+                    is_primary_key=column_info.is_primary_key,
+                    is_foreign_key=column_info.is_foreign_key,
+                    overrides=policy_overrides,
+                ):
+                    continue
+
+                # 2. Single cheap bounded query for distinct count and average length
+                try:
+                    with self.adapter.engine.connect() as connection:
+                        cnt, avg_len = get_column_stats(connection, reflected, column_info.name, threshold=self.threshold)
+                except Exception:
+                    cnt, avg_len = None, None
+
+                # 3. Final classification decision
+                final_class, _ = classify_catalog_column(
+                    table_name=table_key,
+                    column_name=column_info.name,
+                    sql_type=column.type,
+                    distinct_count=cnt,
+                    avg_text_length=avg_len,
+                    is_primary_key=column_info.is_primary_key,
+                    is_foreign_key=column_info.is_foreign_key,
+                    overrides=policy_overrides,
+                    cardinality_threshold=self.threshold,
+                )
+
+                if final_class == ColumnClass.VALUE_HIGH:
+                    self.large_columns.add(key)
+                    continue
+                elif final_class != ColumnClass.VALUE_LOW:
+                    continue
+
                 try:
                     with self.adapter.engine.connect() as connection:
                         query = (
@@ -240,7 +284,7 @@ class ValueIndex:
                             content_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
                             embedding = embeddings_list[i].tolist()
                             self.embedding_store.upsert_value(
-                                table_name=table_name,
+                                table_name=bare_table_name,
                                 column_name=column_info.name,
                                 value=value,
                                 content_hash=content_hash,
@@ -248,7 +292,7 @@ class ValueIndex:
                             )
                         # Load embeddings into memory for scoring
                         value_embeddings = self.embedding_store.get_value_embeddings(
-                            table_name, column_info.name
+                            bare_table_name, column_info.name
                         )
                         self.embeddings[key] = np.array([value_embeddings[v] for v in values if v in value_embeddings])
                     elif self.embedder is not None:

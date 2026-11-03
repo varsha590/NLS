@@ -10,8 +10,15 @@ from dataclasses import dataclass
 from typing import Any
 
 import sqlalchemy as sa
-from schema.metadata import EXCLUDED_SCHEMA_OBJECTS
+from schema.metadata import EXCLUDED_SCHEMA_OBJECTS, is_internal_table_name
 from schema.documents import build_table_document, build_column_document, build_relationship_document
+from config.data_policy import is_blocked, get_policy_overrides
+from catalog.classifier import (
+    ColumnClass,
+    classify_column as classify_catalog_column,
+    get_column_stats,
+    is_candidate_text_column,
+)
 from sqlalchemy.engine import Engine, URL, make_url
 
 LOGGER = logging.getLogger(__name__)
@@ -767,10 +774,7 @@ class EmbeddingStore:
             # Build list of rows to upsert
             rows_to_upsert = []
             for table_info in metadata.tables.values():
-                bare_name = table_info.name.rsplit(".", 1)[-1]
-                if bare_name.startswith("system_"):
-                    continue
-                if bare_name in EXCLUDED_SCHEMA_OBJECTS or table_info.name in EXCLUDED_SCHEMA_OBJECTS:
+                if is_internal_table_name(table_info.name):
                     continue
                 # Keep schema-qualified name for persisted schema key (0c fix)
                 table_name = table_info.name
@@ -788,9 +792,13 @@ class EmbeddingStore:
                     }
                 )
 
-                # column_description rows
+                # column_description rows (omit BLOCKED columns entirely)
                 for column_info in table_info.columns:
+                    if is_blocked(f"{table_name}.{column_info.name}"):
+                        continue
                     col_doc = build_column_document(table_info, column_info)
+                    if not col_doc:
+                        continue
                     content_hash = hashlib.sha256(col_doc.encode("utf-8")).hexdigest()
                     rows_to_upsert.append(
                         {
@@ -894,14 +902,13 @@ class EmbeddingStore:
 
         connection = self.adapter.connect()
         try:
-            # Gather all values to embed
+            # Gather all values to embed using the unified classifier
             rows_to_upsert = []
+            policy_overrides = get_policy_overrides()
             for table_info in metadata.tables.values():
+                if is_internal_table_name(table_info.name):
+                    continue
                 bare_name = table_info.name.rsplit(".", 1)[-1]
-                if bare_name.startswith("system_"):
-                    continue
-                if bare_name in EXCLUDED_SCHEMA_OBJECTS or table_info.name in EXCLUDED_SCHEMA_OBJECTS:
-                    continue
                 reflected = sa.Table(
                     bare_name,
                     sa.MetaData(),
@@ -913,8 +920,33 @@ class EmbeddingStore:
                     column = reflected.c.get(column_info.name)
                     if column is None:
                         continue
-                    if not self._is_value_column(column):
+                    # Preliminary check: only text candidates can be VALUE_*
+                    if not is_candidate_text_column(
+                        table_name=table_key,
+                        column_name=column_info.name,
+                        sql_type=column.type,
+                        is_primary_key=column_info.is_primary_key,
+                        is_foreign_key=column_info.is_foreign_key,
+                        overrides=policy_overrides,
+                    ):
                         continue
+
+                    # Single cheap bounded count query
+                    cnt, avg_len = get_column_stats(connection, reflected, column_info.name, threshold=cardinality_threshold)
+                    final_class, _ = classify_catalog_column(
+                        table_name=table_key,
+                        column_name=column_info.name,
+                        sql_type=column.type,
+                        distinct_count=cnt,
+                        avg_text_length=avg_len,
+                        is_primary_key=column_info.is_primary_key,
+                        is_foreign_key=column_info.is_foreign_key,
+                        overrides=policy_overrides,
+                        cardinality_threshold=cardinality_threshold,
+                    )
+                    if final_class != ColumnClass.VALUE_LOW:
+                        continue
+
                     try:
                         with self.adapter.engine.connect() as conn:
                             query = (
@@ -1002,9 +1034,9 @@ class EmbeddingStore:
 
     @staticmethod
     def _is_value_column(column: Any) -> bool:
-        """Check if column is a value column based on data type."""
-        type_name = str(column.type).lower()
-        return any(marker in type_name for marker in ("char", "text", "string"))
+        """Check if column is a candidate value column based on data type."""
+        from catalog.classifier import is_text_type
+        return is_text_type(column.type)
 
     @staticmethod
     def _is_schema_value(value: str) -> bool:

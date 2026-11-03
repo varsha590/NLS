@@ -20,12 +20,15 @@ from retrieval.schema_retriever import HybridSchemaRetriever
 from retrieval.value_index import ValueIndex
 
 try:
-    from config.data_policy import is_masked, mask_value
+    from config.data_policy import is_blocked, is_masked, mask_value
 except Exception:
+    # Fail closed: treat as blocked and mask all values if data policy is unavailable
+    def is_blocked(key: str) -> bool:
+        return True
     def is_masked(key: str) -> bool:
-        return False
+        return True
     def mask_value(v: Any) -> str:
-        return v
+        return "***"
 from schema.metadata import SchemaMetadata
 from validation.validator import ValidationError, ValueSafetyError, validate_sql
 
@@ -176,11 +179,17 @@ class TextToSQLPipeline:
             correction = None
             for attempt in range(self.max_retries + 1):
                 result.retries = attempt
+                # Send resolved value mappings to LLM only for VALUE_LOW columns (Phase 1 privacy boundary)
+                llm_resolved_values = [
+                    v for v in result.resolved_values
+                    if self.value_index is None
+                    or v.get("column") in self.value_index.values
+                ]
                 messages = build_prompt(
                     question=question,
                     dialect=self.adapter.get_dialect(),
                     ddl=retrieval["ddl"],
-                    resolved_values=result.resolved_values,
+                    resolved_values=llm_resolved_values,
                     examples=examples,
                     correction=correction,
                 )
@@ -221,6 +230,17 @@ class TextToSQLPipeline:
                         result.answer = "I could not produce a safe query for that request. Please revise the question."
                     break
                 except ValueSafetyError as error:
+                    col_key = error.column or ""
+                    is_restricted_col = (
+                        is_blocked(col_key)
+                        or is_masked(col_key)
+                        or (self.value_index is not None and col_key in getattr(self.value_index, "large_columns", set()))
+                    )
+                    safe_error_str = (
+                        f"Literal filter on restricted column '{col_key}' rejected."
+                        if is_restricted_col
+                        else str(error)
+                    )
                     metric_terms = getattr(self.value_index, "metric_terms", set())
                     excluded_terms = getattr(self.value_index, "excluded_terms", set())
                     mention_words = {word.casefold() for word in error.mention.split()}
@@ -232,10 +252,10 @@ class TextToSQLPipeline:
                         and is_metric_phrase
                         and attempt < self.max_retries
                     ):
-                        result.errors.append(str(error))
+                        result.errors.append(safe_error_str)
                         result.sql = ""
                         correction = (
-                            f"{error} The rejected literal is configured as metric vocabulary, "
+                            f"{safe_error_str} The rejected literal is configured as metric vocabulary, "
                             "not a stored value. Reinterpret the requested historical activity using "
                             "measures in event or transaction records and their schema relationships. "
                             "Do not use status, availability, or inventory-state columns as a proxy "
@@ -244,22 +264,24 @@ class TextToSQLPipeline:
                         continue
                     if error.kind == "ambiguous":
                         result.ambiguous_values = [{
-                            "mention": error.mention,
+                            "mention": error.mention if not is_restricted_col else "[restricted]",
                             "ambiguous": True,
-                            "candidates": [{"column": error.column, "value": v, "confidence": 0.0} for v in error.closest],
+                            "candidates": [{"column": error.column, "value": v if not is_restricted_col else "[restricted]", "confidence": 0.0} for v in error.closest],
                             "confidence": 0.0,
                         }]
                     else:
                         result.not_found_values = [{
-                            "mention": error.mention,
+                            "mention": error.mention if not is_restricted_col else "[restricted]",
                             "not_found": True,
                             "column": error.column,
-                            "candidates": [{"value": v} for v in error.closest],
+                            "candidates": [{"value": v} for v in (error.closest if not is_restricted_col else [])],
                             "confidence": 0.0,
                         }]
-                    result.errors.append(str(error))
+                    result.errors.append(safe_error_str)
                     result.sql = ""  # Clear unverified SQL
-                    if error.kind == "not_found":
+                    if is_restricted_col:
+                        result.answer = "I could not produce a safe query for that request."
+                    elif error.kind == "not_found":
                         closest_values = [v for v in error.closest if v and v != "none"]
                         closest_str = ", ".join(closest_values) if closest_values else "none"
                         result.answer = f"I couldn't find a value matching '{error.mention}'. Closest: {closest_str}."
