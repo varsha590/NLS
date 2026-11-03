@@ -264,9 +264,6 @@ class DatabaseAdapter:
             connection.close()
 
 
-from schema.documents import build_table_document, build_column_document, build_relationship_document
-
-
 class EmbeddingStore:
     """Encapsulates all pgvector embedding operations: upsert, search, delete, build."""
 
@@ -285,25 +282,52 @@ class EmbeddingStore:
         content_hash: str,
         embedding: list[float] | None,
     ) -> None:
-        """Upsert a schema embedding row."""
+        """Upsert a schema embedding row.
+
+        When *embedding* is None (unchanged row), the stored vector is preserved
+        via a conditional DO UPDATE that only writes the embedding column when
+        EXCLUDED.embedding IS NOT NULL.  If the stored vector is already NULL
+        (corrupted / missing) and the incoming embedding is also None, this
+        method is a no-op for that row — callers must detect and repair such
+        rows separately.
+        """
         if self.adapter.get_dialect() != "postgresql":
             return
         connection = self.adapter.connect()
         try:
-            stmt = sa.text(
-                """
-                INSERT INTO system_schema_embeddings
-                    (table_name, column_name, metadata_type, content, content_hash, embedding, namespace)
-                VALUES
-                    (:table_name, :column_name, :metadata_type, :content, :content_hash, :embedding, :namespace)
-                ON CONFLICT (table_name, column_name, metadata_type, namespace)
-                DO UPDATE SET
-                    content = EXCLUDED.content,
-                    content_hash = EXCLUDED.content_hash,
-                    embedding = EXCLUDED.embedding,
-                    updated_at = CURRENT_TIMESTAMP;
-                """
-            )
+            if embedding is not None:
+                # New or changed content: write full row including new embedding.
+                stmt = sa.text(
+                    """
+                    INSERT INTO system_schema_embeddings
+                        (table_name, column_name, metadata_type, content, content_hash, embedding, namespace)
+                    VALUES
+                        (:table_name, :column_name, :metadata_type, :content, :content_hash, :embedding, :namespace)
+                    ON CONFLICT (table_name, column_name, metadata_type, namespace)
+                    DO UPDATE SET
+                        content = EXCLUDED.content,
+                        content_hash = EXCLUDED.content_hash,
+                        embedding = EXCLUDED.embedding,
+                        updated_at = CURRENT_TIMESTAMP;
+                    """
+                )
+            else:
+                # Unchanged content: preserve any existing vector, only refresh
+                # the text fields so the row stays current.
+                stmt = sa.text(
+                    """
+                    INSERT INTO system_schema_embeddings
+                        (table_name, column_name, metadata_type, content, content_hash, embedding, namespace)
+                    VALUES
+                        (:table_name, :column_name, :metadata_type, :content, :content_hash, :embedding, :namespace)
+                    ON CONFLICT (table_name, column_name, metadata_type, namespace)
+                    DO UPDATE SET
+                        content = EXCLUDED.content,
+                        content_hash = EXCLUDED.content_hash,
+                        embedding = COALESCE(system_schema_embeddings.embedding, EXCLUDED.embedding),
+                        updated_at = CURRENT_TIMESTAMP;
+                    """
+                )
             params = {
                 "table_name": table_name,
                 "column_name": column_name,
@@ -329,24 +353,46 @@ class EmbeddingStore:
         content_hash: str,
         embedding: list[float] | None,
     ) -> None:
-        """Upsert a value embedding row."""
+        """Upsert a value embedding row.
+
+        When *embedding* is None (unchanged row), the stored vector is preserved
+        via COALESCE so it is never overwritten with NULL.  Raw value text is
+        never written to log extras (0f fix).
+        """
         if self.adapter.get_dialect() != "postgresql":
             return
         connection = self.adapter.connect()
         try:
-            stmt = sa.text(
-                """
-                INSERT INTO system_value_embeddings
-                    (namespace, table_name, column_name, value, content_hash, embedding)
-                VALUES
-                    (:namespace, :table_name, :column_name, :value, :content_hash, :embedding)
-                ON CONFLICT (namespace, table_name, column_name, value)
-                DO UPDATE SET
-                    content_hash = EXCLUDED.content_hash,
-                    embedding = EXCLUDED.embedding,
-                    updated_at = CURRENT_TIMESTAMP;
-                """
-            )
+            if embedding is not None:
+                # New or changed value: write full row including new embedding.
+                stmt = sa.text(
+                    """
+                    INSERT INTO system_value_embeddings
+                        (namespace, table_name, column_name, value, content_hash, embedding)
+                    VALUES
+                        (:namespace, :table_name, :column_name, :value, :content_hash, :embedding)
+                    ON CONFLICT (namespace, table_name, column_name, value)
+                    DO UPDATE SET
+                        content_hash = EXCLUDED.content_hash,
+                        embedding = EXCLUDED.embedding,
+                        updated_at = CURRENT_TIMESTAMP;
+                    """
+                )
+            else:
+                # Unchanged value: preserve existing vector.
+                stmt = sa.text(
+                    """
+                    INSERT INTO system_value_embeddings
+                        (namespace, table_name, column_name, value, content_hash, embedding)
+                    VALUES
+                        (:namespace, :table_name, :column_name, :value, :content_hash, :embedding)
+                    ON CONFLICT (namespace, table_name, column_name, value)
+                    DO UPDATE SET
+                        content_hash = EXCLUDED.content_hash,
+                        embedding = COALESCE(system_value_embeddings.embedding, EXCLUDED.embedding),
+                        updated_at = CURRENT_TIMESTAMP;
+                    """
+                )
             params = {
                 "namespace": self.namespace,
                 "table_name": table_name,
@@ -358,15 +404,24 @@ class EmbeddingStore:
             connection.execute(stmt, params)
             connection.commit()
         except sa.exc.SQLAlchemyError:
-            LOGGER.error("Failed to upsert value embedding", extra={"table": table_name, "column": column_name, "value": value})
+            # Log table/column only — never log the raw value (0f).
+            LOGGER.error(
+                "Failed to upsert value embedding",
+                extra={"table": table_name, "column": column_name},
+            )
             connection.rollback()
         finally:
             connection.close()
 
-    def upsert_example(self, question: str, sql: str) -> None:
-        """Upsert a verified example."""
+    def upsert_example(self, question: str, sql: str) -> bool:
+        """Upsert a verified example.
+
+        Returns True when the row was persisted successfully, False otherwise.
+        Callers must check the return value and not report success to users when
+        this returns False (0e fix).
+        """
         if self.adapter.get_dialect() != "postgresql":
-            return
+            return False
         connection = self.adapter.connect()
         try:
             stmt = sa.text(
@@ -388,9 +443,11 @@ class EmbeddingStore:
             }
             connection.execute(stmt, params)
             connection.commit()
+            return True
         except sa.exc.SQLAlchemyError:
-            LOGGER.error("Failed to upsert example", extra={"question": question})
+            LOGGER.error("Failed to upsert example", extra={"question_len": len(question)})
             connection.rollback()
+            return False
         finally:
             connection.close()
 
@@ -523,14 +580,15 @@ class EmbeddingStore:
             connection.close()
 
     def get_all_value_embeddings(self) -> list[dict[str, Any]]:
-        """Retrieve all value embeddings for pruning."""
+        """Retrieve all value embeddings for pruning and null-vector detection."""
         if self.adapter.get_dialect() != "postgresql":
             return []
         connection = self.adapter.connect()
         try:
             stmt = sa.text(
                 """
-                SELECT table_name, column_name, value, content_hash
+                SELECT table_name, column_name, value, content_hash,
+                       (embedding IS NULL) AS vector_missing
                 FROM system_value_embeddings
                 WHERE namespace = :namespace
                 """
@@ -542,6 +600,7 @@ class EmbeddingStore:
                     "column_name": row["column_name"],
                     "value": row["value"],
                     "content_hash": row["content_hash"],
+                    "vector_missing": bool(row["vector_missing"]),
                 }
                 for row in result.mappings()
             ]
@@ -549,14 +608,15 @@ class EmbeddingStore:
             connection.close()
 
     def get_all_schema_embeddings(self) -> list[dict[str, Any]]:
-        """Retrieve all schema embeddings for pruning."""
+        """Retrieve all schema embeddings for pruning and null-vector detection."""
         if self.adapter.get_dialect() != "postgresql":
             return []
         connection = self.adapter.connect()
         try:
             stmt = sa.text(
                 """
-                SELECT table_name, column_name, metadata_type, content_hash
+                SELECT table_name, column_name, metadata_type, content_hash,
+                       (embedding IS NULL) AS vector_missing
                 FROM system_schema_embeddings
                 WHERE namespace = :namespace
                 """
@@ -568,6 +628,7 @@ class EmbeddingStore:
                     "column_name": row["column_name"],
                     "metadata_type": row["metadata_type"],
                     "content_hash": row["content_hash"],
+                    "vector_missing": bool(row["vector_missing"]),
                 }
                 for row in result.mappings()
             ]
@@ -686,10 +747,16 @@ class EmbeddingStore:
         finally:
             connection.close()
 
-    def build_schema_embeddings(self, metadata: Any, embedder: Any | None = None) -> None:
-        """Build schema embeddings from introspected metadata: table_ddl, column_description, relationship."""
+    def build_schema_embeddings(self, metadata: Any, embedder: Any | None = None) -> bool:
+        """Build schema embeddings from introspected metadata: table_ddl, column_description, relationship.
+
+        Returns True when indexing completed without errors, False when any error
+        occurred (partial index).  Unchanged rows whose vector is intact are
+        skipped; rows whose hash matches but whose stored vector is NULL are
+        repaired by re-embedding.
+        """
         if self.adapter.get_dialect() != "postgresql":
-            return
+            return True
         if embedder is None:
             from retrieval.embeddings import EmbeddingModel
 
@@ -749,35 +816,43 @@ class EmbeddingStore:
                         }
                     )
 
-            # Fetch existing hashes to skip unchanged
+            # Fetch existing rows: hash and whether their vector is NULL (0a repair).
             existing = self.get_all_schema_embeddings()
-            existing_hashes = {
-                (r["table_name"], r["column_name"], r["metadata_type"]): r["content_hash"]
-                for r in existing
-            }
+            existing_hashes: dict[tuple, str] = {}
+            null_vector_keys: set[tuple] = set()
+            for r in existing:
+                key = (r["table_name"], r["column_name"], r["metadata_type"])
+                existing_hashes[key] = r["content_hash"]
+                if r.get("vector_missing"):
+                    null_vector_keys.add(key)
 
-            # Determine which need embedding
+            # Determine which need embedding:
+            # - content changed (hash mismatch), OR
+            # - content unchanged but stored vector is NULL (repair path, 0a).
             to_embed = []
             for row in rows_to_upsert:
                 key = (row["table_name"], row["column_name"], row["metadata_type"])
-                if existing_hashes.get(key) != row["content_hash"]:
+                hash_changed = existing_hashes.get(key) != row["content_hash"]
+                vector_missing = key in null_vector_keys
+                if hash_changed or vector_missing:
                     to_embed.append(row)
 
-            # Batch embed new/changed
+            # Batch embed new/changed/repaired rows
             embeddings = []
             if to_embed:
                 embeddings = embedder.embed([r["content"] for r in to_embed])
 
-            # Create mapping from key to embedding for new/changed rows
+            # Create mapping from key to embedding for rows that need (re-)embedding
             embed_map = {
                 (r["table_name"], r["column_name"], r["metadata_type"]): embeddings[i].tolist()
                 for i, r in enumerate(to_embed)
             }
 
-            # Upsert all
+            # Upsert all rows; unchanged rows with intact vectors pass embedding=None
+            # and upsert_schema uses COALESCE to preserve the stored vector (0a).
             for row in rows_to_upsert:
                 key = (row["table_name"], row["column_name"], row["metadata_type"])
-                embedding = embed_map.get(key)  # None if unchanged
+                embedding = embed_map.get(key)  # None if unchanged and vector intact
                 self.upsert_schema(
                     table_name=row["table_name"],
                     column_name=row["column_name"],
@@ -792,16 +867,24 @@ class EmbeddingStore:
             self.prune_schema(keep_keys)
 
             connection.commit()
+            return True
         except sa.exc.SQLAlchemyError:
             LOGGER.error("Failed to build schema embeddings")
             connection.rollback()
+            return False
         finally:
             connection.close()
 
-    def build_value_embeddings(self, metadata: Any, embedder: Any | None = None, cardinality_threshold: int = 500) -> None:
-        """Build value embeddings from database distinct values."""
+    def build_value_embeddings(self, metadata: Any, embedder: Any | None = None, cardinality_threshold: int = 500) -> bool:
+        """Build value embeddings from database distinct values.
+
+        Returns True when indexing completed without errors, False when any error
+        occurred (partial index).  Unchanged rows whose vector is intact are
+        skipped; rows whose hash matches but whose stored vector is NULL are
+        repaired by re-embedding (0a fix).
+        """
         if self.adapter.get_dialect() != "postgresql":
-            return
+            return True
         if embedder is None:
             from retrieval.embeddings import EmbeddingModel
 
@@ -856,18 +939,25 @@ class EmbeddingStore:
                             }
                         )
 
-            # Fetch existing hashes
+            # Fetch existing rows: hash and whether their vector is NULL (0a repair).
             existing = self.get_all_value_embeddings()
-            existing_hashes = {
-                (r["table_name"], r["column_name"], r["value"]): r["content_hash"]
-                for r in existing
-            }
+            existing_hashes: dict[tuple, str] = {}
+            null_vector_keys: set[tuple] = set()
+            for r in existing:
+                key = (r["table_name"], r["column_name"], r["value"])
+                existing_hashes[key] = r["content_hash"]
+                if r.get("vector_missing"):
+                    null_vector_keys.add(key)
 
-            # Determine which need embedding
+            # Determine which need embedding:
+            # - content changed (hash mismatch), OR
+            # - content unchanged but stored vector is NULL (repair path, 0a).
             to_embed = []
             for row in rows_to_upsert:
                 key = (row["table_name"], row["column_name"], row["value"])
-                if existing_hashes.get(key) != row["content_hash"]:
+                hash_changed = existing_hashes.get(key) != row["content_hash"]
+                vector_missing = key in null_vector_keys
+                if hash_changed or vector_missing:
                     to_embed.append(row)
 
             # Batch embed
@@ -875,16 +965,17 @@ class EmbeddingStore:
             if to_embed:
                 embeddings = embedder.embed([r["value"] for r in to_embed])
 
-            # Create mapping from key to embedding for new/changed rows
+            # Create mapping from key to embedding for rows that need (re-)embedding
             embed_map = {
                 (r["table_name"], r["column_name"], r["value"]): embeddings[i].tolist()
                 for i, r in enumerate(to_embed)
             }
 
-            # Upsert all
+            # Upsert all rows; unchanged rows with intact vectors pass embedding=None
+            # and upsert_value uses COALESCE to preserve the stored vector (0a).
             for row in rows_to_upsert:
                 key = (row["table_name"], row["column_name"], row["value"])
-                embedding = embed_map.get(key)  # None if unchanged
+                embedding = embed_map.get(key)  # None if unchanged and vector intact
                 self.upsert_value(
                     table_name=row["table_name"],
                     column_name=row["column_name"],
@@ -898,9 +989,11 @@ class EmbeddingStore:
             self.prune_values(keep_keys)
 
             connection.commit()
+            return True
         except sa.exc.SQLAlchemyError:
             LOGGER.error("Failed to build value embeddings")
             connection.rollback()
+            return False
         finally:
             connection.close()
 

@@ -29,7 +29,15 @@ def _render_sidebar(runtime: dict[str, Any]) -> None:
     st.sidebar.title("Configuration")
     st.sidebar.metric("Connected dialect", runtime["adapter"].get_dialect())
     st.sidebar.metric("Tables indexed", runtime["indexed_tables"])
-    st.sidebar.caption(f"Schema index: {runtime['catalog_status']}")
+    catalog_status = runtime.get("catalog_status", "unknown")
+    st.sidebar.caption(f"Schema index: {catalog_status}")
+    # Surface incomplete index prominently (0h fix).
+    if not runtime.get("index_complete", True):
+        st.sidebar.warning(
+            "Index incomplete: one or more embedding build steps failed. "
+            "Re-index to repair.",
+            icon="⚠️",
+        )
     if st.sidebar.button("Re-index schema", icon=":material/refresh:"):
         load_runtime.clear()
         st.session_state.force_reindex = True
@@ -105,8 +113,8 @@ def _render_result(result: dict[str, Any], question: str, runtime: dict[str, Any
         else:
             st.info("No SQL was generated.")
 
-    if result.get("rows"):
-        st.dataframe(result["rows"], alt="Query result rows")
+    if result.get("rows") is not None and result.get("sql") and not result.get("errors"):
+        st.dataframe(result["rows"], alt="Query result rows") if result["rows"] else st.info("No rows matched the question.")
     elif result.get("sql") and not result.get("errors"):
         st.info("No rows matched the question.")
     for error in result.get("errors", []):
@@ -114,10 +122,19 @@ def _render_result(result: dict[str, Any], question: str, runtime: dict[str, Any
             continue
         st.error(error)
 
-    if result.get("sql"):
+    # Show "This was correct" only when SQL validated AND executed without errors (0e fix).
+    sql_is_verified = (
+        bool(result.get("sql"))
+        and not result.get("errors")
+        and result.get("rows") is not None
+    )
+    if sql_is_verified:
         if st.button("This was correct", icon=":material/thumb_up:", key="save-example"):
-            runtime["examples"].save(question, result["sql"])
-            st.success("Saved as a verified example for this database.")
+            saved = runtime["examples"].save(question, result["sql"])
+            if saved:
+                st.success("Saved as a verified example for this database.")
+            else:
+                st.warning("Could not persist the example (storage unavailable).")
     if result.get("timings"):
         with st.expander("Run details"):
             st.write(f"Tables used: {', '.join(result.get('tables_used', [])) or 'None'}")

@@ -304,11 +304,32 @@ class ValueIndex:
         ]
         if column and column in self.large_columns:
             table_name, column_name = column.rsplit(".", 1)
-            candidate_values.extend(
-                (column, value)
-                for value in self.adapter.search_values(table_name, column_name, mention, top_k)
-                if not self._is_schema_value(value)
-            )
+            if self.embedding_store is not None:
+                # Use EmbeddingStore.search_values for high-cardinality columns (0b fix).
+                # Embed the mention once and search via the store.
+                if self.embedder is not None:
+                    span_embedding = self.embedder.embed([mention])[0].tolist()
+                    store_results = self.embedding_store.search_values(
+                        query_embedding=span_embedding,
+                        top_k=top_k,
+                    )
+                    candidate_values.extend(
+                        (column, result["value"])
+                        for result in store_results
+                        if result.get("table_name") == table_name
+                        and result.get("column_name") == column_name
+                        and not self._is_schema_value(result["value"])
+                    )
+                else:
+                    LOGGER.debug(
+                        "High-cardinality lookup skipped: no embedder",
+                        extra={"column": column},
+                    )
+            else:
+                LOGGER.debug(
+                    "High-cardinality lookup skipped: no embedding_store",
+                    extra={"column": column},
+                )
         unique = list(dict.fromkeys(candidate_values))
         if not unique:
             return []

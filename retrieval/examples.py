@@ -14,9 +14,13 @@ class ExampleStore:
     def __init__(self, path: str | None, adapter: DatabaseAdapter) -> None:
         self.embedding_store = EmbeddingStore(adapter)
 
-    def save(self, question: str, sql: str) -> None:
-        """Save or replace a verified question/SQL pair."""
-        self.embedding_store.upsert_example(question, sql)
+    def save(self, question: str, sql: str) -> bool:
+        """Save or replace a verified question/SQL pair.
+
+        Returns True when the example was persisted successfully, False otherwise.
+        Callers must check the return value and not claim success when False (0e fix).
+        """
+        return self.embedding_store.upsert_example(question, sql)
 
     def retrieve(self, question: str, top_k: int = 3) -> list[dict[str, Any]]:
         """Return the most lexically similar verified examples."""

@@ -55,13 +55,21 @@ def init_app(force: bool = False) -> dict[str, Any]:
 
     if not cached_is_current:
         # Build schema embeddings from introspected metadata
-        embedding_store.build_schema_embeddings(metadata)
+        schema_ok = embedding_store.build_schema_embeddings(metadata)
         # Build value embeddings from database values
-        embedding_store.build_value_embeddings(metadata, embedding_model, settings.value_cardinality_threshold)
+        value_ok = embedding_store.build_value_embeddings(metadata, embedding_model, settings.value_cardinality_threshold)
     else:
         # Refresh what changed - only update rows that differ
-        embedding_store.build_schema_embeddings(metadata)
-        embedding_store.build_value_embeddings(metadata, embedding_model, settings.value_cardinality_threshold)
+        schema_ok = embedding_store.build_schema_embeddings(metadata)
+        value_ok = embedding_store.build_value_embeddings(metadata, embedding_model, settings.value_cardinality_threshold)
+
+    # Track whether the index build succeeded fully (0h fix: surface partial failures).
+    index_complete = schema_ok and value_ok
+    if not index_complete:
+        LOGGER.warning(
+            "Index build completed with errors; index may be incomplete",
+            extra={"dialect": adapter.get_dialect()},
+        )
 
     # Create ValueIndex with embedding_store for value resolution
     value_index = ValueIndex(
@@ -94,6 +102,13 @@ def init_app(force: bool = False) -> dict[str, Any]:
 
     # Store resources in runtime
     global _runtime
+    # Determine catalog status (0h fix: show "incomplete" when index build had errors).
+    if not index_complete:
+        catalog_status = "incomplete"
+    elif schema_count > 0 or previously_indexed:
+        catalog_status = "cached"
+    else:
+        catalog_status = "indexed"
     _runtime = {
         "settings": settings,
         "adapter": adapter,
@@ -105,7 +120,8 @@ def init_app(force: bool = False) -> dict[str, Any]:
         "examples": examples,
         "pipeline": pipeline,
         "indexed_tables": len(metadata.tables),
-        "catalog_status": "cached" if schema_count > 0 or previously_indexed else "indexed",
+        "catalog_status": catalog_status,
+        "index_complete": index_complete,
     }
     LOGGER.info(
         "Application ready",

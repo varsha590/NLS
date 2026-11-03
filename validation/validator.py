@@ -163,15 +163,25 @@ def _check_and_rewrite_literals(
     value_index: ValueIndex | None,
     resolved_values: list[dict[str, Any]] | None,
     dialect: str | None,
+    used_tables: dict[str, object] | None = None,
 ) -> tuple[str | None, list[str]]:
-    """
-    Check string literals in comparisons against value index.
+    """Check string literals in comparisons against value index.
+
+    Unqualified column references are resolved only against *used_tables* (the
+    tables actually referenced by the query), not the full catalog.  This
+    prevents false-positive value-safety rejections on same-named columns in
+    tables that are not part of the current query (0g fix).
+
     Returns (rewritten_sql, errors).
     If errors, the query should not be executed.
     """
     if value_index is None:
         return (None, [])
-    
+
+    # Columns are resolved against the tables actually used by the query.
+    # Fall back to the full catalog only if used_tables is not provided (0g fix).
+    column_scope = used_tables if used_tables else catalog
+
     errors: list[str] = []
     rewrites: list[tuple[exp.Expression, str]] = []  # (node, new_value)
     
@@ -218,8 +228,8 @@ def _check_and_rewrite_literals(
                     if table_key:
                         column_key = f"{table_key}.{col_name}"
                 else:
-                    # Unqualified column - find in used tables
-                    for table_key, table in catalog.items():
+                    # Unqualified column — search only the tables used by this query (0g fix).
+                    for table_key, table in column_scope.items():
                         if col_name.casefold() in {c.name.casefold() for c in table.columns}:
                             column_key = f"{table_key}.{col_name}"
                             break
@@ -281,7 +291,8 @@ def _check_and_rewrite_literals(
                         if table_key:
                             column_key = f"{table_key}.{col_name}"
                     else:
-                        for table_key, table in catalog.items():
+                        # Unqualified column — search only the tables used by this query (0g fix).
+                        for table_key, table in column_scope.items():
                             if col_name.casefold() in {c.name.casefold() for c in table.columns}:
                                 column_key = f"{table_key}.{col_name}"
                                 break
@@ -477,7 +488,7 @@ def validate_sql(
             limit.set("expression", exp.Literal.number(max_rows))
     # Literal safety net: check string literals against value index
     rewritten_sql, errors = _check_and_rewrite_literals(
-        parsed, table_aliases, catalog, value_index, resolved_values, dialect
+        parsed, table_aliases, catalog, value_index, resolved_values, dialect, used_tables=used_tables
     )
     if errors:
         # Parse first error to extract structured info

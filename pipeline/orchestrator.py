@@ -211,6 +211,7 @@ class TextToSQLPipeline:
                         time.monotonic() - generation_started
                     ) * 1000 if isinstance(error, GenerationError) else result.timings.get("generation_ms", 0)
                     result.errors.append(str(error))
+                    result.sql = ""  # Clear unverified SQL on validation failure (0e fix)
                     correction = str(error)
                     if attempt < self.max_retries:
                         continue
@@ -298,6 +299,7 @@ class TextToSQLPipeline:
                         time.monotonic() - execution_started
                     ) * 1000
                     result.errors.append(str(error))
+                    result.sql = ""  # Clear unexecuted SQL on execution failure (0e fix)
                     correction = str(error)
                     if attempt >= self.max_retries:
                         result.answer = "The query could not be run against the connected database."

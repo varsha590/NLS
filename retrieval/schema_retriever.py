@@ -10,6 +10,7 @@ import numpy as np
 
 from db.adapter import EmbeddingStore
 from config.settings import Settings
+from retrieval.embeddings import EmbeddingModel
 from schema.index_schema import cosine_similarity
 from schema.metadata import SchemaMetadata
 
@@ -70,12 +71,17 @@ class HybridSchemaRetriever:
                 query_vector.tolist(), top_k=max(top_k, MAX_TOP_K), metadata_type="table_ddl"
             )
         
-        # Build a lookup of semantic scores from the search results
+        # Build a lookup of semantic scores from the search results, keyed by
+        # the schema-qualified table name returned by the store.  The store key
+        # matches the fully-qualified name (schema.table or bare table) that was
+        # used when the embedding was built.  We must NOT fall back to positional
+        # indexing because semantic results are similarity-ranked, so position
+        # does not correspond to document position (0c fix).
         semantic_scores: dict[str, float] = {}
         for result in semantic_results:
             table_name = result.get("table_name", "")
-            # Store per-table similarity
-            semantic_scores[table_name] = result.get("similarity", 0.0)
+            if table_name:
+                semantic_scores[table_name] = result.get("similarity", 0.0)
         
         ranked = []
         for index, document in enumerate(self.documents):
@@ -85,12 +91,15 @@ class HybridSchemaRetriever:
                 min(tokens[token], query_tokens.count(token)) for token in set(query_tokens)
             ) / max(1, len(set(query_tokens)))
             
-            # Semantic scoring: use from EmbeddingStore if available, else fallback
+            # Semantic scoring: match by schema-qualified key first, then by
+            # bare table name.  Never fall back to positional indexing because
+            # semantic_results are similarity-ranked (0c fix).
             table_name = document["table_name"]
+            bare_name = table_name.rsplit(".", 1)[-1]
             if table_name in semantic_scores:
                 semantic = semantic_scores[table_name]
-            elif self.embedding_store is not None and len(semantic_results) > index:
-                semantic = semantic_results[index].get("similarity", 0.0)
+            elif bare_name in semantic_scores:
+                semantic = semantic_scores[bare_name]
             else:
                 semantic = 0.0
             
@@ -149,11 +158,7 @@ def retrieve_schema(engine, query: str, top_k: int = DEFAULT_TOP_K, indexer=None
 
     started = time.monotonic()
     metadata = SchemaMetadata.from_engine(engine)
-    from db.adapter import EmbeddingStore
-    
-    # Get or create embedding store from engine connection
-    adapter = None
-    # Try to get adapter from somewhere - for compatibility, create a basic lookup
+
     # If indexer is provided, use its embedding store
     if indexer is not None:
         initial = indexer.search_similar(query, top_k=top_k)

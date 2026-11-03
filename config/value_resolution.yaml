@@ -38,10 +38,10 @@ excluded_column_names:
   - table_name
   - column_name
   - description
-  # - name
-  # - first_name
-  # - last_name
-  # - full_name
+  - name
+  - first_name
+  - last_name
+  - full_name
   - email
   - phone
   - phone_number
@@ -344,42 +344,9 @@ excluded_terms:
   - friday
   - saturday
   - sunday
-  # Library schema nouns/verbs: these name tables or actions, not values.
-  # Status-like words (borrowed, returned, overdue, paid, unpaid, active) are
-  # deliberately NOT listed because they are real values.
-  # - book
-  # - books
-  # - author
-  # - authors
-  # - member
-  # - member_name
-  # - name
-  # # - members
-  # - loan
-  # - loans
-  # - fine
-  # - fines
-  # - branch
-  # - branches
-  # - publisher
-  # - publishers
-  # - staff
-  # - library
-  # - libraries
-  # - copy
-  # - copies
-  # - title
-  # - titles
-  # - written
-  # - wrote
-  # - published
-  # - borrow
-  # - borrows
-  # - issued
-  # - category
-  # - categories
-  # - genre
-  # - genres
+  - name
+  - email
+  
 
 cue_aliases:
   category:
