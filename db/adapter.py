@@ -767,11 +767,13 @@ class EmbeddingStore:
             # Build list of rows to upsert
             rows_to_upsert = []
             for table_info in metadata.tables.values():
-                table_name = table_info.name.rsplit(".", 1)[-1]
-                if table_name.startswith("system_"):
+                bare_name = table_info.name.rsplit(".", 1)[-1]
+                if bare_name.startswith("system_"):
                     continue
-                if table_name in EXCLUDED_SCHEMA_OBJECTS:
+                if bare_name in EXCLUDED_SCHEMA_OBJECTS or table_info.name in EXCLUDED_SCHEMA_OBJECTS:
                     continue
+                # Keep schema-qualified name for persisted schema key (0c fix)
+                table_name = table_info.name
 
                 # table_ddl row
                 table_doc = build_table_document(table_info)
@@ -895,17 +897,18 @@ class EmbeddingStore:
             # Gather all values to embed
             rows_to_upsert = []
             for table_info in metadata.tables.values():
-                table_name = table_info.name.rsplit(".", 1)[-1]
-                if table_name.startswith("system_"):
+                bare_name = table_info.name.rsplit(".", 1)[-1]
+                if bare_name.startswith("system_"):
                     continue
-                if table_name in EXCLUDED_SCHEMA_OBJECTS:
+                if bare_name in EXCLUDED_SCHEMA_OBJECTS or table_info.name in EXCLUDED_SCHEMA_OBJECTS:
                     continue
                 reflected = sa.Table(
-                    table_name,
+                    bare_name,
                     sa.MetaData(),
                     schema=table_info.schema,
                     autoload_with=self.adapter.engine,
                 )
+                table_key = table_info.name
                 for column_info in table_info.columns:
                     column = reflected.c.get(column_info.name)
                     if column is None:
@@ -932,7 +935,7 @@ class EmbeddingStore:
                         content_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
                         rows_to_upsert.append(
                             {
-                                "table_name": table_name,
+                                "table_name": table_key,
                                 "column_name": column_info.name,
                                 "value": value,
                                 "content_hash": content_hash,
