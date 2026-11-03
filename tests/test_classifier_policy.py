@@ -14,6 +14,10 @@ from catalog.classifier import (
     ColumnClass,
     classify_column,
     get_column_stats,
+    is_flag_like_options,
+    is_text_type,
+    parse_enum_options,
+    reviewable_sensitive_name_tokens,
     split_identifier_tokens,
 )
 from catalog.introspect import introspect_catalog
@@ -25,6 +29,7 @@ from retrieval.value_index import ValueIndex
 from schema.documents import build_column_document, build_table_document
 from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo, is_internal_table_name
 from validation.validator import ValidationError, validate_sql
+from scripts.classify_report import _possible_duplicate_table_groups
 
 
 # ---------------------------------------------------------------------------
@@ -133,6 +138,101 @@ def test_default_deny_unknown_column_types():
     )
     assert col_class == ColumnClass.SKIP
     assert "unclassifiable" in reason
+
+
+@pytest.mark.parametrize(
+    "sql_type,expected_class,expected_option_count",
+    [
+        ("ENUM('a','b','c')", ColumnClass.VALUE_LOW, 3),
+        ("ENUM('0','1')", ColumnClass.VALUE_LOW, 2),
+        ("VARCHAR(32) COLLATE utf8mb4_unicode_ci", ColumnClass.VALUE_LOW, None),
+        ("TINYINT(1)", ColumnClass.SKIP, None),
+        ("SET('x','y')", ColumnClass.VALUE_LOW, 2),
+    ],
+)
+def test_phase1b_type_metadata_classification(
+    sql_type: str,
+    expected_class: ColumnClass,
+    expected_option_count: int | None,
+):
+    """Use declared ENUM/SET options and normalize collated text type strings."""
+    options = parse_enum_options(sql_type)
+    observed, reason = classify_column(
+        table_name="generic_table",
+        column_name="generic_field",
+        sql_type=sql_type,
+        distinct_count=2,
+        avg_text_length=1,
+    )
+    assert observed == expected_class
+    assert (len(options) if options is not None else None) == expected_option_count
+    assert is_text_type(sql_type) is (expected_class != ColumnClass.SKIP)
+    if expected_option_count is not None:
+        assert str(expected_option_count) in reason
+
+
+def test_phase1b_sensitive_name_review_and_enum_privacy_guards():
+    """Clean categorical options are reviewable; credentials and PII-shaped options remain blocked."""
+    clean, _ = classify_column(
+        "generic_table", "generic_status_email", "ENUM('0','1')"
+    )
+    credential, _ = classify_column(
+        "generic_table", "generic_secret_status", "ENUM('0','1')"
+    )
+    pii_shaped, _ = classify_column(
+        "generic_table", "generic_status", "ENUM('a@example.test','b@example.test')"
+    )
+    text_without_shape_evidence, _ = classify_column(
+        "generic_table",
+        "generic_status_email",
+        "VARCHAR(32) COLLATE utf8mb4_unicode_ci",
+        distinct_count=2,
+    )
+    text_with_clean_shape_evidence, _ = classify_column(
+        "generic_table",
+        "generic_status_email",
+        "VARCHAR(32) COLLATE utf8mb4_unicode_ci",
+        distinct_count=2,
+        sensitive_values_clean=True,
+    )
+
+    assert clean == ColumnClass.VALUE_LOW
+    assert credential == ColumnClass.BLOCKED
+    assert pii_shaped == ColumnClass.BLOCKED
+    assert text_without_shape_evidence == ColumnClass.BLOCKED
+    assert text_with_clean_shape_evidence == ColumnClass.VALUE_LOW
+    assert reviewable_sensitive_name_tokens("generic_status_email") == ["email"]
+    assert is_flag_like_options(parse_enum_options("ENUM('0','1')"))
+
+
+def test_possible_duplicate_groups_use_column_structure_only():
+    """Similar structures group regardless of unrelated table names."""
+    tables = [
+        TableInfo(
+            name="generic_alpha",
+            description="",
+            columns=[ColumnInfo("field_a", "VARCHAR(32)"), ColumnInfo("field_b", "INTEGER")],
+            primary_key_names=[],
+            foreign_keys=[],
+        ),
+        TableInfo(
+            name="generic_beta",
+            description="",
+            columns=[ColumnInfo("field_a", "VARCHAR(32)"), ColumnInfo("field_b", "INTEGER")],
+            primary_key_names=[],
+            foreign_keys=[],
+        ),
+        TableInfo(
+            name="generic_other",
+            description="",
+            columns=[ColumnInfo("unrelated", "TEXT")],
+            primary_key_names=[],
+            foreign_keys=[],
+        ),
+    ]
+
+    groups = _possible_duplicate_table_groups(tables)
+    assert groups == [{"tables": ["generic_alpha", "generic_beta"], "minimum_similarity": 1.0}]
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +576,14 @@ def test_classifier_runs_on_local_mysql_hiresanta():
             assert "# Database Column Classification Report" in report
             assert "Summary Counts" in report
             assert "Detailed Column Classifications" in report
+            assert "## POSSIBLE DUPLICATE TABLES" in report
+            assert "## FLAG-LIKE VALUE COLUMNS" in report
+            assert "## Columns With Stats Unavailable" in report
+            assert "non-text type: ENUM" not in report
+            unavailable = report.split("## Columns With Stats Unavailable", 1)[1].split(
+                "## Sensitive-Value Shape Checks Unavailable", 1
+            )[0]
+            assert "0 columns had stats unavailable." in unavailable or "| Table.Column | Error category |" in unavailable
     finally:
         if tmp_path.exists():
             tmp_path.unlink()

@@ -19,7 +19,7 @@ import fnmatch
 import logging
 import re
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection, Engine
@@ -71,6 +71,16 @@ WEAK_BLOCK_TOKENS = frozenset({
     "session",
     "token",
 })
+
+CREDENTIAL_BLOCK_PATTERNS = ("password", "passwd", "pwd", "token", "secret", "otp", "api_key")
+FLAG_OPTION_PAIRS = (
+    frozenset(("0", "1")),
+    frozenset(("false", "true")),
+    frozenset(("no", "yes")),
+    frozenset(("n", "y")),
+    frozenset(("off", "on")),
+    frozenset(("disabled", "enabled")),
+)
 
 # Free-text column name indicators
 FREE_TEXT_PATTERNS = (
@@ -182,9 +192,114 @@ def _match_override_list(
     return False, False
 
 
+def normalize_sql_type_name(sql_type: Any) -> str:
+    """Normalize a reflected or textual SQL type, dropping charset/collation suffixes."""
+    type_name = str(sql_type).strip()
+    type_name = re.split(r"\s+(?:COLLATE|CHARACTER\s+SET|CHARSET)\s+", type_name, maxsplit=1, flags=re.IGNORECASE)[0]
+    return type_name.strip().casefold()
+
+
+def parse_enum_options(sql_type: Any) -> tuple[str, ...] | None:
+    """Read ENUM/SET options from type metadata or its SQL type declaration."""
+    declared_options = getattr(sql_type, "enums", None)
+    if declared_options:
+        return tuple(str(option) for option in declared_options)
+
+    type_text = str(sql_type)
+    match = re.search(r"\b(?:enum|set)\s*\(", type_text, re.IGNORECASE)
+    if match is None:
+        return None
+
+    options: list[str] = []
+    index = match.end()
+    while index < len(type_text):
+        while index < len(type_text) and type_text[index].isspace():
+            index += 1
+        if index >= len(type_text) or type_text[index] != "'":
+            return None
+        index += 1
+        value: list[str] = []
+        while index < len(type_text):
+            character = type_text[index]
+            if character == "\\" and index + 1 < len(type_text):
+                value.append(type_text[index + 1])
+                index += 2
+            elif character == "'":
+                if index + 1 < len(type_text) and type_text[index + 1] == "'":
+                    value.append("'")
+                    index += 2
+                else:
+                    index += 1
+                    break
+            else:
+                value.append(character)
+                index += 1
+        else:
+            return None
+        options.append("".join(value))
+        while index < len(type_text) and type_text[index].isspace():
+            index += 1
+        if index < len(type_text) and type_text[index] == ",":
+            index += 1
+            continue
+        if index < len(type_text) and type_text[index] == ")":
+            return tuple(options) or None
+        return None
+    return None
+
+
+def _is_credential_name(tokens: list[str]) -> bool:
+    return any(_matches_token_pattern(tokens, pattern) for pattern in CREDENTIAL_BLOCK_PATTERNS)
+
+
+def reviewable_sensitive_name_tokens(
+    column_name: str,
+    block_patterns: tuple[str, ...] | list[str] = DEFAULT_BLOCK_PATTERNS,
+) -> list[str]:
+    """Return matched non-credential sensitive-name patterns for report review."""
+    tokens = split_identifier_tokens(column_name)
+    if _is_credential_name(tokens):
+        return []
+    return [
+        pattern
+        for pattern in block_patterns
+        if pattern in DEFAULT_BLOCK_PATTERNS and _matches_token_pattern(tokens, pattern)
+    ]
+
+
+def is_pii_shaped_value(value: Any) -> bool:
+    """Detect obvious contact/identifier shapes without retaining or reporting values."""
+    text = str(value).strip()
+    if re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", text):
+        return True
+    if re.fullmatch(r"\+?[\d().\-\s]{7,}", text) and sum(char.isdigit() for char in text) >= 7:
+        return True
+    if re.fullmatch(r"\d{5}(?:-\d{4})?", text):
+        return True
+    if re.search(
+        r"\b(?:p\.?\s*o\.?\s*box|\d{1,6}\s+[\w.'-]+(?:\s+[\w.'-]+){0,3}\s+(?:street|st|road|rd|avenue|ave|lane|ln|drive|dr|court|ct|boulevard|blvd))\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return True
+    return False
+
+
+def is_flag_like_options(options: tuple[str, ...] | list[str]) -> bool:
+    """Identify numeric option sets or conventional two-value boolean labels."""
+    normalized = tuple(option.strip().casefold() for option in options)
+    if normalized and all(re.fullmatch(r"\d+", option) for option in normalized):
+        return True
+    return len(normalized) == 2 and frozenset(normalized) in FLAG_OPTION_PAIRS
+
+
 def is_text_type(sql_type: Any) -> bool:
     """Check if a SQLAlchemy or string SQL type represents character/text data."""
-    type_str = str(sql_type).lower()
+    type_str = normalize_sql_type_name(sql_type)
+    if re.match(r"(?:enum|set)\s*\(", type_str):
+        return True
+    if type_str in ("enum", "set"):
+        return True
     # Explicit non-text markers
     non_text = (
         "int",
@@ -267,6 +382,8 @@ def is_candidate_text_column(
         if _matches_token_pattern(tokens, pat):
             if matched_fa and is_exact_fa:
                 break
+            if pat in DEFAULT_BLOCK_PATTERNS and not _is_credential_name(tokens):
+                break
             return False
 
     # 3. Keys / IDs
@@ -303,6 +420,7 @@ def classify_column(
     overrides: dict[str, Any] | None = None,
     cardinality_threshold: int = DEFAULT_CARDINALITY_THRESHOLD,
     max_avg_text_length: float = DEFAULT_MAX_AVG_TEXT_LENGTH,
+    sensitive_values_clean: bool = False,
 ) -> tuple[ColumnClass, str]:
     """Pure, unit-testable automatic deny-first column classifier.
 
@@ -355,6 +473,12 @@ def classify_column(
             matched_block_pattern = pat
             break
 
+    options = parse_enum_options(sql_type)
+    options_have_pii_shape = options is not None and any(is_pii_shaped_value(option) for option in options)
+    credential_named = _is_credential_name(tokens)
+    reviewable_name = matched_block_pattern in DEFAULT_BLOCK_PATTERNS and not credential_named
+    options_are_safe = options is not None and not options_have_pii_shape and reviewable_name
+
     if matched_block_pattern is not None:
         # force_allow never relaxes a name-pattern BLOCK unless the override is exact table.column
         if matched_fa and is_exact_fa:
@@ -362,17 +486,26 @@ def classify_column(
                 "Exact force_allow override relaxed pattern block",
                 extra={"table": table_name, "column": column_name, "pattern": matched_block_pattern},
             )
-        else:
+        elif not (options_are_safe or (reviewable_name and sensitive_values_clean)):
             return (
                 ColumnClass.BLOCKED,
                 f"blocked by name pattern: '{matched_block_pattern}'",
             )
+
+    if options_have_pii_shape:
+        return ColumnClass.BLOCKED, "blocked because declared options have a PII-like shape"
 
     # -------------------------------------------------------------------------
     # c. Keys and ID columns are never VALUE_* (retained in DDL for joins)
     # -------------------------------------------------------------------------
     if is_key_column(column_name, is_primary_key=is_primary_key, is_foreign_key=is_foreign_key):
         return ColumnClass.SKIP, "key or identifier column (available in DDL for joins)"
+
+    if options is not None:
+        option_count = len(options)
+        if option_count <= cardinality_threshold:
+            return ColumnClass.VALUE_LOW, f"declared option count {option_count} <= threshold {cardinality_threshold}"
+        return ColumnClass.VALUE_HIGH, f"declared option count {option_count} > threshold {cardinality_threshold}"
 
     # -------------------------------------------------------------------------
     # d. SKIP: non-text, free-text, embeddings, hashes, JSON/blob
@@ -407,6 +540,8 @@ def classify_column(
     # -------------------------------------------------------------------------
     if distinct_count is not None:
         if distinct_count <= cardinality_threshold:
+            if matched_block_pattern is not None and sensitive_values_clean:
+                return ColumnClass.VALUE_LOW, f"low-cardinality values ({distinct_count}) appear non-PII; manual review recommended"
             return (
                 ColumnClass.VALUE_LOW,
                 f"text column with distinct count {distinct_count} <= threshold {cardinality_threshold}",
@@ -435,6 +570,7 @@ def get_column_stats(
     table: sa.Table,
     column_name: str,
     threshold: int = DEFAULT_CARDINALITY_THRESHOLD,
+    on_error: Callable[[str], None] | None = None,
 ) -> tuple[int | None, float | None]:
     """Execute one cheap capped query for distinct count and average length.
 
@@ -443,6 +579,15 @@ def get_column_stats(
     """
     col = table.c.get(column_name)
     if col is None:
+        LOGGER.warning(
+            "Column stats unavailable for %s.%s (%s)",
+            table.name,
+            column_name,
+            "column_not_found",
+            extra={"table": table.name, "column": column_name, "error_category": "column_not_found"},
+        )
+        if on_error:
+            on_error("column_not_found")
         return None, None
 
     try:
@@ -467,9 +612,88 @@ def get_column_stats(
             cnt = int(row[0]) if row[0] is not None else 0
             avg_len = float(row[1]) if row[1] is not None else None
             return cnt, avg_len
-    except (sa.exc.SQLAlchemyError, Exception) as exc:
-        LOGGER.debug(
-            "Distinct count scan skipped or failed",
-            extra={"table": table.name, "column": column_name, "error": str(exc)},
+        category = "no_result"
+        LOGGER.warning(
+            "Column stats unavailable for %s.%s (%s)",
+            table.name,
+            column_name,
+            category,
+            extra={"table": table.name, "column": column_name, "error_category": category},
         )
+        if on_error:
+            on_error(category)
+    except Exception as exc:
+        if isinstance(exc, sa.exc.OperationalError):
+            category = "operational_or_connection_error"
+        elif isinstance(exc, sa.exc.ProgrammingError):
+            category = "query_or_schema_error"
+        elif isinstance(exc, sa.exc.DataError):
+            category = "data_error"
+        elif isinstance(exc, sa.exc.SQLAlchemyError):
+            category = "database_error"
+        else:
+            category = "unexpected_error"
+        LOGGER.warning(
+            "Column stats unavailable for %s.%s (%s)",
+            table.name,
+            column_name,
+            category,
+            extra={"table": table.name, "column": column_name, "error_category": category},
+        )
+        if on_error:
+            on_error(category)
     return None, None
+
+
+def get_column_values_have_pii_shape(
+    connection: Connection,
+    table: sa.Table,
+    column_name: str,
+    threshold: int = DEFAULT_CARDINALITY_THRESHOLD,
+    on_error: Callable[[str], None] | None = None,
+) -> bool | None:
+    """Check bounded distinct values in memory and return only whether a PII shape was found."""
+    col = table.c.get(column_name)
+    if col is None:
+        category = "column_not_found"
+        LOGGER.warning(
+            "Column value-shape check unavailable for %s.%s (%s)",
+            table.name,
+            column_name,
+            category,
+            extra={"table": table.name, "column": column_name, "error_category": category},
+        )
+        if on_error:
+            on_error(category)
+        return None
+
+    try:
+        query = (
+            sa.select(col)
+            .where(col.is_not(None))
+            .distinct()
+            .limit(threshold + 1)
+        )
+        values = connection.execute(query).scalars().all()
+        return any(is_pii_shaped_value(value) for value in values)
+    except Exception as exc:
+        if isinstance(exc, sa.exc.OperationalError):
+            category = "operational_or_connection_error"
+        elif isinstance(exc, sa.exc.ProgrammingError):
+            category = "query_or_schema_error"
+        elif isinstance(exc, sa.exc.DataError):
+            category = "data_error"
+        elif isinstance(exc, sa.exc.SQLAlchemyError):
+            category = "database_error"
+        else:
+            category = "unexpected_error"
+        LOGGER.warning(
+            "Column value-shape check unavailable for %s.%s (%s)",
+            table.name,
+            column_name,
+            category,
+            extra={"table": table.name, "column": column_name, "error_category": category},
+        )
+        if on_error:
+            on_error(category)
+        return None
