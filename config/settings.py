@@ -34,6 +34,9 @@ class Settings:
     excluded_tables: tuple[str, ...]
     value_cardinality_threshold: int
     example_candidate_limit: int = 500
+    index_refresh_ttl_hours: float = 24.0
+    index_scan_workers: int = 1
+    embed_cache_max_entries: int = 250000
 
     @classmethod
     def from_env(cls, dotenv_path: str | None = None) -> "Settings":
@@ -75,5 +78,14 @@ class Settings:
             ),
             example_candidate_limit=max(
                 1, int(os.getenv("EXAMPLE_CANDIDATE_LIMIT", "500"))
+            ),
+            index_refresh_ttl_hours=max(
+                0.0, float(os.getenv("INDEX_REFRESH_TTL_HOURS", "24"))
+            ),
+            index_scan_workers=min(
+                8, max(1, int(os.getenv("INDEX_SCAN_WORKERS", "1")))
+            ),
+            embed_cache_max_entries=max(
+                1, int(os.getenv("EMBED_CACHE_MAX_ENTRIES", "250000"))
             ),
         )

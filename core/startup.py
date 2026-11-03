@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
+from catalog.classifier import is_candidate_text_column, parse_enum_options
 from catalog.introspect import introspect_catalog
+from config.data_policy import get_policy_overrides
 from config.settings import Settings
 from db.adapter import DatabaseAdapter
 from llm.generator import GroqGenerator
@@ -76,8 +80,79 @@ def _schema_records(metadata: Any) -> list[dict[str, Any]]:
     return records
 
 
-def init_app(force: bool = False) -> dict[str, Any]:
-    """Connect read-only, introspect, and locally index the configured database."""
+def _table_fingerprint(table: Any) -> str:
+    payload = {
+        "name": table.name,
+        "schema": table.schema,
+        "comment": table.comment,
+        "columns": [
+            {
+                "name": column.name,
+                "type": column.data_type,
+                "enum_options": column.enum_options or parse_enum_options(column.data_type),
+                "nullable": column.nullable,
+                "primary_key": column.is_primary_key,
+                "foreign_key": column.is_foreign_key,
+                "foreign_table": column.foreign_table,
+                "foreign_column": column.foreign_column,
+                "comment": column.comment,
+            }
+            for column in table.columns
+        ],
+        "primary_keys": sorted(table.primary_key_names),
+        "unique_constraints": sorted(
+            sorted(columns) for columns in table.unique_constraints
+        ),
+        "foreign_keys": sorted(
+            json.dumps(item, sort_keys=True, separators=(",", ":"))
+            for item in table.foreign_keys
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _schema_fingerprints(metadata: Any) -> tuple[dict[str, str], str]:
+    table_fingerprints = {
+        name: _table_fingerprint(table)
+        for name, table in sorted(metadata.tables.items())
+        if not is_internal_table_name(name)
+    }
+    global_fingerprint = hashlib.sha256(
+        json.dumps(table_fingerprints, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return table_fingerprints, global_fingerprint
+
+
+def _scan_eligible_tables(metadata: Any) -> set[str]:
+    overrides = get_policy_overrides()
+    result: set[str] = set()
+    for table in metadata.tables.values():
+        if is_internal_table_name(table.name):
+            continue
+        for column in table.columns:
+            if (
+                is_candidate_text_column(
+                    table_name=table.name,
+                    column_name=column.name,
+                    sql_type=column.data_type,
+                    is_primary_key=column.is_primary_key,
+                    is_foreign_key=column.is_foreign_key,
+                    overrides=overrides,
+                )
+                and parse_enum_options(column.data_type) is None
+            ):
+                result.add(table.name)
+                break
+    return result
+
+
+def init_app(
+    force: bool = False,
+    clock: Callable[[], float] | None = None,
+) -> dict[str, Any]:
+    """Load a current local index or incrementally rebuild it from read-only metadata."""
     settings = Settings.from_env()
     adapter = DatabaseAdapter(settings.database_url, settings.query_timeout_seconds)
     connection = adapter.connect()
@@ -86,12 +161,6 @@ def init_app(force: bool = False) -> dict[str, Any]:
     finally:
         connection.close()
 
-    metadata = introspect_catalog(
-        adapter.engine,
-        allowed_schemas=settings.allowed_schemas,
-        excluded_tables=settings.excluded_tables,
-        sample_limit=0,
-    )
     embedding_model = EmbeddingModel(settings.embedding_model)
     local_store = LocalVectorStore(
         root=settings.vector_store_path,
@@ -100,12 +169,37 @@ def init_app(force: bool = False) -> dict[str, Any]:
         dimension=embedding_model.dim,
         policy_hash=_config_policy_hash(settings.value_cardinality_threshold),
         example_candidate_limit=settings.example_candidate_limit,
+        clock=clock,
+        embed_cache_max_entries=settings.embed_cache_max_entries,
     )
-    had_local_index = local_store.count_schema() > 0 or local_store.count_values() > 0
-    if force:
-        local_store.clear_indexes()
 
-    schema_ok = local_store.build_schema(_schema_records(metadata), embedding_model)
+    introspect_started = time.perf_counter()
+    metadata = introspect_catalog(
+        adapter.engine,
+        allowed_schemas=settings.allowed_schemas,
+        excluded_tables=settings.excluded_tables,
+    )
+    introspect_seconds = time.perf_counter() - introspect_started
+    table_fingerprints, global_fingerprint = _schema_fingerprints(metadata)
+    scan_tables = _scan_eligible_tables(metadata)
+    now = clock() if clock is not None else time.time()
+    previous_manifest = local_store.manifest
+    old_table_fingerprints = previous_manifest.get("table_fingerprints", {})
+    old_scan_times = previous_manifest.get("last_value_scan_at", {})
+    policy_changed = previous_manifest.get("config_policy_hash") != local_store.policy_hash
+    changed_tables = {
+        table_name
+        for table_name, fingerprint in table_fingerprints.items()
+        if old_table_fingerprints.get(table_name) != fingerprint
+    }
+    force_rebuild = bool(force)
+    fast_path = not force_rebuild and local_store.fast_path_valid(
+        global_fingerprint,
+        scan_tables,
+        settings.index_refresh_ttl_hours,
+        now=now,
+    )
+
     value_index = ValueIndex(
         adapter=adapter,
         metadata=metadata,
@@ -113,13 +207,156 @@ def init_app(force: bool = False) -> dict[str, Any]:
         embedder=embedding_model,
         local_store=local_store,
     )
-    value_index.build()
-    value_ok = value_index.build_success
-    index_complete = schema_ok and value_ok
+    index_metrics: dict[str, Any] = {
+        "path": "fast_path" if fast_path else "rebuild",
+        "index_age_seconds": max(0.0, now - float(previous_manifest.get("build_time", now))),
+        "stages": {
+            "introspect": {
+                "status": "complete",
+                "seconds": round(introspect_seconds, 3),
+                "tables": len(metadata.tables),
+            },
+            "classify": {"status": "skipped" if fast_path else "pending", "seconds": 0.0, "columns": 0},
+            "scan": {"status": "skipped" if fast_path else "pending", "seconds": 0.0, "queries": 0, "tables": 0},
+            "embed": {"status": "skipped" if fast_path else "pending", "seconds": 0.0, "batches": 0, "vectors": 0},
+            "save": {
+                "status": "skipped" if fast_path else "pending",
+                "seconds": 0.0,
+                "schema_vectors": local_store.count_schema(),
+                "value_vectors": local_store.count_values(),
+            },
+        },
+    }
+    schema_ok = True
+    value_ok = True
+    incomplete_tables: dict[str, str] = {}
+    if fast_path:
+        value_index.load_cached(local_store.classification_cache)
+    else:
+        schema_changed = (
+            force_rebuild
+            or not local_store.part_is_valid("schema")
+            or policy_changed
+            or bool(changed_tables)
+            or set(old_table_fingerprints) != set(table_fingerprints)
+        )
+        embed_batches_before = local_store.embedding_batches
+        embedded_vectors_before = local_store.embedded_vectors
+        embedded_seconds_before = local_store.embedding_seconds
+        save_seconds_before = local_store.save_seconds
+        if schema_changed:
+            schema_ok = local_store.build_schema(_schema_records(metadata), embedding_model)
+
+        previous_classifications = local_store.classification_cache or {}
+        stale_tables = set()
+        for table_name in scan_tables:
+            scanned_at = old_scan_times.get(table_name)
+            if (
+                force_rebuild
+                or settings.index_refresh_ttl_hours <= 0
+                or scanned_at is None
+                or now - float(scanned_at) >= settings.index_refresh_ttl_hours * 3600
+            ):
+                stale_tables.add(table_name)
+
+        value_index.build_incremental(
+            classification_cache=local_store.classification_cache,
+            table_fingerprints=table_fingerprints,
+            changed_tables=changed_tables | (set(table_fingerprints) if policy_changed else set()),
+            stale_tables=stale_tables,
+            value_part_valid=local_store.part_is_valid("values"),
+            reuse_value_metadata=local_store.part_metadata_is_valid("values"),
+            last_value_scan_at=old_scan_times,
+            force=force_rebuild,
+            workers=settings.index_scan_workers,
+            now=now,
+        )
+        scan_seconds = value_index.scan_seconds
+        value_ok = local_store.build_values(
+            value_index.value_records,
+            embedding_model,
+            current_tables=set(table_fingerprints),
+        )
+        incomplete_tables.update(value_index.incomplete_tables)
+        incomplete_tables.update({
+            table_name: "embedding_error"
+            for table_name in local_store.failed_value_tables
+        })
+        for table_name in local_store.failed_value_tables:
+            previous_classification = previous_classifications.get(table_name)
+            if previous_classification is not None:
+                value_index.restore_table_from_store(
+                    table_name, previous_classification
+                )
+            if table_name in old_scan_times:
+                value_index.last_value_scan_at[table_name] = old_scan_times[table_name]
+            else:
+                value_index.last_value_scan_at.pop(table_name, None)
+
+        previous_table_fingerprints = dict(old_table_fingerprints)
+        for table_name in set(previous_table_fingerprints) - set(table_fingerprints):
+            previous_table_fingerprints.pop(table_name, None)
+        for table_name, fingerprint in table_fingerprints.items():
+            if table_name not in incomplete_tables:
+                previous_table_fingerprints[table_name] = fingerprint
+        next_scan_times = {
+            table: timestamp
+            for table, timestamp in value_index.last_value_scan_at.items()
+            if table in table_fingerprints
+        }
+        if schema_ok and value_ok and not incomplete_tables:
+            persisted_global_fingerprint = global_fingerprint
+        else:
+            persisted_global_fingerprint = previous_manifest.get(
+                "global_schema_fingerprint", ""
+            )
+        state_save_started = time.perf_counter()
+        local_store.save_index_state(
+            global_schema_fingerprint=persisted_global_fingerprint,
+            table_fingerprints=previous_table_fingerprints,
+            last_value_scan_at=next_scan_times,
+            classification_cache=value_index.classification_cache,
+            incomplete_tables=incomplete_tables,
+        )
+        state_save_seconds = time.perf_counter() - state_save_started
+        index_metrics["stages"].update({
+            "classify": {
+                "status": "incomplete" if incomplete_tables else "complete",
+                "seconds": round(value_index.classify_seconds, 3),
+                "columns": sum(len(item.get("columns", {})) for item in value_index.classification_cache.values()),
+            },
+            "scan": {
+                "status": "incomplete" if incomplete_tables else "complete",
+                "seconds": round(scan_seconds, 3),
+                "queries": value_index.scan_count,
+                "tables": value_index.scanned_tables,
+            },
+            "embed": {
+                "status": "incomplete" if not value_ok or not schema_ok else "complete",
+                "seconds": round(local_store.embedding_seconds - embedded_seconds_before, 3),
+                "batches": local_store.embedding_batches - embed_batches_before,
+                "vectors": local_store.embedded_vectors - embedded_vectors_before,
+            },
+            "save": {
+                "status": "incomplete" if not value_ok or not schema_ok else "complete",
+                "seconds": round(
+                    local_store.save_seconds - save_seconds_before + state_save_seconds,
+                    3,
+                ),
+                "schema_vectors": local_store.count_schema(),
+                "value_vectors": local_store.count_values(),
+            },
+        })
+
+    index_complete = schema_ok and value_ok and not incomplete_tables
     if not index_complete:
         LOGGER.warning(
             "Local index build completed with errors",
-            extra={"dialect": adapter.get_dialect()},
+            extra={
+                "dialect": adapter.get_dialect(),
+                "incomplete_tables": sorted(incomplete_tables),
+                "error_categories": sorted(set(incomplete_tables.values())),
+            },
         )
 
     retriever = HybridSchemaRetriever(metadata, embedding_model, local_store=local_store)
@@ -146,7 +383,7 @@ def init_app(force: bool = False) -> dict[str, Any]:
     catalog_status = (
         "incomplete"
         if not index_complete
-        else "cached" if had_local_index and not force
+        else "cached" if fast_path
         else "indexed"
     )
     runtime = {
@@ -162,12 +399,18 @@ def init_app(force: bool = False) -> dict[str, Any]:
         "indexed_tables": len(metadata.tables),
         "catalog_status": catalog_status,
         "index_complete": index_complete,
+        "incomplete_tables": incomplete_tables,
+        "index_metrics": index_metrics,
     }
     _runtime.clear()
     _runtime.update(runtime)
     LOGGER.info(
         "Application ready",
         extra={"dialect": adapter.get_dialect(), "indexed_tables": len(metadata.tables)},
+    )
+    LOGGER.info(
+        "Local index startup stages",
+        extra={"index_metrics": index_metrics},
     )
     return runtime
 

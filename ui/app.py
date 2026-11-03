@@ -31,11 +31,31 @@ def _render_sidebar(runtime: dict[str, Any]) -> None:
     st.sidebar.metric("Tables indexed", runtime["indexed_tables"])
     catalog_status = runtime.get("catalog_status", "unknown")
     st.sidebar.caption(f"Schema index: {catalog_status}")
-    # Surface incomplete index prominently (0h fix).
+    index_metrics = runtime.get("index_metrics", {})
+    index_age = float(index_metrics.get("index_age_seconds", 0.0))
+    st.sidebar.caption(f"Index age: {index_age / 3600:.1f} hours")
+    with st.sidebar.expander("Index stages"):
+        for stage_name, stage in index_metrics.get("stages", {}).items():
+            details = [
+                f"{name.replace('_', ' ')}: {value:.3f}s"
+                if name.endswith("seconds")
+                else f"{name.replace('_', ' ')}: {value}"
+                for name, value in stage.items()
+                if name != "status"
+            ]
+            st.caption(
+                f"{stage_name.title()}: {stage.get('status', 'unknown')}"
+                + (f" | {', '.join(details)}" if details else "")
+            )
     if not runtime.get("index_complete", True):
+        incomplete_tables = runtime.get("incomplete_tables", {})
+        table_names = ", ".join(sorted(incomplete_tables))
+        categories = ", ".join(sorted(set(incomplete_tables.values())))
         st.sidebar.warning(
-            "Index incomplete: one or more embedding build steps failed. "
-            "Re-index to repair.",
+            "Index incomplete. "
+            + (f"Tables: {table_names}. " if table_names else "")
+            + (f"Error categories: {categories}. " if categories else "")
+            + "Re-index to retry.",
             icon="⚠️",
         )
     if st.sidebar.button("Re-index schema", icon=":material/refresh:"):
@@ -114,7 +134,10 @@ def _render_result(result: dict[str, Any], question: str, runtime: dict[str, Any
             st.info("No SQL was generated.")
 
     if result.get("rows") is not None and result.get("sql") and not result.get("errors"):
-        st.dataframe(result["rows"], alt="Query result rows") if result["rows"] else st.info("No rows matched the question.")
+        if result["rows"]:
+            st.dataframe(result["rows"], alt="Query result rows")
+        else:
+            st.info("No rows matched the question.")
     elif result.get("sql") and not result.get("errors"):
         st.info("No rows matched the question.")
     for error in result.get("errors", []):
@@ -140,6 +163,12 @@ def _render_result(result: dict[str, Any], question: str, runtime: dict[str, Any
             st.write(f"Tables used: {', '.join(result.get('tables_used', [])) or 'None'}")
             st.write(f"Retries: {result.get('retries', 0)}")
             st.json(result["timings"])
+            index_metrics = runtime.get("index_metrics", {})
+            st.write(
+                f"Index path: {index_metrics.get('path', 'unknown')} | "
+                f"Age: {float(index_metrics.get('index_age_seconds', 0.0)) / 3600:.1f} hours"
+            )
+            st.json(index_metrics.get("stages", {}))
 
 
 def main() -> None:

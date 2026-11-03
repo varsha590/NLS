@@ -1,17 +1,18 @@
 # Natural Language to SQL Gap Analysis
 
-Historical baseline from before Phases 0–2. The static review below records the earlier implementation and must not be read as current runtime behavior. No row values were inspected or reproduced for that review. Current Phase 2 behavior is summarized here; see `docs/flow.md` and the Phase 2 entry in `docs/fix_log.md` for the maintained implementation record.
+Historical baseline from before Phases 0–2. The static review below records the earlier implementation and must not be read as current runtime behavior. No row values were inspected or reproduced for that review. Current Phase 3 behavior is summarized here; see `docs/flow.md` and the Phase 3 entry in `docs/fix_log.md` for the maintained implementation record.
 
-## Phase 2 Reverification
+## Phase 3 Reverification
 
 | Area | Current status |
 |---|---|
-| Persisted schema/value vectors | Stored in namespace-local FAISS indexes with paired metadata, checksums, model/dimension/policy manifest, and content/model embedding cache. Startup reloads valid pairs and rebuilds damaged or mismatched parts. |
-| Startup indexing work | Startup still introspects and performs bounded eligible-column scans, as allowed for this phase. Unchanged content reuses cached embeddings. |
+| Persisted schema/value vectors | Stored in namespace-local FAISS indexes with paired metadata, checksums, model/dimension/policy manifest, table/global fingerprints, classification cache, and content/model embedding cache. Startup loads valid pairs and rebuilds only invalid or changed parts. |
+| Startup indexing work | Unchanged, fresh catalogs load classifications and vectors with no data-table statements, statistics queries, embedding calls, or index writes. Changed/stale tables alone are processed; each eligible non-ENUM/SET column uses one bounded scan statement. |
 | Examples | Stored in namespace-local SQLite and retrieved from a bounded set of recent candidates before lexical ranking. |
-| Target database writes | Removed from application startup and index/example paths. SQLite startup plus a full question passed the statement-capture allowlist. The provided MySQL `nls_ro` contract attempt skipped because the local endpoint/account was unavailable; PostgreSQL is checked at source level. |
+| Target database writes | Removed from application startup and index/example paths. SQLite and the local MySQL `nls_ro` contract use SELECT-only target statements; PostgreSQL is checked at source level. |
 | Dialect vector search | Active schema and value searches use the same local FAISS store for SQLite, MySQL, and PostgreSQL. |
-| Legacy modules | Dead schema indexing/value catalog modules were removed after reference checks. The CatalogStore description utility and SQL compatibility modules remain as recorded in `docs/fix_log.md`. |
+| Re-index and reporting | Sidebar and `reindex.py` force a full TTL-independent rebuild without deleting last-known-good parts first. `reindex.py --dry-run` prints metadata-only counts/estimates; `scripts/store_report.py` prints classes/counts without value text. |
+| Legacy modules | Dead schema indexing/value catalog modules were removed after reference checks. Introspection row sampling is removed. The CatalogStore description utility and SQL compatibility modules remain as recorded in `docs/fix_log.md`. |
 
 The detailed findings and examples below describe the earlier audited source state, not the current implementation.
 

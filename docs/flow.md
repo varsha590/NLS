@@ -1,18 +1,32 @@
 # Runtime and Query Workflow
 
-This document describes the Phase 2 implementation. Persistent vectors, embedding cache, examples, and optional per-database hints live under the local namespace directory. The target database is never used as an index or example store.
+This document describes the Phase 3 implementation. Schema/value vectors, classification metadata, the embedding cache, examples, and optional per-database hints live under the local namespace directory. The target database is read-only and is never used as an index or example store.
 
 ## Startup
 
 1. `app.py` enters `ui.app:main()`. `ui.app:load_runtime()` calls `core.startup:init_app()` through `st.cache_resource`; the runtime is shared by Streamlit sessions in the process.
-2. `config.settings:Settings.from_env()` reads `DATABASE_URL`, the model and retrieval settings, and `EXAMPLE_CANDIDATE_LIMIT` (default 500). Database identity for local storage comes from `db.adapter:DatabaseAdapter.namespace()`, a SHA-256 prefix of the credential-free URL.
-3. `core.startup:init_app()` creates `DatabaseAdapter` and checks connectivity with `SELECT 1`. It does not create database objects or write target data.
-4. `catalog.introspect:introspect_catalog()` discovers tables, columns, keys, comments, and relationships with `sample_limit=0`. `ALLOWED_SCHEMAS` and `EXCLUDED_TABLES` filter the catalog. No row samples are collected.
-5. `retrieval.embeddings:EmbeddingModel` loads the configured local model and reports its embedding dimension. `core.startup:_config_policy_hash()` hashes the active policy/config files and cardinality threshold.
-6. `core.startup:_schema_records()` builds table, column, and relationship documents from catalog structure. `schema.documents:build_table_document()`, `build_column_document()`, and `build_relationship_document()` omit protected columns/references. No introspection sample values enter schema documents.
-7. `retrieval.local_store:LocalVectorStore.__init__()` opens `.vector_store/<namespace>/`, checks the manifest and paired FAISS/metadata checksums, and loads only valid indexes. `LocalVectorStore.build_schema()` reuses cached embeddings for unchanged content and atomically writes the schema index/metadata pair.
-8. `retrieval.value_index:ValueIndex.build()` rechecks bounded distinct counts at startup. `ENUM`/`SET` values come from reflected type metadata; ordinary eligible columns use bounded `SELECT DISTINCT`. Only columns classified `VALUE_LOW` are passed to `LocalVectorStore.build_values()`. `VALUE_HIGH`, `BLOCKED`, and `MASKED` values are not embedded or persisted. The content-hash/model embedding cache avoids re-embedding unchanged text.
-9. `core.startup:init_app()` sets `index_complete` from the actual schema and value build results, creates `HybridSchemaRetriever` and `ExampleStore` over the same local namespace, and builds the pipeline. `force=True` clears this namespace's schema/value indexes and embedding cache before rebuilding; examples and hints are retained.
+2. `config.settings:Settings.from_env()` reads the database/model/retrieval settings, `INDEX_REFRESH_TTL_HOURS` (24 by default, 0 means scan every startup), `INDEX_SCAN_WORKERS` (1 by default, capped at 8), and `EMBED_CACHE_MAX_ENTRIES` (250000 by default). `db.adapter:DatabaseAdapter.namespace()` derives local identity from the credential-free URL.
+3. `core.startup:init_app()` creates `DatabaseAdapter`, checks connectivity with `SELECT 1`, loads `EmbeddingModel`, then constructs `retrieval.local_store:LocalVectorStore` before introspection so the manifest is read first. It never creates or writes target objects.
+4. `catalog.introspect:introspect_catalog()` uses SQLAlchemy `get_multi_columns`, `get_multi_pk_constraint`, `get_multi_foreign_keys`, `get_multi_unique_constraints`, and `get_multi_table_comment` where supported, with per-table inspector fallbacks. It records columns, types, nullability, keys, comments, relationships, and ENUM/SET options. It issues no data-table SELECTs and collects no row samples.
+5. `core.startup:_table_fingerprint()` hashes each table's structural metadata; `core.startup:_schema_fingerprints()` hashes the sorted table-fingerprint map globally. `core.startup:_config_policy_hash()` hashes the active policy/config files and cardinality threshold.
+6. `core.startup:_scan_eligible_tables()` identifies tables with non-ENUM/SET text columns that may need scans. `retrieval.local_store:LocalVectorStore.fast_path_valid()` checks manifest format/model/dimension/normalization/policy, global schema fingerprint, FAISS/metadata integrity, classification-cache checksum, and per-table refresh timestamps.
+7. On the fast path, `retrieval.value_index:ValueIndex.load_cached()` restores resolver values/classes from disk. Startup performs metadata inspection only: zero data-table scans, zero stats queries, zero embedding calls, and no index rewrites.
+8. Otherwise, `core.startup:init_app()` compares per-table fingerprints and the TTL. `retrieval.value_index:ValueIndex.build_incremental()` reuses fresh table classifications and scans changed/stale tables only. It uses one bounded distinct-value query per eligible non-ENUM/SET column for value collection, count, shape check, and classification. Default scans reuse one read-only connection; optional worker threads use bounded read-only connections. ENUM/SET options come from `ColumnInfo.enum_options` and need no data scan.
+9. `retrieval.local_store:LocalVectorStore.build_schema()` and `build_values()` reconcile desired metadata, reuse the content/model embedding cache, prune dropped keys, and write only changed index parts. `LocalVectorStore.save_index_state()` atomically saves fingerprints, per-table `last_value_scan_at`, and a checksum-protected classification cache containing classes, reasons, fingerprints, and counts only. A table scan failure preserves that table's last-known-good entries and marks the runtime incomplete.
+10. `core.startup:init_app()` creates `HybridSchemaRetriever`, `ExampleStore`, and `TextToSQLPipeline`, and returns count/time-only `index_metrics`. `ui.app:_render_sidebar()` displays index age and stage statuses. `force=True` bypasses TTL without deleting last-known-good files before rebuild.
+
+## Startup Decision Table
+
+| Condition | Path | Work performed |
+|---|---|---|
+| Manifest, model/dimension/normalization/policy, checksums, global schema fingerprint, classification cache, and TTL all match | Fast load | Load FAISS, metadata, classification cache, and VALUE_LOW values. No data-table statements, statistics queries, embedding calls, or index writes. |
+| Table added, removed, renamed, or structurally changed | Per-table rebuild | Rebuild schema records and process only changed tables; reconcile away dropped table/column/value keys. |
+| A table's value timestamp is past `INDEX_REFRESH_TTL_HOURS` | Stale-value refresh | Rescan eligible candidate columns in stale tables only; content hashes reuse unchanged vectors. |
+| Policy/config hash changes | Reclassification | Reclassify under current policy and reconcile affected records; unchanged content hashes reuse cached embeddings. |
+| Embedding model, dimension, or normalization changes | Vector rebuild | Re-embed schema/value content from valid metadata; do not rescan values solely for vector incompatibility. |
+| A FAISS part is missing/corrupt but its metadata is valid | Part rebuild | Rebuild only that vector part from validated metadata and the embedding cache. |
+| Metadata/classification cache is missing/corrupt | Metadata rebuild | Recompute affected classifications and scan eligible columns when required; preserve independently valid index parts. |
+| Force re-index (`--dry-run` excluded) | Full refresh | Ignore TTL and process all tables while preserving the previous valid files until replacements succeed. |
 
 ## Namespace Files
 
@@ -24,12 +38,13 @@ Files are scoped to one credential-free database namespace. FAISS row `i` corres
 | `schema_meta.json` | One entry per schema vector: schema-qualified table key, column or null, metadata type, and content hash. Schema text is not copied into this metadata file. |
 | `values.faiss` | `IndexFlatIP` over L2-normalized float32 vectors for VALUE_LOW values only. |
 | `values_meta.json` | One entry per value vector: schema-qualified table key, column, value hash, and canonical VALUE_LOW value text. |
-| `manifest.json` | Store format, embedding model name, model dimension, normalization version, config/policy hash, build time, and checksums for both index/metadata pairs. |
+| `manifest.json` | Store format, embedding model name, model dimension, normalization version, config/policy hash, global/per-table schema fingerprints, per-table `last_value_scan_at`, build time, and checksums for both index/metadata pairs and the classification cache. |
+| `classification_cache.json` | Per-table/per-column schema fingerprints, class/reason, distinct count, non-null count, and average text length. Never contains row values. |
 | `embed_cache.sqlite` | Parameterized content-hash/model-name cache of normalized float32 vectors and dimensions. |
 | `examples.sqlite` | Verified question/SQL pairs with update timestamps; retrieval reads only the configured most-recent candidate limit. |
 | `hints.md` | Optional per-database prompt guidance. If absent, the root `hints.md` is used. |
 
-`retrieval.local_store:LocalVectorStore._write_part()` writes and fsyncs temporary index and metadata files, renames the pair, then atomically updates the manifest. `_load_part()` validates checksums, row counts, index type, and dimension. A damaged part is discarded and rebuilt without discarding the other valid index. Model, dimension, normalization, or policy/config mismatch invalidates the schema/value indexes. The per-namespace reentrant lock serializes writes and protects search reads while a replacement index is swapped in.
+`retrieval.local_store:LocalVectorStore._write_part()` writes and fsyncs temporary index and metadata files, renames the pair, then updates checksums. `_load_part()` validates checksums, row counts, index type, and dimension while retaining valid metadata if only a vector file is invalid. The per-namespace reentrant lock serializes writes and protects search reads while a replacement index is swapped in. The embedding cache is garbage-collected in batches above `EMBED_CACHE_MAX_ENTRIES`, deleting only hashes no longer referenced by active schema/value parts.
 
 ## Per-Question Flow
 
@@ -44,18 +59,20 @@ Files are scoped to one credential-free database namespace. FAISS row `i` corres
 
 ## Read-Only Target Guarantee
 
-`core.startup:init_app()`, catalog introspection, value classification, schema retrieval, and example persistence do not issue target-database DDL or DML. Target connections are used for connection checks, metadata inspection, bounded `SELECT`/`SELECT DISTINCT`, `EXPLAIN`, and supported read-only or timeout settings. SQLite also uses `PRAGMA query_only`; its inspector issues read-only metadata PRAGMAs. MySQL startup can run with a SELECT-only account. PostgreSQL uses only read-only transaction/session settings and `SELECT`/`EXPLAIN` statements in the application path. The before-cursor contract tests enforce this boundary for SQLite and optional MySQL runs; a source-level test checks the PostgreSQL path.
+`core.startup:init_app()`, catalog introspection, value classification, schema retrieval, and example persistence do not issue target-database DDL or DML. Target connections are used for connection checks, metadata inspection, one bounded scan statement per eligible candidate column when a rebuild/refresh requires it, `EXPLAIN`, and supported read-only or timeout settings. The unchanged fast path issues no data-table statements. SQLite also uses `PRAGMA query_only`; its inspector issues read-only metadata PRAGMAs. MySQL startup can run with the SELECT-only account. PostgreSQL uses read-only transaction/session settings and `SELECT`/`EXPLAIN` statements in the application path. Statement-listener tests cover the no-scan fast path and read-only contract for SQLite and optional MySQL; a source-level test checks PostgreSQL.
 
 The configured database role must still be read-only. This permission boundary is authoritative even when application validation or session settings are bypassed.
 
 ## Re-index and Configuration
 
-- `ui.app:_render_sidebar()` clears the cached runtime and sets `force_reindex`; the next `init_app(force=True)` resets only the current namespace's schema/value indexes and embedding cache. `reindex.py:main()` invokes the same forced build. Other database namespaces are untouched.
-- `Settings.from_env()` reads `DATABASE_URL`, `EMBEDDING_MODEL`, `VECTOR_STORE_PATH`, `SCHEMA_TOP_K`, `VALUE_TOP_K`, `VALUE_CARDINALITY_THRESHOLD`, `EXAMPLE_CANDIDATE_LIMIT`, `MAX_ROWS`, `QUERY_TIMEOUT_SECONDS`, `MAX_RETRIES`, `ALLOWED_SCHEMAS`, and `EXCLUDED_TABLES`.
+- `ui.app:_render_sidebar()` clears the cached runtime and sets `force_reindex`; the next `core.startup:init_app(force=True)` ignores TTL and rebuilds the current namespace without deleting last-known-good files first. `reindex.py:main()` invokes the same forced build. Other database namespaces are untouched.
+- `reindex.py:create_dry_run_plan()` compares read-only schema metadata with local fingerprints and prints counts plus a rough estimate; `reindex.py:main()` accepts `--dry-run` without scanning table values or changing the store.
+- `scripts.store_report:format_store_report()` prints per-table/column classes and stored-value/vector counts plus model, dimension, build time, and last scan timestamps; it never formats value text.
+- `Settings.from_env()` reads `DATABASE_URL`, `EMBEDDING_MODEL`, `VECTOR_STORE_PATH`, `SCHEMA_TOP_K`, `VALUE_TOP_K`, `VALUE_CARDINALITY_THRESHOLD`, `EXAMPLE_CANDIDATE_LIMIT`, `INDEX_REFRESH_TTL_HOURS`, `INDEX_SCAN_WORKERS`, `EMBED_CACHE_MAX_ENTRIES`, `MAX_ROWS`, `QUERY_TIMEOUT_SECONDS`, `MAX_RETRIES`, `ALLOWED_SCHEMAS`, and `EXCLUDED_TABLES`.
 - `config/data_policy.yaml` controls protected columns; `config/value_resolution.yaml` supplies matching and language configuration. Their content and the cardinality threshold participate in the manifest policy/config hash.
 - The optional description utility still imports the legacy `CatalogStore` (`catalog/describe.py:describe_catalog()`); it is not part of application startup or indexing. `db/init_db.py` and `seed_library.py` are developer-only fixture utilities and are not imported by the application.
 - The compatibility modules `sql/validator.py` and `sql/executor.py` remain for Phase 6; the main pipeline uses `validation/validator.py` and `DatabaseAdapter` directly.
 
 ## Changes in This Phase
 
-Phase 2 moved schema/value vectors and verified examples out of the target database into namespace-local FAISS/SQLite files, added cache-aware atomic rebuilds and bounded example retrieval, removed the target-database vector persistence path, wired all active dialects to local search, and established statement-capture tests for the read-only contract.
+Phase 3 adds manifest-first startup, per-table/global structural fingerprints, a checksummed classification cache, TTL-based per-table value refresh, one bounded scan query per eligible column, incremental vector reconciliation, failure-preserving table updates, stage metrics, force/dry-run re-indexing, and a counts-only store report. Phase 2's namespace-local storage and read-only target boundary remain in force.

@@ -61,3 +61,24 @@ def test_missing_database_or_model_configuration_fails_fast(monkeypatch):
 
     with pytest.raises(SettingsError, match="DATABASE_URL.*LLM_MODEL"):
         Settings.from_env()
+
+
+def test_phase3_index_settings_have_safe_defaults_and_environment_overrides(monkeypatch):
+    _set_required_environment(monkeypatch)
+    monkeypatch.delenv("INDEX_REFRESH_TTL_HOURS", raising=False)
+    monkeypatch.delenv("INDEX_SCAN_WORKERS", raising=False)
+    monkeypatch.delenv("EMBED_CACHE_MAX_ENTRIES", raising=False)
+
+    defaults = Settings.from_env()
+
+    monkeypatch.setenv("INDEX_REFRESH_TTL_HOURS", "0")
+    monkeypatch.setenv("INDEX_SCAN_WORKERS", "3")
+    monkeypatch.setenv("EMBED_CACHE_MAX_ENTRIES", "5000")
+    overrides = Settings.from_env()
+
+    assert defaults.index_refresh_ttl_hours == 24
+    assert defaults.index_scan_workers == 1
+    assert defaults.embed_cache_max_entries == 250000
+    assert overrides.index_refresh_ttl_hours == 0
+    assert overrides.index_scan_workers == 3
+    assert overrides.embed_cache_max_entries == 5000

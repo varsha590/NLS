@@ -100,7 +100,6 @@ def generate_classification_report(output_path: Path | None = None) -> str:
         engine,
         allowed_schemas=settings.allowed_schemas,
         excluded_tables=settings.excluded_tables,
-        sample_limit=0,  # Do not collect row samples
     )
     overrides = get_policy_overrides()
 

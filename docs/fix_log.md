@@ -1117,3 +1117,31 @@ Columns blocked by a short or generic token where manual review may be helpful:
 - The SQLite startup-plus-question statement listener passed; no target statements outside the read-only/metadata allowlist were observed. The live MySQL `nls_ro` test was attempted with the provided hiresanta URL but skipped because the local SELECT-only MySQL endpoint/account was unavailable.
 - No live PostgreSQL server was available; the PostgreSQL target path passed the source-level check. Groq generation is mocked in contract tests.
 - `git diff --check`: clean after the final code/documentation edits.
+
+## Phase 3: Manifest-First Incremental Indexing
+
+### What Changed
+
+1. **Bulk, sample-free introspection**: `catalog.introspect:introspect_catalog()` now uses SQLAlchemy bulk inspector methods for columns, primary keys, foreign keys, unique constraints, and table comments where available, with per-table fallbacks. `ColumnInfo` retains nullability and ENUM/SET option metadata. The per-column sample SELECT code, `sample_limit` API, and `ColumnInfo.sample_values` storage/serialization were removed.
+2. **Schema fingerprints and fast path**: `core.startup:_table_fingerprint()` hashes table/column metadata including types, nullability, primary/unique/foreign keys, comments, and enum options. `_schema_fingerprints()` creates the global catalog fingerprint. Startup constructs `LocalVectorStore` before introspection and skips data scans, stats queries, embeddings, and index writes when the manifest, fingerprints, classification cache, vector parts, policy/model settings, and refresh timestamps are valid.
+3. **Classification and freshness persistence**: `manifest.json` now records global/per-table fingerprints, `last_value_scan_at`, and classification-cache checksums. `classification_cache.json` stores per-column class/reason, fingerprints, distinct count, non-null count, and average text length only; it contains no row values. `INDEX_REFRESH_TTL_HOURS` defaults to 24 and 0 forces a value scan on each startup.
+4. **Incremental scan/rebuild behavior**: `retrieval.value_index:ValueIndex.build_incremental()` reuses classifications for unchanged fresh tables and processes only changed or stale tables. Each eligible non-ENUM/SET column uses one bounded distinct-value statement for value collection, classification statistics, and PII-shape checking. A default scan shares one read-only connection; `INDEX_SCAN_WORKERS` optionally enables bounded parallel read-only workers. ENUM/SET options are metadata-only.
+5. **Last-known-good and vector compatibility**: vector-file validity and metadata validity are tracked independently. Missing/corrupt vector files can rebuild from valid metadata; model/dimension/normalization changes re-embed valid cached content without rescanning values. A table scan failure preserves that table's prior classification/value entries, continues other tables, and reports table names plus error categories without row text. Unchanged vector parts are not rewritten.
+6. **Cache collection and telemetry**: `EMBED_CACHE_MAX_ENTRIES` defaults to 250000. When exceeded, unreferenced embedding-cache rows are removed in bounded batches; hashes referenced by active schema/value indexes are retained. Startup logs and runtime UI expose stage status, seconds, counts, and index age only.
+7. **Re-index/report tools**: Sidebar re-index and `reindex.py` force a TTL-independent full refresh without clearing good files first. `reindex.py --dry-run` performs read-only metadata planning and prints changed table/column counts, columns to scan, an estimated embedding count, and rough seconds. `scripts/store_report.py` prints per-table/column classes and stored-value/vector counts plus manifest model/dimension/build/scan metadata; it never prints value text.
+8. **Documentation**: `docs/flow.md` now documents the exact startup functions and fast-path/rebuild decision table. `README.md` documents Phase 3 settings, refresh/model behavior, forced rebuilds, dry-run, and reporting.
+
+### Tests Added or Updated
+
+- `tests/test_phase3_indexing.py`: unchanged startup performs zero data-table statements and embedding calls; 120/300-table synthetic catalogs scan one statement per eligible column on the first startup and zero on the second; injected-clock TTL refreshes only stale tables; TTL 0 rescans; changed values embed only new content; schema add/rename/drop prunes stale entries; scan failure preserves last-known-good state while another table updates; model/policy changes follow their respective rebuild paths; enum option changes prune removed values; dry-run and report output contain no fixture value text.
+- `tests/test_local_store.py`: classification/fingerprint cache persistence, no-op index writes, metadata/vector corruption handling, and bounded cache garbage collection.
+- `tests/test_settings.py`: refresh TTL, worker, and cache-cap defaults and environment overrides.
+- `tests/test_adapter_sqlite.py`: introspection returns schema metadata without data-table SELECTs or sample-value storage.
+
+### Verified Sampler Removal
+
+`catalog.introspect:introspect_catalog()` no longer exposes `sample_limit`, issues per-column sample `SELECT DISTINCT` queries, or stores sample values in `ColumnInfo`. Runtime startup and `scripts/classify_report.py` now use the same sample-free reflection path. A SQLAlchemy statement listener verifies introspection issues no SELECT against the synthetic data table.
+
+### Hiresanta Measurement
+
+Live `nls_ro` first/second-startup measurements are recorded after the required full-suite run below. The record will contain only elapsed stage seconds, data-table statement counts, embedding batch/vector counts, and fast-path status; no row values are inspected or reported.

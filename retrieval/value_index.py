@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +22,8 @@ from schema.metadata import SchemaMetadata, is_internal_table_name
 from catalog.classifier import (
     ColumnClass,
     classify_column as classify_catalog_column,
-    get_column_stats,
     is_candidate_text_column,
+    is_pii_shaped_value,
     parse_enum_options,
 )
 from config.data_policy import get_policy_overrides
@@ -159,6 +162,14 @@ class ValueIndex:
         self.activity_query_expansion = tuple(
             str(term) for term in self.config.get("activity_query_expansion", [])
         )
+        self.classification_cache: dict[str, Any] = {}
+        self.value_records: list[dict[str, str]] = []
+        self.incomplete_tables: dict[str, str] = {}
+        self.last_value_scan_at: dict[str, float] = {}
+        self.scan_count = 0
+        self.scanned_tables = 0
+        self.scan_seconds = 0.0
+        self.classify_seconds = 0.0
 
     def _is_internal_table(self, table: Any) -> bool:
         """Recognize common metadata/index structures by name or by structural columns."""
@@ -194,124 +205,368 @@ class ValueIndex:
         words = set(normalized.split())
         return bool(words) and words.issubset(self.schema_vocabulary)
 
-    def build(self) -> dict[str, list[str]]:
-        """Index only VALUE_LOW data, using metadata options for ENUM/SET columns."""
+    @staticmethod
+    def _error_category(error: Exception) -> str:
+        if isinstance(error, sa.exc.OperationalError):
+            return "operational_or_connection_error"
+        if isinstance(error, sa.exc.ProgrammingError):
+            return "query_or_schema_error"
+        if isinstance(error, sa.exc.DataError):
+            return "data_error"
+        if isinstance(error, sa.exc.SQLAlchemyError):
+            return "database_error"
+        return "unexpected_error"
+
+    def _scan_column(
+        self, connection: Any, table: Any, column_name: str
+    ) -> tuple[list[Any], int]:
+        started = time.perf_counter()
+        column = table.c[column_name]
+        bounded_values = (
+            sa.select(column.label("value"))
+            .where(column.is_not(None))
+            .distinct()
+            .limit(self.threshold + 1)
+            .subquery("bounded_values")
+        )
+        row_count = sa.select(
+            sa.literal_column("COUNT(*)").label("non_null_count")
+        ).select_from(table).where(column.is_not(None)).subquery("column_counts")
+        query = sa.select(
+            bounded_values.c.value,
+            row_count.c.non_null_count,
+        ).select_from(row_count.outerjoin(bounded_values, sa.true()))
+        rows = connection.execute(query).all()
+        self.scan_seconds += time.perf_counter() - started
+        values = [row[0] for row in rows if row[0] is not None]
+        non_null_count = int(rows[0][1]) if rows and rows[0][1] is not None else 0
+        return values, non_null_count
+
+    @staticmethod
+    def column_fingerprint(column_info: Any) -> str:
+        payload = {
+            "name": column_info.name,
+            "type": column_info.data_type,
+            "enum_options": column_info.enum_options,
+            "nullable": column_info.nullable,
+            "primary_key": column_info.is_primary_key,
+            "foreign_key": column_info.is_foreign_key,
+            "foreign_table": column_info.foreign_table,
+            "foreign_column": column_info.foreign_column,
+            "comment": column_info.comment,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _process_table(
+        self,
+        table_info: Any,
+        table_fingerprint: str,
+        policy_overrides: dict[str, Any],
+        connection: Any,
+    ) -> tuple[dict[str, Any], dict[str, list[str]], int]:
+        bare_table_name = table_info.name.rsplit(".", 1)[-1]
+        table = sa.table(
+            bare_table_name,
+            *(sa.column(column.name, sa.String()) for column in table_info.columns),
+            schema=table_info.schema,
+        )
+        columns: dict[str, Any] = {}
+        column_fingerprints: dict[str, str] = {}
+        indexed_values: dict[str, list[str]] = {}
+        scans = 0
+        for column_info in table_info.columns:
+            column_fingerprints[column_info.name] = self.column_fingerprint(column_info)
+            column_type = column_info.data_type
+            options = column_info.enum_options or parse_enum_options(column_type)
+            candidate = is_candidate_text_column(
+                table_name=table_info.name,
+                column_name=column_info.name,
+                sql_type=column_type,
+                is_primary_key=column_info.is_primary_key,
+                is_foreign_key=column_info.is_foreign_key,
+                overrides=policy_overrides,
+            )
+            values: list[Any] = []
+            non_null_count: int | None = None
+            if candidate and options is not None:
+                distinct_count = len(options)
+                average_length = (
+                    sum(len(option) for option in options) / distinct_count
+                    if distinct_count
+                    else 0.0
+                )
+                values = list(options)
+                clean_shape = not any(is_pii_shaped_value(option) for option in options)
+            elif candidate:
+                values, non_null_count = self._scan_column(
+                    connection, table, column_info.name
+                )
+                scans += 1
+                distinct_count = len(values)
+                average_length = (
+                    sum(len(str(value)) for value in values) / distinct_count
+                    if distinct_count
+                    else 0.0
+                )
+                clean_shape = not any(is_pii_shaped_value(value) for value in values)
+            else:
+                distinct_count = None
+                average_length = None
+                clean_shape = False
+
+            column_class, reason = classify_catalog_column(
+                table_name=table_info.name,
+                column_name=column_info.name,
+                sql_type=column_type,
+                distinct_count=distinct_count,
+                avg_text_length=average_length,
+                nullable=column_info.nullable,
+                is_primary_key=column_info.is_primary_key,
+                is_foreign_key=column_info.is_foreign_key,
+                overrides=policy_overrides,
+                cardinality_threshold=self.threshold,
+                sensitive_values_clean=clean_shape,
+            )
+            columns[column_info.name] = {
+                "class": column_class.value,
+                "reason": reason,
+                "distinct_count": distinct_count,
+                "non_null_count": non_null_count,
+                "avg_text_length": average_length,
+            }
+            if column_class == ColumnClass.VALUE_LOW:
+                key = f"{table_info.name}.{column_info.name}"
+                filtered = [str(value) for value in values if not self._is_schema_value(str(value))]
+                if filtered:
+                    indexed_values[key] = list(dict.fromkeys(filtered))
+
+        return (
+            {
+                "fingerprint": table_fingerprint,
+                "column_fingerprints": column_fingerprints,
+                "columns": columns,
+            },
+            indexed_values,
+            scans,
+        )
+
+    def _restore_table_values(self, table_name: str) -> None:
+        for record in getattr(self.local_store, "values_meta", []):
+            if record.get("table_name") != table_name:
+                continue
+            column = str(record.get("column_name", ""))
+            value = record.get("value")
+            if value is not None:
+                self.values.setdefault(f"{table_name}.{column}", []).append(str(value))
+
+    def restore_table_from_store(
+        self, table_name: str, classification: dict[str, Any]
+    ) -> None:
+        """Restore resolver state for a table whose new embeddings failed."""
+        prefix = f"{table_name}."
+        for key in [key for key in self.values if key.startswith(prefix)]:
+            self.values.pop(key, None)
+        self.large_columns = {
+            key for key in self.large_columns if not key.startswith(prefix)
+        }
+        self.classification_cache[table_name] = classification
+        for column_name, entry in classification.get("columns", {}).items():
+            if entry.get("class") == ColumnClass.VALUE_HIGH.value:
+                self.large_columns.add(f"{table_name}.{column_name}")
+        self._restore_table_values(table_name)
+
+    def load_cached(self, classification_cache: dict[str, Any] | None = None) -> None:
+        """Restore resolver state exclusively from validated local metadata files."""
+        self.values.clear()
+        self.large_columns.clear()
+        self.classification_cache = classification_cache or {}
+        for table_name, table_cache in self.classification_cache.items():
+            for column_name, entry in table_cache.get("columns", {}).items():
+                if entry.get("class") == ColumnClass.VALUE_HIGH.value:
+                    self.large_columns.add(f"{table_name}.{column_name}")
+            self._restore_table_values(table_name)
+
+    def build_incremental(
+        self,
+        classification_cache: dict[str, Any] | None,
+        table_fingerprints: dict[str, str],
+        changed_tables: set[str],
+        stale_tables: set[str],
+        value_part_valid: bool,
+        reuse_value_metadata: bool = False,
+        last_value_scan_at: dict[str, float] | None = None,
+        force: bool = False,
+        workers: int = 1,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        """Reuse fresh table classifications and rescan only changed or stale tables."""
         self.values.clear()
         self.large_columns.clear()
         self.embeddings.clear()
         self.build_success = True
-        value_records: list[dict[str, str]] = []
+        self.incomplete_tables.clear()
+        self.scan_count = 0
+        self.scanned_tables = 0
+        self.scan_seconds = 0.0
+        scan_started = time.perf_counter()
         policy_overrides = get_policy_overrides()
+        previous_cache = classification_cache or {}
+        prior_scan_times = dict(last_value_scan_at or {})
+        now_value = time.time() if now is None else float(now)
+        active_tables = {
+            table.name: table
+            for table in self.metadata.tables.values()
+            if not self._is_internal_table(table)
+        }
+        tables_to_process = set(changed_tables) | set(stale_tables)
+        if (
+            force
+            or (not value_part_valid and not reuse_value_metadata)
+            or classification_cache is None
+        ):
+            tables_to_process.update(active_tables)
+        for table_name in active_tables:
+            cached = previous_cache.get(table_name)
+            if (
+                cached is None
+                or cached.get("fingerprint") != table_fingerprints.get(table_name)
+            ):
+                tables_to_process.add(table_name)
 
-        for table_info in self.metadata.tables.values():
-            if self._is_internal_table(table_info):
-                continue
-            bare_table_name = table_info.name.rsplit(".", 1)[-1]
-            reflected = sa.Table(
-                bare_table_name,
-                sa.MetaData(),
-                schema=table_info.schema,
-                autoload_with=self.adapter.engine,
-            )
-            table_key = table_info.name
-            for column_info in table_info.columns:
-                column = reflected.c.get(column_info.name)
-                if column is None:
-                    continue
-                key = f"{table_key}.{column_info.name}"
-
-                # 1. Preliminary check without DB query
-                if not is_candidate_text_column(
-                    table_name=table_key,
-                    column_name=column_info.name,
-                    sql_type=column.type,
-                    is_primary_key=column_info.is_primary_key,
-                    is_foreign_key=column_info.is_foreign_key,
-                    overrides=policy_overrides,
-                ):
-                    continue
-
-                options = parse_enum_options(column.type)
-                if options is not None:
-                    cnt = len(options)
-                    avg_len = (
-                        sum(len(option) for option in options) / cnt if cnt else 0.0
-                    )
-                else:
-                    stats_errors: list[str] = []
-                    try:
-                        with self.adapter.engine.connect() as connection:
-                            cnt, avg_len = get_column_stats(
-                                connection,
-                                reflected,
-                                column_info.name,
-                                threshold=self.threshold,
-                                on_error=stats_errors.append,
-                            )
-                    except sa.exc.SQLAlchemyError:
-                        cnt, avg_len = None, None
-                        stats_errors.append("database_error")
-                    if cnt is None:
-                        self.build_success = False
-
-                # Final classification is shared with the report and policy boundary.
-                final_class, _ = classify_catalog_column(
-                    table_name=table_key,
-                    column_name=column_info.name,
-                    sql_type=column.type,
-                    distinct_count=cnt,
-                    avg_text_length=avg_len,
-                    is_primary_key=column_info.is_primary_key,
-                    is_foreign_key=column_info.is_foreign_key,
-                    overrides=policy_overrides,
-                    cardinality_threshold=self.threshold,
+        def process_table(table_name: str, connection: Any) -> tuple[str, Any, Any, int, str | None]:
+            try:
+                cache, values, scans = self._process_table(
+                    active_tables[table_name],
+                    table_fingerprints[table_name],
+                    policy_overrides,
+                    connection,
                 )
+                return table_name, cache, values, scans, None
+            except (sa.exc.SQLAlchemyError, RuntimeError, ValueError, TypeError, KeyError) as error:
+                return table_name, None, None, 0, self._error_category(error)
 
-                if final_class == ColumnClass.VALUE_HIGH:
-                    self.large_columns.add(key)
+        processed: dict[str, tuple[Any, Any, int, str | None]] = {}
+        queued = sorted(tables_to_process & set(active_tables))
+        worker_count = min(8, max(1, int(workers)))
+        tables_needing_connection = {
+            table_name
+            for table_name in queued
+            if any(
+                is_candidate_text_column(
+                    table_name=table_name,
+                    column_name=column.name,
+                    sql_type=column.data_type,
+                    is_primary_key=column.is_primary_key,
+                    is_foreign_key=column.is_foreign_key,
+                    overrides=policy_overrides,
+                )
+                and column.enum_options is None
+                and parse_enum_options(column.data_type) is None
+                for column in active_tables[table_name].columns
+            )
+        }
+        if worker_count == 1:
+            if tables_needing_connection:
+                connection_context = self.adapter.readonly_connection()
+            else:
+                connection_context = None
+            if connection_context is None:
+                for table_name in queued:
+                    _, cache, values, scans, error = process_table(table_name, None)
+                    processed[table_name] = (cache, values, scans, error)
+            else:
+                with connection_context as connection:
+                    for table_name in queued:
+                        _, cache, values, scans, error = process_table(table_name, connection)
+                        processed[table_name] = (cache, values, scans, error)
+        elif queued:
+            def process_with_connection(table_name: str):
+                if table_name not in tables_needing_connection:
+                    return process_table(table_name, None)
+                with self.adapter.readonly_connection() as connection:
+                    return process_table(table_name, connection)
+
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                for table_name, cache, values, scans, error in executor.map(
+                    process_with_connection, queued
+                ):
+                    processed[table_name] = (cache, values, scans, error)
+
+        self.classification_cache = {}
+        for table_name in active_tables:
+            current_fingerprint = table_fingerprints[table_name]
+            cached = previous_cache.get(table_name)
+            processed_table = processed.get(table_name)
+            if processed_table is not None:
+                cache, values, scans, error = processed_table
+                if error is not None:
+                    self.incomplete_tables[table_name] = error
+                    self.build_success = False
+                    if cached is not None:
+                        self.classification_cache[table_name] = cached
+                        self.large_columns.update(
+                            f"{table_name}.{column_name}"
+                            for column_name, entry in cached.get("columns", {}).items()
+                            if entry.get("class") == ColumnClass.VALUE_HIGH.value
+                        )
+                        self._restore_table_values(table_name)
                     continue
-                elif final_class != ColumnClass.VALUE_LOW:
-                    continue
+                self.classification_cache[table_name] = cache
+                self.large_columns.update(
+                    f"{table_name}.{column_name}"
+                    for column_name, entry in cache.get("columns", {}).items()
+                    if entry.get("class") == ColumnClass.VALUE_HIGH.value
+                )
+                for key, column_values in values.items():
+                    self.values[key] = column_values
+                self.scan_count += scans
+                if scans:
+                    self.scanned_tables += 1
+                    prior_scan_times[table_name] = now_value
+            elif cached is not None and cached.get("fingerprint") == current_fingerprint:
+                self.classification_cache[table_name] = cached
+                for column_name, entry in cached.get("columns", {}).items():
+                    if entry.get("class") == ColumnClass.VALUE_HIGH.value:
+                        self.large_columns.add(f"{table_name}.{column_name}")
+                self._restore_table_values(table_name)
+            else:
+                self.incomplete_tables[table_name] = "classification_cache_missing"
+                self.build_success = False
 
-                if options is not None:
-                    values = [str(option) for option in options]
-                else:
-                    try:
-                        with self.adapter.engine.connect() as connection:
-                            query = (
-                                sa.select(column)
-                                .where(column.is_not(None))
-                                .distinct()
-                                .limit(self.threshold + 1)
-                            )
-                            raw_values = connection.execute(query).scalars().all()
-                    except sa.exc.SQLAlchemyError:
-                        self.build_success = False
-                        continue
-                    if len(raw_values) > self.threshold:
-                        self.large_columns.add(key)
-                        continue
-                    values = [str(value) for value in raw_values]
+        self.last_value_scan_at = prior_scan_times
+        self.classify_seconds = max(
+            0.0, time.perf_counter() - scan_started - self.scan_seconds
+        )
+        self.value_records = []
+        for key, values in sorted(self.values.items()):
+            table_name, column_name = key.rsplit(".", 1)
+            for value in values:
+                self.value_records.append({
+                    "table_name": table_name,
+                    "column_name": column_name,
+                    "classification": ColumnClass.VALUE_LOW.value,
+                    "value_hash": hashlib.sha256(value.encode("utf-8")).hexdigest(),
+                    "value": value,
+                })
+        return self.values
 
-                values = [value for value in values if not self._is_schema_value(value)]
-                if not values:
-                    continue
-                self.values[key] = values
-                for value in values:
-                    value_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
-                    value_records.append({
-                        "table_name": table_key,
-                        "column_name": column_info.name,
-                        "classification": ColumnClass.VALUE_LOW.value,
-                        "value_hash": value_hash,
-                        "value": value,
-                    })
-
+    def build(self) -> dict[str, list[str]]:
+        """Perform a complete value classification and persist VALUE_LOW vectors."""
+        fingerprints = {table.name: "full-build" for table in self.metadata.tables.values()}
+        self.build_incremental(
+            classification_cache=None,
+            table_fingerprints=fingerprints,
+            changed_tables=set(fingerprints),
+            stale_tables=set(),
+            value_part_valid=False,
+            force=True,
+        )
         if self.embedder is not None and self.local_store is not None:
-            self.build_success = self.local_store.build_values(value_records, self.embedder) and self.build_success
-        elif self.embedder is not None:
-            for key, values in self.values.items():
-                self.embeddings[key] = self.embedder.embed(values)
+            self.build_success = self.local_store.build_values(
+                self.value_records, self.embedder
+            ) and self.build_success
         return self.values
 
     def report(self) -> list[dict[str, Any]]:

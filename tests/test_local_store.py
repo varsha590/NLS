@@ -99,6 +99,21 @@ def test_local_store_round_trip_and_incremental_embed_cache(tmp_path):
     assert embedder.batches[-1] == 1
 
 
+def test_unchanged_valid_parts_are_not_rewritten(tmp_path):
+    embedder = CountingEmbedder()
+    schema, values = _records()
+    store = _store(tmp_path, embedder)
+    assert store.build_schema(schema, embedder)
+    assert store.build_values(values, embedder)
+
+    reloaded = _store(tmp_path, embedder)
+    original_save_seconds = reloaded.save_seconds
+    assert reloaded.build_schema(schema, embedder)
+    assert reloaded.build_values(values, embedder)
+
+    assert reloaded.save_seconds == original_save_seconds
+
+
 @pytest.mark.parametrize(
     "damaged_file,expected_schema,expected_values",
     [
@@ -169,6 +184,132 @@ def test_zero_vector_build_does_not_replace_existing_index(tmp_path):
     )
     assert store.count_schema() == 1
     assert store.schema_meta[0]["content_hash"] == original_hash
+
+
+def test_local_store_persists_phase3_fingerprints_and_classification_counts(tmp_path):
+    store = _store(tmp_path)
+    classification_cache = {
+        "generic_table": {
+            "fingerprint": "table-fingerprint",
+            "columns": {
+                "generic_field": {
+                    "class": "VALUE_LOW",
+                    "reason": "text column with distinct count 2 <= threshold 10",
+                    "distinct_count": 2,
+                    "non_null_count": 3,
+                    "avg_text_length": 4.0,
+                }
+            },
+        }
+    }
+
+    store.save_index_state(
+        global_schema_fingerprint="global-fingerprint",
+        table_fingerprints={"generic_table": "table-fingerprint"},
+        last_value_scan_at={"generic_table": 1234.5},
+        classification_cache=classification_cache,
+    )
+
+    reloaded = _store(tmp_path)
+    assert reloaded.manifest["global_schema_fingerprint"] == "global-fingerprint"
+    assert reloaded.manifest["table_fingerprints"] == {
+        "generic_table": "table-fingerprint"
+    }
+    assert reloaded.manifest["last_value_scan_at"] == {"generic_table": 1234.5}
+    assert reloaded.load_classification_cache() == classification_cache
+    cache_text = reloaded.classification_cache_path.read_text(encoding="utf-8")
+    assert '"value"' not in cache_text
+
+
+def test_embedding_cache_collects_unreferenced_rows_in_batches(tmp_path):
+    embedder = CountingEmbedder()
+    schema, values = _records()
+    store = LocalVectorStore(
+        tmp_path,
+        "cache-gc-namespace",
+        embedder.model_name,
+        embedder.dim,
+        "policy",
+        embed_cache_max_entries=2,
+    )
+    assert store.build_schema(schema, embedder)
+    assert store.build_values(values, embedder)
+    old_schema_hash = store.schema_meta[0]["content_hash"]
+    assert store.build_schema(
+        [dict(schema[0], content="replacement generic table")], embedder
+    )
+    store.save_index_state(
+        global_schema_fingerprint="global",
+        table_fingerprints={"generic_table": "table"},
+        last_value_scan_at={},
+        classification_cache={},
+    )
+
+    with sqlite3.connect(store.path / "embed_cache.sqlite") as connection:
+        cache_count = connection.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
+        old_hash_count = connection.execute(
+            "SELECT COUNT(*) FROM embeddings WHERE content_hash = ?",
+            (old_schema_hash,),
+        ).fetchone()[0]
+
+    assert cache_count == 2
+    assert old_hash_count == 0
+
+
+def test_value_embedding_failure_preserves_failed_table_and_updates_others(tmp_path):
+    class SelectiveFailEmbedder(CountingEmbedder):
+        def embed(self, texts: list[str]) -> np.ndarray:
+            if "new-primary" in texts:
+                raise RuntimeError("synthetic embedding failure")
+            return super().embed(texts)
+
+    embedder = CountingEmbedder()
+    store = _store(tmp_path, embedder)
+    initial_values = [
+        {
+            "table_name": "generic_primary",
+            "column_name": "generic_label",
+            "classification": "VALUE_LOW",
+            "value_hash": hashlib.sha256(b"old-primary").hexdigest(),
+            "value": "old-primary",
+        },
+        {
+            "table_name": "generic_secondary",
+            "column_name": "generic_label",
+            "classification": "VALUE_LOW",
+            "value_hash": hashlib.sha256(b"old-secondary").hexdigest(),
+            "value": "old-secondary",
+        },
+    ]
+    assert store.build_values(initial_values, embedder)
+
+    replacement_values = [
+        dict(
+            initial_values[0],
+            value_hash=hashlib.sha256(b"new-primary").hexdigest(),
+            value="new-primary",
+        ),
+        dict(
+            initial_values[1],
+            value_hash=hashlib.sha256(b"new-secondary").hexdigest(),
+            value="new-secondary",
+        ),
+    ]
+    result = store.build_values(
+        replacement_values,
+        SelectiveFailEmbedder(),
+        current_tables={"generic_primary", "generic_secondary"},
+    )
+
+    values_by_table = {
+        record["table_name"]: record["value"] for record in store.values_meta
+    }
+    assert not result
+    assert store.failed_value_tables == {"generic_primary"}
+    assert values_by_table == {
+        "generic_primary": "old-primary",
+        "generic_secondary": "new-secondary",
+    }
 
 
 def test_value_search_keeps_schema_qualified_names_and_filters(tmp_path):
@@ -272,7 +413,7 @@ def test_value_index_persists_only_allowed_low_values(tmp_path, monkeypatch):
     monkeypatch.setattr(documents_module, "is_masked", data_policy.is_masked)
 
     adapter = DatabaseAdapter("sqlite:///:memory:", engine=engine)
-    catalog = introspect_catalog(engine, sample_limit=0)
+    catalog = introspect_catalog(engine)
     embedder = CountingEmbedder()
     store = _store(tmp_path, embedder)
     index = ValueIndex(adapter, catalog, cardinality_threshold=2, embedder=embedder, local_store=store)
@@ -337,37 +478,20 @@ def test_local_store_rejects_non_value_low_value_records(tmp_path):
 
 @pytest.mark.parametrize("sql_type", [sa.Enum("alpha", "beta"), sa.Enum("0", "1")])
 def test_enum_options_are_indexed_from_type_metadata_without_target_scan(
-    tmp_path, monkeypatch, sql_type
+    tmp_path, sql_type
 ):
-    import retrieval.value_index as value_index_module
-
-    class ReflectedColumn:
-        name = "generic_field"
-        type = sql_type
-
-    class ReflectedTable:
-        name = "generic_table"
-        columns = [ReflectedColumn()]
-
-        class ColumnCollection:
-            @staticmethod
-            def get(name):
-                return ReflectedColumn() if name == "generic_field" else None
-
-        c = ColumnCollection()
-
-    monkeypatch.setattr(value_index_module.sa, "Table", lambda *args, **kwargs: ReflectedTable())
-    monkeypatch.setattr(
-        value_index_module,
-        "get_column_stats",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("enum must not scan")),
-    )
     adapter = type("Adapter", (), {"engine": object()})()
     metadata = SchemaMetadata({
         "generic_table": TableInfo(
             name="generic_table",
             description="generic table",
-            columns=[ColumnInfo("generic_field", str(sql_type))],
+            columns=[
+                ColumnInfo(
+                    "generic_field",
+                    str(sql_type),
+                    enum_options=list(sql_type.enums),
+                )
+            ],
             primary_key_names=[],
             foreign_keys=[],
         )

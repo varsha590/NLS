@@ -9,8 +9,8 @@ import sqlalchemy as sa
 from sqlalchemy import inspect
 from sqlalchemy.engine import Engine
 
+from catalog.classifier import parse_enum_options
 from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo, is_internal_table_name
-from config.data_policy import is_blocked, is_masked
 
 LOGGER = logging.getLogger(__name__)
 
@@ -19,13 +19,34 @@ def _qualified_name(schema: str | None, table: str) -> str:
     return f"{schema}.{table}" if schema else table
 
 
+def _bulk_metadata(inspector: Any, method_name: str, schema: str | None) -> dict[Any, Any] | None:
+    method = getattr(inspector, method_name, None)
+    if method is None:
+        return None
+    try:
+        result = method(schema=schema)
+        return result if isinstance(result, dict) else None
+    except (AttributeError, NotImplementedError, sa.exc.SQLAlchemyError):
+        return None
+
+
+def _table_metadata(
+    mapping: dict[Any, Any] | None, schema: str | None, table_name: str
+) -> Any:
+    if mapping is None:
+        return None
+    for key in ((schema, table_name), (None, table_name), table_name):
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
 def introspect_catalog(
     engine: Engine,
     allowed_schemas: tuple[str, ...] = (),
     excluded_tables: tuple[str, ...] = (),
-    sample_limit: int = 5,
 ) -> SchemaMetadata:
-    """Inspect tables, columns, keys, comments, and bounded per-column samples."""
+    """Inspect schema metadata in bulk where supported; never read table rows."""
     inspector = inspect(engine)
     schema_names: tuple[str | None, ...] = allowed_schemas or (None,)
     excluded = set(excluded_tables)
@@ -37,6 +58,13 @@ def introspect_catalog(
         except (sa.exc.SQLAlchemyError, NotImplementedError):
             LOGGER.warning("Schema enumeration skipped", extra={"schema": schema_name})
             continue
+        bulk_columns = _bulk_metadata(inspector, "get_multi_columns", schema_name)
+        bulk_primary_keys = _bulk_metadata(inspector, "get_multi_pk_constraint", schema_name)
+        bulk_foreign_keys = _bulk_metadata(inspector, "get_multi_foreign_keys", schema_name)
+        bulk_unique_constraints = _bulk_metadata(
+            inspector, "get_multi_unique_constraints", schema_name
+        )
+        bulk_table_comments = _bulk_metadata(inspector, "get_multi_table_comment", schema_name)
         for raw_table_name in table_names:
             table_name = _qualified_name(schema_name, raw_table_name)
             if (
@@ -47,24 +75,37 @@ def introspect_catalog(
             ):
                 continue
             try:
-                columns = inspector.get_columns(raw_table_name, schema=schema_name)
-                primary_keys = inspector.get_pk_constraint(raw_table_name, schema=schema_name)
+                columns = _table_metadata(bulk_columns, schema_name, raw_table_name)
+                if columns is None:
+                    columns = inspector.get_columns(raw_table_name, schema=schema_name)
+                primary_keys = _table_metadata(bulk_primary_keys, schema_name, raw_table_name)
+                if primary_keys is None:
+                    primary_keys = inspector.get_pk_constraint(raw_table_name, schema=schema_name)
                 primary_key_names = primary_keys.get("constrained_columns") or []
-                foreign_keys = inspector.get_foreign_keys(raw_table_name, schema=schema_name)
-                table_comment = None
-                try:
-                    table_comment = inspector.get_table_comment(
-                        raw_table_name, schema=schema_name
-                    ).get("text")
-                except (NotImplementedError, sa.exc.SQLAlchemyError):
-                    pass
-
-                reflected = sa.Table(
-                    raw_table_name,
-                    sa.MetaData(),
-                    schema=schema_name,
-                    autoload_with=engine,
+                foreign_keys = _table_metadata(bulk_foreign_keys, schema_name, raw_table_name)
+                if foreign_keys is None:
+                    foreign_keys = inspector.get_foreign_keys(raw_table_name, schema=schema_name)
+                unique_constraints = _table_metadata(
+                    bulk_unique_constraints, schema_name, raw_table_name
                 )
+                if unique_constraints is None:
+                    try:
+                        unique_constraints = inspector.get_unique_constraints(
+                            raw_table_name, schema=schema_name
+                        )
+                    except (NotImplementedError, sa.exc.SQLAlchemyError):
+                        unique_constraints = []
+                table_comment_data = _table_metadata(
+                    bulk_table_comments, schema_name, raw_table_name
+                )
+                if table_comment_data is None:
+                    try:
+                        table_comment_data = inspector.get_table_comment(
+                            raw_table_name, schema=schema_name
+                        )
+                    except (AttributeError, NotImplementedError, sa.exc.SQLAlchemyError):
+                        table_comment_data = {}
+                table_comment = (table_comment_data or {}).get("text")
                 column_infos = []
                 for column_data in columns:
                     column_name = column_data["name"]
@@ -86,25 +127,6 @@ def introspect_catalog(
                             foreign_key["referred_table"],
                         )
                         foreign_column = foreign_key["referred_columns"][index]
-                    samples: list[Any] = []
-                    col_key = f"{table_name}.{column_name}"
-                    # Never collect sample values for BLOCKED or MASKED columns
-                    if not is_blocked(col_key) and not is_masked(col_key) and sample_limit > 0:
-                        try:
-                            reflected_column = reflected.c[column_name]
-                            with engine.connect() as connection:
-                                values = connection.execute(
-                                    sa.select(reflected_column)
-                                    .where(reflected_column.is_not(None))
-                                    .distinct()
-                                    .limit(sample_limit)
-                                ).scalars().all()
-                            samples = [str(value) for value in values]
-                        except (sa.exc.SQLAlchemyError, KeyError):
-                            LOGGER.debug(
-                                "Column samples unavailable",
-                                extra={"table": table_name, "column": column_name},
-                            )
                     column_infos.append(
                         ColumnInfo(
                             name=column_name,
@@ -114,7 +136,8 @@ def introspect_catalog(
                             foreign_table=foreign_table,
                             foreign_column=foreign_column,
                             comment=column_data.get("comment"),
-                            sample_values=samples,
+                            nullable=column_data.get("nullable", True),
+                            enum_options=parse_enum_options(column_data.get("type", "")),
                         )
                     )
                 tables[table_name] = TableInfo(
@@ -136,6 +159,11 @@ def introspect_catalog(
                     ],
                     schema=schema_name,
                     comment=table_comment,
+                    unique_constraints=[
+                        constraint.get("column_names") or []
+                        for constraint in unique_constraints
+                        if constraint.get("column_names")
+                    ],
                 )
             except (sa.exc.SQLAlchemyError, KeyError):
                 LOGGER.warning("Table inspection skipped", extra={"table": table_name})

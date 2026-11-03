@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import sqlalchemy as sa
 from sqlalchemy.engine import Engine, URL, make_url
@@ -98,6 +99,33 @@ class DatabaseAdapter:
         raw_connection = getattr(connection.connection, "driver_connection", None)
         if raw_connection is not None and hasattr(raw_connection, "timeout"):
             raw_connection.timeout = self.timeout_seconds
+
+    @contextmanager
+    def readonly_connection(self) -> Iterator[Any]:
+        """Yield a read-only transaction with dialect session controls applied."""
+        connection = self.connect()
+        transaction = None
+        sqlite_raw = None
+        try:
+            dialect = self.get_dialect()
+            if dialect == "mysql":
+                connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+                self._set_read_only(connection)
+                transaction = connection.get_transaction() or connection.begin()
+            elif dialect == "sqlite":
+                self._set_read_only(connection)
+                transaction = connection.get_transaction() or connection.begin()
+                sqlite_raw = connection.connection.driver_connection
+            else:
+                transaction = connection.begin()
+                self._set_read_only(connection)
+            yield connection
+        finally:
+            if transaction is not None and transaction.is_active:
+                transaction.rollback()
+            if sqlite_raw is not None:
+                sqlite_raw.execute("PRAGMA query_only=OFF")
+            connection.close()
 
     def run_readonly_query(self, sql: str, max_rows: int = 100) -> QueryResult:
         """Execute pre-validated SQL using supported read-only settings and a row bound."""

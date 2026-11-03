@@ -2,9 +2,7 @@
 
 import sqlalchemy as sa
 from sqlalchemy import inspect as sa_inspect
-from sqlalchemy.engine import Engine
 from typing import Dict, List, Any, Optional
-import json
 
 import fnmatch
 EXCLUDED_SCHEMA_OBJECTS: set[str] = set()
@@ -54,7 +52,8 @@ class ColumnInfo:
         foreign_table: Optional[str] = None,
         foreign_column: Optional[str] = None,
         comment: Optional[str] = None,
-        sample_values: Optional[List[Any]] = None,
+        nullable: bool = True,
+        enum_options: Optional[List[str]] = None,
     ):
         self.name = name
         self.data_type = data_type
@@ -63,7 +62,8 @@ class ColumnInfo:
         self.foreign_table = foreign_table
         self.foreign_column = foreign_column
         self.comment = comment
-        self.sample_values = sample_values or []
+        self.nullable = bool(nullable)
+        self.enum_options = tuple(enum_options) if enum_options is not None else None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -74,7 +74,8 @@ class ColumnInfo:
             "foreign_table": self.foreign_table,
             "foreign_column": self.foreign_column,
             "comment": self.comment,
-            "sample_values": self.sample_values,
+            "nullable": self.nullable,
+            "enum_options": self.enum_options,
         }
 
 
@@ -90,6 +91,7 @@ class TableInfo:
         foreign_keys: List[Dict[str, Any]],
         schema: Optional[str] = None,
         comment: Optional[str] = None,
+        unique_constraints: Optional[List[List[str]]] = None,
     ):
         self.name = name
         self.description = description
@@ -98,6 +100,7 @@ class TableInfo:
         self.foreign_keys = foreign_keys  # list of {constrain_name, local_cols, remote_table, remote_cols}
         self.schema = schema
         self.comment = comment
+        self.unique_constraints = unique_constraints or []
 
     def to_schema_doc(self) -> str:
         """Convert to a retrievable schema document string."""
@@ -167,12 +170,14 @@ class SchemaMetadata:
                             "foreign_table": c.foreign_table,
                             "foreign_column": c.foreign_column,
                             "comment": c.comment,
-                            "sample_values": c.sample_values,
+                            "nullable": c.nullable,
+                            "enum_options": c.enum_options,
                         }
                         for c in t.columns
                     ],
                     "primary_key_names": t.primary_key_names,
                     "foreign_keys": t.foreign_keys,
+                    "unique_constraints": t.unique_constraints,
                 }
                 for name, t in self.tables.items()
             },

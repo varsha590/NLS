@@ -69,7 +69,7 @@ def test_value_index_does_not_store_high_cardinality_values(tmp_path):
         connection.execute(table.insert(), [{"generic_field": f"candidate-{index}"} for index in range(3)])
     adapter = DatabaseAdapter("sqlite:///:memory:", engine=engine)
     catalog = __import__("catalog.introspect", fromlist=["introspect_catalog"]).introspect_catalog(
-        engine, sample_limit=0
+        engine
     )
     embedder = FakeEmbedder()
     store = LocalVectorStore(tmp_path, adapter.namespace(), embedder.model_name, embedder.dim, "policy")

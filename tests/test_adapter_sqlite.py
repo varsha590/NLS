@@ -23,7 +23,7 @@ def test_adapter_executes_readonly_sqlite_query_with_row_bound():
     assert result.rows == [{"record_id": 1}, {"record_id": 2}]
 
 
-def test_catalog_introspection_reads_sqlite_columns_keys_and_samples():
+def test_catalog_introspection_reads_sqlite_metadata_without_row_samples():
     engine = sa.create_engine("sqlite:///:memory:")
     metadata = sa.MetaData()
     parent = sa.Table(
@@ -42,11 +42,23 @@ def test_catalog_introspection_reads_sqlite_columns_keys_and_samples():
     with engine.begin() as connection:
         connection.execute(parent.insert(), [{"parent_key": 1, "label": "First"}])
 
+    statements: list[str] = []
+    sa.event.listen(
+        engine,
+        "before_cursor_execute",
+        lambda conn, cursor, statement, params, context, many: statements.append(statement),
+    )
     catalog = introspect_catalog(engine, excluded_tables=("child_record",))
 
     assert set(catalog.tables) == {"parent_record"}
     label = catalog.tables["parent_record"].columns[1]
-    assert label.sample_values == ["First"]
+    assert not hasattr(label, "sample_values")
+    assert label.nullable
+    assert not any(
+        statement.lstrip().upper().startswith("SELECT")
+        and "FROM PARENT_RECORD" in statement.upper()
+        for statement in statements
+    )
     assert catalog.tables["parent_record"].primary_key_names == ["parent_key"]
 
 
