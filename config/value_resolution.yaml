@@ -82,6 +82,16 @@ metric_value_names:
   - percent
   - amount
   - amounts
+  - sale
+  - sales
+  - sell
+  - selling
+  - sold
+  - purchase
+  - purchases
+  - purchased
+  - buy
+  - bought
 
 # Words that double as a metric and as a real value. They only produce a hint
 # when an adjacent cue word names the semantic type they belong to.
@@ -427,3 +437,11 @@ value_column_allowlist:
   - membership_type
   - location
   - name
+
+# Columns representing current state rather than historical activity. Metric
+# questions should not use these as a proxy for event or transaction counts.
+status_filter_column_names:
+  - status
+  - availability
+  - inventory_status
+  - stock_status

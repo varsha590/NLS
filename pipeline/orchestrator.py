@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import sqlalchemy as sa
+import sqlglot
+from sqlglot import exp
 
 from db.adapter import DatabaseAdapter, DatabaseUnavailableError
 from llm.generator import GenerationError, GroqGenerator
@@ -96,6 +99,27 @@ class TextToSQLPipeline:
         self.schema_top_k = schema_top_k
         self.value_top_k = value_top_k
 
+    def _uses_status_as_activity_proxy(self, question: str, sql: str) -> bool:
+        """Detect status filters in questions phrased as activity metrics."""
+        if self.value_index is None:
+            return False
+        question_words = set(re.findall(r"[\w'-]+", question.casefold()))
+        metric_terms = getattr(self.value_index, "metric_terms", set())
+        if not question_words.intersection(metric_terms):
+            return False
+        try:
+            parsed = sqlglot.parse_one(sql, read=self.adapter.get_sqlglot_dialect())
+        except sqlglot.errors.ParseError:
+            return False
+        where = parsed.args.get("where")
+        if where is None:
+            return False
+        status_columns = getattr(self.value_index, "status_filter_column_names", set())
+        return any(
+            column.name.casefold() in status_columns
+            for column in where.find_all(exp.Column)
+        )
+
     def run(self, question: str, confirmed_values: list[dict[str, Any]] | None = None) -> PipelineResult:
         """Process a natural-language question and return rows plus an answer."""
         result = PipelineResult()
@@ -171,6 +195,11 @@ class TextToSQLPipeline:
                         value_index=self.value_index,
                         resolved_values=result.resolved_values,
                     )
+                    if self._uses_status_as_activity_proxy(question, result.sql):
+                        raise ValidationError(
+                            "An activity or ranking query cannot use a current-status filter "
+                            "as a proxy for historical activity. Use event or transaction measures."
+                        )
                 except (GenerationError, ValidationError) as error:
                     result.timings["generation_ms"] = result.timings.get("generation_ms", 0) + (
                         time.monotonic() - generation_started
@@ -185,6 +214,27 @@ class TextToSQLPipeline:
                         result.answer = "I could not produce a safe query for that request. Please revise the question."
                     break
                 except ValueSafetyError as error:
+                    metric_terms = getattr(self.value_index, "metric_terms", set())
+                    excluded_terms = getattr(self.value_index, "excluded_terms", set())
+                    mention_words = {word.casefold() for word in error.mention.split()}
+                    is_metric_phrase = bool(mention_words & metric_terms) and mention_words.issubset(
+                        metric_terms | excluded_terms
+                    )
+                    if (
+                        error.kind == "not_found"
+                        and is_metric_phrase
+                        and attempt < self.max_retries
+                    ):
+                        result.errors.append(str(error))
+                        result.sql = ""
+                        correction = (
+                            f"{error} The rejected literal is configured as metric vocabulary, "
+                            "not a stored value. Reinterpret the requested historical activity using "
+                            "measures in event or transaction records and their schema relationships. "
+                            "Do not use status, availability, or inventory-state columns as a proxy "
+                            "unless the question explicitly asks for current status."
+                        )
+                        continue
                     if error.kind == "ambiguous":
                         result.ambiguous_values = [{
                             "mention": error.mention,

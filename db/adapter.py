@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import logging
 import hashlib
+import re
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import sqlalchemy as sa
+from schema.metadata import EXCLUDED_SCHEMA_OBJECTS
+from schema.documents import build_table_document, build_column_document, build_relationship_document
 from sqlalchemy.engine import Engine, URL, make_url
-from sqlalchemy.dialects.postgresql import insert
 
 LOGGER = logging.getLogger(__name__)
 
@@ -77,8 +79,8 @@ class DatabaseAdapter:
         return self.url.set(username=None, password=None, query=safe_query)
 
     def ensure_pgvector(self) -> None:
-        """Ensure pgvector extension and system_schema_embeddings table exist for PostgreSQL.
-        
+        """Ensure pgvector extension and all embedding tables exist for PostgreSQL.
+
         Note: Index creation may fail if the connecting user doesn't have sufficient
         privileges; the table structure will still be created correctly.
         """
@@ -103,6 +105,33 @@ class DatabaseAdapter:
                 );
                 """
             )
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS system_value_embeddings (
+                    id SERIAL PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    table_name VARCHAR(255) NOT NULL,
+                    column_name VARCHAR(255),
+                    value TEXT NOT NULL,
+                    content_hash TEXT,
+                    embedding VECTOR(384),
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT uq_value_emb UNIQUE (namespace, table_name, column_name, value)
+                );
+                """
+            )
+            connection.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS system_examples (
+                    id SERIAL PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    question TEXT NOT NULL,
+                    sql TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT uq_example UNIQUE (namespace, question)
+                );
+                """
+            )
             # Attempt HNSW index creation; skip gracefully if user lacks privilege
             try:
                 connection.exec_driver_sql(
@@ -115,34 +144,6 @@ class DatabaseAdapter:
                 )
             except sa.exc.SQLAlchemyError:
                 LOGGER.info("HNSW index creation skipped - may need schema privileges")
-        finally:
-            connection.close()
-
-    def ensure_pgvalue_vector(self) -> None:
-        """Ensure system_value_embeddings table and HNSW index exist for PostgreSQL.
-        
-        Note: Index creation may fail if the connecting user doesn't have sufficient
-        privileges; the table structure will still be created correctly.
-        """
-        if self.get_dialect() != "postgresql":
-            return
-        connection = self.connect()
-        try:
-            connection.exec_driver_sql(
-                """
-                CREATE TABLE IF NOT EXISTS system_value_embeddings (
-                    id SERIAL PRIMARY KEY,
-                    namespace TEXT NOT NULL,
-                    table_name VARCHAR(255) NOT NULL,
-                    column_name VARCHAR(255),
-                    value TEXT NOT NULL,
-                    embedding VECTOR(384),
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    CONSTRAINT uq_value_emb UNIQUE (namespace, table_name, column_name, value)
-                );
-                """
-            )
-            # Attempt HNSW index creation; skip gracefully if user lacks privilege
             try:
                 connection.exec_driver_sql(
                     """
@@ -154,8 +155,13 @@ class DatabaseAdapter:
                 )
             except sa.exc.SQLAlchemyError:
                 LOGGER.info("HNSW index creation skipped - may need schema privileges")
+            connection.commit()
         finally:
             connection.close()
+
+    def ensure_pgvalue_vector(self) -> None:
+        """Alias for ensure_pgvector (backwards compatibility)."""
+        self.ensure_pgvector()
 
     def namespace(self) -> str:
         """Build a stable local index namespace without retaining URL credentials."""
@@ -218,7 +224,7 @@ class DatabaseAdapter:
                 sqlite_raw.set_progress_handler(lambda: int(time.monotonic() > deadline), 1000)
             result = connection.execute(sa.text(sql))
             columns = list(result.keys())
-            rows = [dict(row) for row in result.mappings().fetchmax(max_rows)]
+            rows = [dict(row) for row in result.mappings().fetchmany(max(0, max_rows))]
             transaction.rollback()
             return QueryResult(rows=rows, columns=columns)
         except sa.exc.SQLAlchemyError:
@@ -258,31 +264,34 @@ class DatabaseAdapter:
             connection.close()
 
 
+from schema.documents import build_table_document, build_column_document, build_relationship_document
+
+
 class EmbeddingStore:
-    """Encapsulates all pgvector embedding operations: upsert, search, delete missing."""
+    """Encapsulates all pgvector embedding operations: upsert, search, delete, build."""
 
     def __init__(self, adapter: DatabaseAdapter, namespace: str | None = None) -> None:
         self.adapter = adapter
         self.namespace = namespace or adapter.namespace()
         if self.adapter.get_dialect() == "postgresql":
             self.adapter.ensure_pgvector()
-            self.adapter.ensure_pgvalue_vector()
 
-    def _upsert_schema(
+    def upsert_schema(
         self,
         table_name: str,
         column_name: str | None,
         metadata_type: str,
         content: str,
-        embedding: list[float] | None,
         content_hash: str,
+        embedding: list[float] | None,
     ) -> None:
         """Upsert a schema embedding row."""
         if self.adapter.get_dialect() != "postgresql":
             return
         connection = self.adapter.connect()
         try:
-            stmt = sa.text("""
+            stmt = sa.text(
+                """
                 INSERT INTO system_schema_embeddings
                     (table_name, column_name, metadata_type, content, content_hash, embedding, namespace)
                 VALUES
@@ -293,7 +302,8 @@ class EmbeddingStore:
                     content_hash = EXCLUDED.content_hash,
                     embedding = EXCLUDED.embedding,
                     updated_at = CURRENT_TIMESTAMP;
-            """)
+                """
+            )
             params = {
                 "table_name": table_name,
                 "column_name": column_name,
@@ -311,12 +321,12 @@ class EmbeddingStore:
         finally:
             connection.close()
 
-    def _upsert_value(
+    def upsert_value(
         self,
-        namespace: str,
         table_name: str,
         column_name: str | None,
         value: str,
+        content_hash: str,
         embedding: list[float] | None,
     ) -> None:
         """Upsert a value embedding row."""
@@ -324,21 +334,25 @@ class EmbeddingStore:
             return
         connection = self.adapter.connect()
         try:
-            stmt = sa.text("""
+            stmt = sa.text(
+                """
                 INSERT INTO system_value_embeddings
-                    (namespace, table_name, column_name, value, embedding)
+                    (namespace, table_name, column_name, value, content_hash, embedding)
                 VALUES
-                    (:namespace, :table_name, :column_name, :value, :embedding)
+                    (:namespace, :table_name, :column_name, :value, :content_hash, :embedding)
                 ON CONFLICT (namespace, table_name, column_name, value)
                 DO UPDATE SET
+                    content_hash = EXCLUDED.content_hash,
                     embedding = EXCLUDED.embedding,
                     updated_at = CURRENT_TIMESTAMP;
-            """)
+                """
+            )
             params = {
-                "namespace": namespace,
+                "namespace": self.namespace,
                 "table_name": table_name,
                 "column_name": column_name,
                 "value": value,
+                "content_hash": content_hash,
                 "embedding": embedding,
             }
             connection.execute(stmt, params)
@@ -349,8 +363,57 @@ class EmbeddingStore:
         finally:
             connection.close()
 
+    def upsert_example(self, question: str, sql: str) -> None:
+        """Upsert a verified example."""
+        if self.adapter.get_dialect() != "postgresql":
+            return
+        connection = self.adapter.connect()
+        try:
+            stmt = sa.text(
+                """
+                INSERT INTO system_examples
+                    (namespace, question, sql)
+                VALUES
+                    (:namespace, :question, :sql)
+                ON CONFLICT (namespace, question)
+                DO UPDATE SET
+                    sql = EXCLUDED.sql,
+                    updated_at = CURRENT_TIMESTAMP;
+                """
+            )
+            params = {
+                "namespace": self.namespace,
+                "question": question.strip(),
+                "sql": sql.strip(),
+            }
+            connection.execute(stmt, params)
+            connection.commit()
+        except sa.exc.SQLAlchemyError:
+            LOGGER.error("Failed to upsert example", extra={"question": question})
+            connection.rollback()
+        finally:
+            connection.close()
+
+    def get_examples(self) -> list[dict[str, str]]:
+        """Retrieve all stored examples."""
+        if self.adapter.get_dialect() != "postgresql":
+            return []
+        connection = self.adapter.connect()
+        try:
+            stmt = sa.text(
+                "SELECT question, sql FROM system_examples WHERE namespace = :namespace;"
+            )
+            result = connection.execute(stmt, {"namespace": self.namespace})
+            return [{"question": row["question"], "sql": row["sql"]} for row in result.mappings()]
+        finally:
+            connection.close()
+
     def search_schema(
-        self, query_embedding: list[float], top_k: int = 10, namespace: str | None = None
+        self,
+        query_embedding: list[float],
+        top_k: int = 10,
+        metadata_type: str | None = None,
+        namespace: str | None = None,
     ) -> list[dict[str, Any]]:
         """Search schema embeddings using cosine similarity."""
         if self.adapter.get_dialect() != "postgresql":
@@ -358,20 +421,26 @@ class EmbeddingStore:
         ns = namespace or self.namespace
         connection = self.adapter.connect()
         try:
-            stmt = sa.text("""
+            where = "WHERE namespace = :namespace AND embedding IS NOT NULL"
+            if metadata_type:
+                where += " AND metadata_type = :metadata_type"
+            stmt = sa.text(
+                f"""
                 SELECT table_name, column_name, metadata_type, content,
                        1 - (embedding <=> CAST(:query_embedding AS vector)) AS similarity
                 FROM system_schema_embeddings
-                WHERE namespace = :namespace
-                  AND embedding IS NOT NULL
+                {where}
                 ORDER BY embedding <=> CAST(:query_embedding AS vector)
                 LIMIT :top_k
-            """)
+                """
+            )
             params = {
                 "query_embedding": query_embedding,
                 "namespace": ns,
                 "top_k": top_k,
             }
+            if metadata_type:
+                params["metadata_type"] = metadata_type
             result = connection.execute(stmt, params)
             rows = []
             for row in result.mappings():
@@ -387,7 +456,10 @@ class EmbeddingStore:
             connection.close()
 
     def search_values(
-        self, query_embedding: list[float], top_k: int = 10, namespace: str | None = None
+        self,
+        query_embedding: list[float],
+        top_k: int = 10,
+        namespace: str | None = None,
     ) -> list[dict[str, Any]]:
         """Search value embeddings using cosine similarity."""
         if self.adapter.get_dialect() != "postgresql":
@@ -395,7 +467,8 @@ class EmbeddingStore:
         ns = namespace or self.namespace
         connection = self.adapter.connect()
         try:
-            stmt = sa.text("""
+            stmt = sa.text(
+                """
                 SELECT table_name, column_name, value,
                        1 - (embedding <=> CAST(:query_embedding AS vector)) AS similarity
                 FROM system_value_embeddings
@@ -403,7 +476,8 @@ class EmbeddingStore:
                   AND embedding IS NOT NULL
                 ORDER BY embedding <=> CAST(:query_embedding AS vector)
                 LIMIT :top_k
-            """)
+                """
+            )
             params = {
                 "query_embedding": query_embedding,
                 "namespace": ns,
@@ -422,69 +496,301 @@ class EmbeddingStore:
         finally:
             connection.close()
 
-    def delete_missing(
-        self, current_table_names: set[str], current_column_names: set[str]
-    ) -> None:
-        """Delete embedding rows for tables/columns that no longer exist."""
+    def get_value_embeddings(self, table_name: str, column_name: str | None) -> dict[str, list[float]]:
+        """Retrieve all value embeddings for a given table/column."""
+        if self.adapter.get_dialect() != "postgresql":
+            return {}
+        connection = self.adapter.connect()
+        try:
+            stmt = sa.text(
+                """
+                SELECT value, embedding
+                FROM system_value_embeddings
+                WHERE namespace = :namespace
+                  AND table_name = :table_name
+                  AND (column_name = :column_name OR (:column_name IS NULL AND column_name IS NULL))
+                  AND embedding IS NOT NULL
+                """
+            )
+            params = {
+                "namespace": self.namespace,
+                "table_name": table_name,
+                "column_name": column_name,
+            }
+            result = connection.execute(stmt, params)
+            return {row["value"]: row["embedding"] for row in result.mappings()}
+        finally:
+            connection.close()
+
+    def get_all_value_embeddings(self) -> list[dict[str, Any]]:
+        """Retrieve all value embeddings for pruning."""
+        if self.adapter.get_dialect() != "postgresql":
+            return []
+        connection = self.adapter.connect()
+        try:
+            stmt = sa.text(
+                """
+                SELECT table_name, column_name, value, content_hash
+                FROM system_value_embeddings
+                WHERE namespace = :namespace
+                """
+            )
+            result = connection.execute(stmt, {"namespace": self.namespace})
+            return [
+                {
+                    "table_name": row["table_name"],
+                    "column_name": row["column_name"],
+                    "value": row["value"],
+                    "content_hash": row["content_hash"],
+                }
+                for row in result.mappings()
+            ]
+        finally:
+            connection.close()
+
+    def get_all_schema_embeddings(self) -> list[dict[str, Any]]:
+        """Retrieve all schema embeddings for pruning."""
+        if self.adapter.get_dialect() != "postgresql":
+            return []
+        connection = self.adapter.connect()
+        try:
+            stmt = sa.text(
+                """
+                SELECT table_name, column_name, metadata_type, content_hash
+                FROM system_schema_embeddings
+                WHERE namespace = :namespace
+                """
+            )
+            result = connection.execute(stmt, {"namespace": self.namespace})
+            return [
+                {
+                    "table_name": row["table_name"],
+                    "column_name": row["column_name"],
+                    "metadata_type": row["metadata_type"],
+                    "content_hash": row["content_hash"],
+                }
+                for row in result.mappings()
+            ]
+        finally:
+            connection.close()
+
+    def prune_schema(self, keep_keys: set[tuple[str, str | None, str]]) -> None:
+        """Delete schema embeddings not in the keep set."""
         if self.adapter.get_dialect() != "postgresql":
             return
         connection = self.adapter.connect()
         try:
-            # Delete schema embeddings for tables no longer present
-            if current_table_names:
-                placeholders = ", ".join(f"'{t}'" for t in current_table_names)
-                connection.exec_driver_sql(
-                    f"DELETE FROM system_schema_embeddings WHERE table_name NOT IN ({placeholders});"
+            all_rows = self.get_all_schema_embeddings()
+            to_delete = [
+                (r["table_name"], r["column_name"], r["metadata_type"])
+                for r in all_rows
+                if (r["table_name"], r["column_name"], r["metadata_type"]) not in keep_keys
+            ]
+            if not to_delete:
+                return
+            for table_name, column_name, metadata_type in to_delete:
+                stmt = sa.text(
+                    """
+                    DELETE FROM system_schema_embeddings
+                    WHERE namespace = :namespace
+                      AND table_name = :table_name
+                      AND (column_name = :column_name OR (:column_name IS NULL AND column_name IS NULL))
+                      AND metadata_type = :metadata_type
+                    """
                 )
-            # Delete value embeddings for tables/columns no longer present
-            # This is a simple cleanup; full reconciliation would need table-aware deletion
-            connection.exec_driver_sql(
-                "DELETE FROM system_value_embeddings WHERE table_name NOT IN (SELECT table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE');"
-            )
+                connection.execute(
+                    stmt,
+                    {
+                        "namespace": self.namespace,
+                        "table_name": table_name,
+                        "column_name": column_name,
+                        "metadata_type": metadata_type,
+                    },
+                )
             connection.commit()
         except sa.exc.SQLAlchemyError:
-            LOGGER.error("Failed to delete missing embedding rows")
+            LOGGER.error("Failed to prune schema embeddings")
             connection.rollback()
         finally:
             connection.close()
 
-    def build_schema_embeddings(self, metadata: Any) -> None:
-        """Build schema embeddings from introspected metadata."""
+    def prune_values(self, keep_keys: set[tuple[str, str | None, str]]) -> None:
+        """Delete value embeddings not in the keep set."""
         if self.adapter.get_dialect() != "postgresql":
             return
         connection = self.adapter.connect()
         try:
+            all_rows = self.get_all_value_embeddings()
+            to_delete = [
+                (r["table_name"], r["column_name"], r["value"])
+                for r in all_rows
+                if (r["table_name"], r["column_name"], r["value"]) not in keep_keys
+            ]
+            if not to_delete:
+                return
+            for table_name, column_name, value in to_delete:
+                stmt = sa.text(
+                    """
+                    DELETE FROM system_value_embeddings
+                    WHERE namespace = :namespace
+                      AND table_name = :table_name
+                      AND (column_name = :column_name OR (:column_name IS NULL AND column_name IS NULL))
+                      AND value = :value
+                    """
+                )
+                connection.execute(
+                    stmt,
+                    {
+                        "namespace": self.namespace,
+                        "table_name": table_name,
+                        "column_name": column_name,
+                        "value": value,
+                    },
+                )
+            connection.commit()
+        except sa.exc.SQLAlchemyError:
+            LOGGER.error("Failed to prune value embeddings")
+            connection.rollback()
+        finally:
+            connection.close()
+
+    def count_schema(self, namespace: str | None = None) -> int:
+        """Count schema embeddings for a namespace."""
+        if self.adapter.get_dialect() != "postgresql":
+            return 0
+        ns = namespace or self.namespace
+        connection = self.adapter.connect()
+        try:
+            result = connection.execute(
+                sa.text("SELECT COUNT(*) FROM system_schema_embeddings WHERE namespace = :namespace;"),
+                {"namespace": ns},
+            )
+            row = result.fetchone()
+            return row[0] if row else 0
+        finally:
+            connection.close()
+
+    def count_values(self, namespace: str | None = None) -> int:
+        """Count value embeddings for a namespace."""
+        if self.adapter.get_dialect() != "postgresql":
+            return 0
+        ns = namespace or self.namespace
+        connection = self.adapter.connect()
+        try:
+            result = connection.execute(
+                sa.text("SELECT COUNT(*) FROM system_value_embeddings WHERE namespace = :namespace;"),
+                {"namespace": ns},
+            )
+            row = result.fetchone()
+            return row[0] if row else 0
+        finally:
+            connection.close()
+
+    def build_schema_embeddings(self, metadata: Any, embedder: Any | None = None) -> None:
+        """Build schema embeddings from introspected metadata: table_ddl, column_description, relationship."""
+        if self.adapter.get_dialect() != "postgresql":
+            return
+        if embedder is None:
+            from retrieval.embeddings import EmbeddingModel
+
+            embedder = EmbeddingModel("all-MiniLM-L6-v2")
+
+        connection = self.adapter.connect()
+        try:
+            # Build list of rows to upsert
+            rows_to_upsert = []
             for table_info in metadata.tables.values():
                 table_name = table_info.name.rsplit(".", 1)[-1]
+                if table_name.startswith("system_"):
+                    continue
+                if table_name in EXCLUDED_SCHEMA_OBJECTS:
+                    continue
+
+                # table_ddl row
+                table_doc = build_table_document(table_info)
+                content_hash = hashlib.sha256(table_doc.encode("utf-8")).hexdigest()
+                rows_to_upsert.append(
+                    {
+                        "table_name": table_name,
+                        "column_name": None,
+                        "metadata_type": "table_ddl",
+                        "content": table_doc,
+                        "content_hash": content_hash,
+                    }
+                )
+
+                # column_description rows
                 for column_info in table_info.columns:
-                    column_name = column_info.name
-                    metadata_type = "column_description"
-                    content = f"{column_info.name} {column_info.data_type} {column_info.comment or ''}"
-                    # Compute content hash
-                    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-                    # Check if already up to date
-                    existing = connection.exec_driver_sql(
-                        "SELECT content_hash FROM system_schema_embeddings WHERE table_name = %s AND column_name = %s AND metadata_type = %s AND namespace = %s;",
-                        (table_name, column_name, metadata_type, self.namespace),
-                    ).fetchone()
-                    if existing and existing[0] == content_hash:
-                        continue  # No change, skip
-                    # Get embedding
-                    embedding = None
-                    try:
-                        from retrieval.embeddings import EmbeddingModel
-                        model = EmbeddingModel("all-MiniLM-L6-v2")
-                        embedding = model.embed([content])[0].tolist()
-                    except Exception:
-                        LOGGER.debug("Embedding generation failed for column", extra={"table": table_name, "column": column_name})
-                    self._upsert_schema(
-                        table_name=table_name,
-                        column_name=column_name,
-                        metadata_type=metadata_type,
-                        content=content,
-                        embedding=embedding,
-                        content_hash=content_hash,
+                    col_doc = build_column_document(table_info, column_info)
+                    content_hash = hashlib.sha256(col_doc.encode("utf-8")).hexdigest()
+                    rows_to_upsert.append(
+                        {
+                            "table_name": table_name,
+                            "column_name": column_info.name,
+                            "metadata_type": "column_description",
+                            "content": col_doc,
+                            "content_hash": content_hash,
+                        }
                     )
+
+                # relationship rows
+                for i, relation in enumerate(table_info.foreign_keys):
+                    rel_doc = build_relationship_document(table_info, relation)
+                    content_hash = hashlib.sha256(rel_doc.encode("utf-8")).hexdigest()
+                    # Use FK column as column_name to keep unique
+                    fk_col = relation.get("column") or relation.get("local_column") or f"fk_{i}"
+                    rows_to_upsert.append(
+                        {
+                            "table_name": table_name,
+                            "column_name": fk_col,
+                            "metadata_type": "relationship",
+                            "content": rel_doc,
+                            "content_hash": content_hash,
+                        }
+                    )
+
+            # Fetch existing hashes to skip unchanged
+            existing = self.get_all_schema_embeddings()
+            existing_hashes = {
+                (r["table_name"], r["column_name"], r["metadata_type"]): r["content_hash"]
+                for r in existing
+            }
+
+            # Determine which need embedding
+            to_embed = []
+            for row in rows_to_upsert:
+                key = (row["table_name"], row["column_name"], row["metadata_type"])
+                if existing_hashes.get(key) != row["content_hash"]:
+                    to_embed.append(row)
+
+            # Batch embed new/changed
+            embeddings = []
+            if to_embed:
+                embeddings = embedder.embed([r["content"] for r in to_embed])
+
+            # Create mapping from key to embedding for new/changed rows
+            embed_map = {
+                (r["table_name"], r["column_name"], r["metadata_type"]): embeddings[i].tolist()
+                for i, r in enumerate(to_embed)
+            }
+
+            # Upsert all
+            for row in rows_to_upsert:
+                key = (row["table_name"], row["column_name"], row["metadata_type"])
+                embedding = embed_map.get(key)  # None if unchanged
+                self.upsert_schema(
+                    table_name=row["table_name"],
+                    column_name=row["column_name"],
+                    metadata_type=row["metadata_type"],
+                    content=row["content"],
+                    content_hash=row["content_hash"],
+                    embedding=embedding,
+                )
+
+            # Prune deleted
+            keep_keys = {(r["table_name"], r["column_name"], r["metadata_type"]) for r in rows_to_upsert}
+            self.prune_schema(keep_keys)
+
             connection.commit()
         except sa.exc.SQLAlchemyError:
             LOGGER.error("Failed to build schema embeddings")
@@ -492,16 +798,25 @@ class EmbeddingStore:
         finally:
             connection.close()
 
-    def build_value_embeddings(self, metadata: Any, cardinality_threshold: int = 500) -> None:
+    def build_value_embeddings(self, metadata: Any, embedder: Any | None = None, cardinality_threshold: int = 500) -> None:
         """Build value embeddings from database distinct values."""
         if self.adapter.get_dialect() != "postgresql":
             return
-        from retrieval.embeddings import EmbeddingModel
-        model = EmbeddingModel("all-MiniLM-L6-v2")
+        if embedder is None:
+            from retrieval.embeddings import EmbeddingModel
+
+            embedder = EmbeddingModel("all-MiniLM-L6-v2")
+
         connection = self.adapter.connect()
         try:
+            # Gather all values to embed
+            rows_to_upsert = []
             for table_info in metadata.tables.values():
                 table_name = table_info.name.rsplit(".", 1)[-1]
+                if table_name.startswith("system_"):
+                    continue
+                if table_name in EXCLUDED_SCHEMA_OBJECTS:
+                    continue
                 reflected = sa.Table(
                     table_name,
                     sa.MetaData(),
@@ -512,112 +827,6 @@ class EmbeddingStore:
                     column = reflected.c.get(column_info.name)
                     if column is None:
                         continue
-                    key = f"{table_info.name}.{column_info.name}"
-                    # Check if value column
-                    if not self._is_value_column(reflected, column):
-                        continue
-                    try:
-                        with self.adapter.engine.connect() as conn:
-                            query = (
-                                sa.select(column)
-                                .where(column.is_not(None))
-                                .distinct()
-                                .limit(cardinality_threshold + 1)
-                            )
-                            raw_values = conn.execute(query).scalars().all()
-                        if len(raw_values) > cardinality_threshold:
-                            continue
-                        values = [str(v) for v in raw_values if not self._is_schema_value(str(v))]
-                        if not values:
-                            continue
-                        for value in values:
-                            value_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
-                            # Check if already up to date
-                            existing = connection.exec_driver_sql(
-                                "SELECT content_hash FROM system_value_embeddings WHERE namespace = %s AND table_name = %s AND column_name = %s AND value = %s;",
-                                (self.namespace, table_name, column_info.name, value),
-                            ).fetchone()
-                            if existing and existing[0] == value_hash:
-                                continue  # No change, skip
-                            embedding = model.embed([value])[0].tolist()
-                            self._upsert_value(
-                                namespace=self.namespace,
-                                table_name=table_name,
-                                column_name=column_info.name,
-                                value=value,
-                                embedding=embedding,
-                            )
-                    except (sa.exc.SQLAlchemyError, KeyError):
-                        LOGGER.debug("Value embedding skipped for column", extra={"table": table_name, "column": column_info.name})
-            connection.commit()
-        except sa.exc.SQLAlchemyError:
-            LOGGER.error("Failed to build value embeddings")
-            connection.rollback()
-        finally:
-            connection.close()
-
-    def refresh_schema_embeddings(self, metadata: Any) -> None:
-        """Refresh schema embeddings - only update changed rows."""
-        if self.adapter.get_dialect() != "postgresql":
-            return
-        connection = self.adapter.connect()
-        try:
-            for table_info in metadata.tables.values():
-                table_name = table_info.name.rsplit(".", 1)[-1]
-                for column_info in table_info.columns:
-                    column_name = column_info.name
-                    metadata_type = "column_description"
-                    content = f"{column_info.name} {column_info.data_type} {column_info.comment or ''}"
-                    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-                    existing = connection.exec_driver_sql(
-                        "SELECT content_hash FROM system_schema_embeddings WHERE table_name = %s AND column_name = %s AND metadata_type = %s AND namespace = %s;",
-                        (table_name, column_name, metadata_type, self.namespace),
-                    ).fetchone()
-                    if existing and existing[0] == content_hash:
-                        continue  # No change, skip
-                    embedding = None
-                    try:
-                        from retrieval.embeddings import EmbeddingModel
-                        model = EmbeddingModel("all-MiniLM-L6-v2")
-                        embedding = model.embed([content])[0].tolist()
-                    except Exception:
-                        LOGGER.debug("Embedding generation failed for column during refresh", extra={"table": table_name, "column": column_name})
-                    self._upsert_schema(
-                        table_name=table_name,
-                        column_name=column_name,
-                        metadata_type=metadata_type,
-                        content=content,
-                        embedding=embedding,
-                        content_hash=content_hash,
-                    )
-            connection.commit()
-        except sa.exc.SQLAlchemyError:
-            LOGGER.error("Failed to refresh schema embeddings")
-            connection.rollback()
-        finally:
-            connection.close()
-
-    def refresh_value_embeddings(self, metadata: Any, cardinality_threshold: int = 500) -> None:
-        """Refresh value embeddings - only update changed rows."""
-        if self.adapter.get_dialect() != "postgresql":
-            return
-        from retrieval.embeddings import EmbeddingModel
-        model = EmbeddingModel("all-MiniLM-L6-v2")
-        connection = self.adapter.connect()
-        try:
-            for table_info in metadata.tables.values():
-                table_name = table_info.name.rsplit(".", 1)[-1]
-                reflected = sa.Table(
-                    table_name,
-                    sa.MetaData(),
-                    schema=table_info.schema,
-                    autoload_with=self.adapter.engine,
-                )
-                for column_info in table_info.columns:
-                    column = reflected.c.get(column_info.name)
-                    if column is None:
-                        continue
-                    key = f"{table_info.name}.{column_info.name}"
                     if not self._is_value_column(column):
                         continue
                     try:
@@ -629,32 +838,68 @@ class EmbeddingStore:
                                 .limit(cardinality_threshold + 1)
                             )
                             raw_values = conn.execute(query).scalars().all()
-                        if len(raw_values) > cardinality_threshold:
-                            continue
-                        values = [str(v) for v in raw_values if not self._is_schema_value(str(v))]
-                        if not values:
-                            continue
-                        for value in values:
-                            value_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
-                            existing = connection.exec_driver_sql(
-                                "SELECT content_hash FROM system_value_embeddings WHERE namespace = %s AND table_name = %s AND column_name = %s AND value = %s;",
-                                (self.namespace, table_name, column_info.name, value),
-                            ).fetchone()
-                            if existing and existing[0] == value_hash:
-                                continue  # No change, skip
-                            embedding = model.embed([value])[0].tolist()
-                            self._upsert_value(
-                                namespace=self.namespace,
-                                table_name=table_name,
-                                column_name=column_info.name,
-                                value=value,
-                                embedding=embedding,
-                            )
-                    except (sa.exc.SQLAlchemyError, KeyError):
-                        LOGGER.debug("Value embedding skipped during refresh", extra={"table": table_name, "column": column_info.name})
+                    except sa.exc.SQLAlchemyError:
+                        continue
+                    if len(raw_values) > cardinality_threshold:
+                        continue
+                    values = [str(v) for v in raw_values if not self._is_schema_value(str(v))]
+                    if not values:
+                        continue
+                    for value in values:
+                        content_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
+                        rows_to_upsert.append(
+                            {
+                                "table_name": table_name,
+                                "column_name": column_info.name,
+                                "value": value,
+                                "content_hash": content_hash,
+                            }
+                        )
+
+            # Fetch existing hashes
+            existing = self.get_all_value_embeddings()
+            existing_hashes = {
+                (r["table_name"], r["column_name"], r["value"]): r["content_hash"]
+                for r in existing
+            }
+
+            # Determine which need embedding
+            to_embed = []
+            for row in rows_to_upsert:
+                key = (row["table_name"], row["column_name"], row["value"])
+                if existing_hashes.get(key) != row["content_hash"]:
+                    to_embed.append(row)
+
+            # Batch embed
+            embeddings = []
+            if to_embed:
+                embeddings = embedder.embed([r["value"] for r in to_embed])
+
+            # Create mapping from key to embedding for new/changed rows
+            embed_map = {
+                (r["table_name"], r["column_name"], r["value"]): embeddings[i].tolist()
+                for i, r in enumerate(to_embed)
+            }
+
+            # Upsert all
+            for row in rows_to_upsert:
+                key = (row["table_name"], row["column_name"], row["value"])
+                embedding = embed_map.get(key)  # None if unchanged
+                self.upsert_value(
+                    table_name=row["table_name"],
+                    column_name=row["column_name"],
+                    value=row["value"],
+                    content_hash=row["content_hash"],
+                    embedding=embedding,
+                )
+
+            # Prune deleted
+            keep_keys = {(r["table_name"], r["column_name"], r["value"]) for r in rows_to_upsert}
+            self.prune_values(keep_keys)
+
             connection.commit()
         except sa.exc.SQLAlchemyError:
-            LOGGER.error("Failed to refresh value embeddings")
+            LOGGER.error("Failed to build value embeddings")
             connection.rollback()
         finally:
             connection.close()
@@ -663,5 +908,13 @@ class EmbeddingStore:
     def _is_value_column(column: Any) -> bool:
         """Check if column is a value column based on data type."""
         type_name = str(column.type).lower()
-        # Value columns are typically text, string, or character types
         return any(marker in type_name for marker in ("char", "text", "string"))
+
+    @staticmethod
+    def _is_schema_value(value: str) -> bool:
+        """Check if a value is schema vocabulary (table/column names, etc.)."""
+        normalized = " ".join(re.findall(r"[\w'-]+", value.casefold()))
+        if not normalized:
+            return True
+        # We don't have schema context here; keep simple filter
+        return False

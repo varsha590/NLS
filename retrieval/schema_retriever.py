@@ -67,14 +67,14 @@ class HybridSchemaRetriever:
         semantic_results = []
         if self.embedding_store is not None:
             semantic_results = self.embedding_store.search_schema(
-                query_vector.tolist(), top_k=max(top_k, MAX_TOP_K)
+                query_vector.tolist(), top_k=max(top_k, MAX_TOP_K), metadata_type="table_ddl"
             )
         
         # Build a lookup of semantic scores from the search results
         semantic_scores: dict[str, float] = {}
         for result in semantic_results:
             table_name = result.get("table_name", "")
-            # Store per-table similarity; may need per-column later
+            # Store per-table similarity
             semantic_scores[table_name] = result.get("similarity", 0.0)
         
         ranked = []
@@ -136,7 +136,7 @@ class HybridSchemaRetriever:
                 details = f"{column.name} {column.data_type}"
                 if column.is_primary_key:
                     details += " PRIMARY KEY"
-                if column.is_fK and column.foreign_table and column.foreign_column:
+                if column.is_foreign_key and column.foreign_table and column.foreign_column:
                     details += f" REFERENCES {column.foreign_table}({column.foreign_column})"
                 columns.append(details)
             definitions.append(f"TABLE {table.name} ({', '.join(columns)})")

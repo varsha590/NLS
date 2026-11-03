@@ -15,10 +15,10 @@ from pipeline.orchestrator import TextToSQLPipeline
 from retrieval.embeddings import EmbeddingModel
 from retrieval.examples import ExampleStore
 from retrieval.schema_retriever import HybridSchemaRetriever
-from sqlalchemy import text
-
+from retrieval.value_index import ValueIndex
 LOGGER = logging.getLogger(__name__)
-_runtime: dict[str, Any] = None
+_runtime: dict[str, Any] = {}
+_catalog_fingerprints: set[tuple[str, str]] = set()
 
 
 def init_app(force: bool = False) -> dict[str, Any]:
@@ -32,7 +32,6 @@ def init_app(force: bool = False) -> dict[str, Any]:
         connection.close()
 
     adapter.ensure_pgvector()
-    adapter.ensure_pgvalue_vector()
 
     metadata = introspect_catalog(
         adapter.engine,
@@ -43,20 +42,12 @@ def init_app(force: bool = False) -> dict[str, Any]:
     schema_hash = hashlib.sha256(
         json.dumps(schema_payload, sort_keys=True, default=str).encode("utf-8")
     ).hexdigest()
+    catalog_fingerprint = (adapter.namespace(), schema_hash)
+    previously_indexed = not force and catalog_fingerprint in _catalog_fingerprints
 
     embedding_store = EmbeddingStore(adapter)
 
-    # Check if schema embeddings exist in PostgreSQL
-    # Use conn.execute(text(...)) for reliable parameter binding
-    connection2 = adapter.connect()
-    try:
-        count_result = connection2.execute(
-            text("SELECT COUNT(*) FROM system_schema_embeddings WHERE namespace = :ns;"),
-            {"ns": embedding_store.namespace},
-        )
-        schema_count = int(count_result.fetchone()[0])
-    finally:
-        connection2.close()
+    schema_count = embedding_store.count_schema()
 
     cached_is_current = not force and schema_count > 0
 
@@ -66,13 +57,25 @@ def init_app(force: bool = False) -> dict[str, Any]:
         # Build schema embeddings from introspected metadata
         embedding_store.build_schema_embeddings(metadata)
         # Build value embeddings from database values
-        embedding_store.build_value_embeddings(metadata, settings.value_cardinality_threshold)
+        embedding_store.build_value_embeddings(metadata, embedding_model, settings.value_cardinality_threshold)
     else:
         # Refresh what changed - only update rows that differ
-        embedding_store.refresh_schema_embeddings(metadata)
-        embedding_store.refresh_value_embeddings(metadata, settings.value_cardinality_threshold)
+        embedding_store.build_schema_embeddings(metadata)
+        embedding_store.build_value_embeddings(metadata, embedding_model, settings.value_cardinality_threshold)
 
-    retriever = HybridSchemaRetriever(metadata, embedding_model)
+    # Create ValueIndex with embedding_store for value resolution
+    value_index = ValueIndex(
+        adapter=adapter,
+        metadata=metadata,
+        cardinality_threshold=settings.value_cardinality_threshold,
+        embedder=embedding_model,
+        storage_path=settings.vector_store_path,
+        embedding_store=embedding_store,
+    )
+    value_index.build()
+    _catalog_fingerprints.add(catalog_fingerprint)
+
+    retriever = HybridSchemaRetriever(metadata, embedding_model, embedding_store=embedding_store)
 
     generator = GroqGenerator(settings.groq_api_key, settings.llm_model)
     examples = ExampleStore(settings.vector_store_path, adapter)
@@ -81,7 +84,7 @@ def init_app(force: bool = False) -> dict[str, Any]:
         metadata=metadata,
         retriever=retriever,
         generator=generator,
-        value_index=embedding_store,
+        value_index=value_index,
         examples=examples,
         max_rows=settings.max_rows,
         max_retries=settings.max_retries,
@@ -89,7 +92,7 @@ def init_app(force: bool = False) -> dict[str, Any]:
         value_top_k=settings.value_top_k,
     )
 
-    # Store resources in runtime - embedding_store replaces old catalog/value_index
+    # Store resources in runtime
     global _runtime
     _runtime = {
         "settings": settings,
@@ -98,10 +101,11 @@ def init_app(force: bool = False) -> dict[str, Any]:
         "metadata": metadata,
         "retriever": retriever,
         "embedding_store": embedding_store,
+        "value_index": value_index,
         "examples": examples,
         "pipeline": pipeline,
         "indexed_tables": len(metadata.tables),
-        "catalog_status": "postgres" if schema_count > 0 else "built",
+        "catalog_status": "cached" if schema_count > 0 or previously_indexed else "indexed",
     }
     LOGGER.info(
         "Application ready",

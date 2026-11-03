@@ -32,7 +32,12 @@ def build_prompt(
         f"You generate SQL for the {dialect} dialect. Return SQL only. "
         "Generate one read-only SELECT statement. Use only the tables and columns in the supplied schema. "
         "Use full table names or consistent aliases, and never invent identifiers. "
-        "Use resolved values exactly as supplied."
+        "Use resolved values exactly as supplied. Interpret activity and ranking language using measurable "
+        "quantities and relationships in the schema; do not turn an activity into a status or category "
+        "filter unless the question explicitly asks for that stored value. For historical activity or "
+        "volume, aggregate measures from event or transaction records; do not use current status, "
+        "availability, or inventory state as a proxy. When a requested full name is split across multiple "
+        "schema columns, select all name components."
     )
     user = (
         f"Question:\n{question}\n\nSchema:\n{ddl}\n\nResolved values:\n{value_text}\n\n"

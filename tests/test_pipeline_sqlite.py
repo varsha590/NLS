@@ -7,6 +7,7 @@ from catalog.introspect import introspect_catalog
 from db.adapter import DatabaseAdapter
 from pipeline.orchestrator import TextToSQLPipeline
 from retrieval.schema_retriever import HybridSchemaRetriever
+from retrieval.value_index import ValueIndex
 
 
 class FakeEmbedder:
@@ -107,3 +108,50 @@ def test_pipeline_none_of_these_skips_value_and_continues():
     assert continued.ambiguous_values == []
     assert continued.errors == []
     assert continued.rows == [{"item_name": "widget", "quantity": 4}]
+
+
+def test_pipeline_retries_unverified_metric_word_as_measure():
+    engine = sa.create_engine("sqlite:///:memory:")
+    metadata = sa.MetaData()
+    inventory = sa.Table(
+        "inventory",
+        metadata,
+        sa.Column("status", sa.String, primary_key=True),
+    )
+    metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(inventory.insert(), [{"status": "Available"}])
+
+    class CorrectingGenerator:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                return "SELECT status FROM inventory WHERE status = 'sold out'"
+            if self.calls == 2:
+                return "SELECT status FROM inventory WHERE status = 'Available'"
+            return "SELECT status FROM inventory"
+
+    adapter = DatabaseAdapter("sqlite:///:memory:", engine=engine)
+    catalog = introspect_catalog(engine)
+    value_index = ValueIndex(adapter, catalog)
+    value_index.build()
+    generator = CorrectingGenerator()
+    pipeline = TextToSQLPipeline(
+        adapter=adapter,
+        metadata=catalog,
+        retriever=HybridSchemaRetriever(catalog, FakeEmbedder()),
+        generator=generator,
+        value_index=value_index,
+        max_rows=10,
+        max_retries=2,
+    )
+
+    result = pipeline.run("show inventory status for sold out items")
+
+    assert generator.calls == 3
+    assert result.retries == 2
+    assert result.errors == []
+    assert result.rows == [{"status": "Available"}]

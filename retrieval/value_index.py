@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -127,8 +128,28 @@ class ValueIndex:
         }
         self.excluded_terms.update(self.metric_terms)
         self.metric_term_cues = {
-            term.caseflow(): {cue.caseflow() for cue in cues}
+            term.casefold(): {cue.casefold() for cue in cues}
             for term, cues in self.config.get("cued_metric_terms", {}).items()
+        }
+        self.value_column_allowlist = {
+            name.casefold()
+            for name in self.config.get("value_column_allowlist", [])
+        }
+        self.value_column_suffixes = tuple(
+            suffix.casefold()
+            for suffix in self.config.get("value_column_patterns", {}).get("suffixes", [])
+        )
+        self.value_column_names = {
+            name.casefold()
+            for name in self.config.get("value_column_patterns", {}).get("exact_names", [])
+        }
+        self.excluded_column_names = {
+            name.casefold()
+            for name in self.config.get("excluded_column_names", [])
+        }
+        self.status_filter_column_names = {
+            name.casefold()
+            for name in self.config.get("status_filter_column_names", [])
         }
         self.embedding_store = embedding_store
 
@@ -141,7 +162,19 @@ class ValueIndex:
         )
 
     def _is_value_column(self, column: Any) -> bool:
-        """Check if column is a value column based on data type."""
+        """Check text type and configured semantics before indexing a column."""
+        column_name = column.name.casefold()
+        if column_name in self.excluded_column_names:
+            return False
+        if self.value_column_allowlist:
+            configured = column_name in self.value_column_allowlist
+        else:
+            configured = (
+                column_name in self.value_column_names
+                or column_name.endswith(self.value_column_suffixes)
+            )
+        if not configured:
+            return False
         type_name = str(column.type).lower()
         return any(marker in type_name for marker in ("char", "text", "string"))
 
@@ -162,6 +195,7 @@ class ValueIndex:
         self.values.clear()
         self.large_columns.clear()
         self.embeddings.clear()
+
         for table_info in self.metadata.tables.values():
             if self._is_internal_table(table_info):
                 continue
@@ -194,22 +228,41 @@ class ValueIndex:
                     if not values:
                         continue
                     self.values[key] = values
+
                     # Upsert embeddings to PostgreSQL via EmbeddingStore
                     if self.embedder is not None and self.embedding_store is not None:
                         namespace = self.embedding_store.namespace
                         embeddings_list = self.embedder.embed(values)
                         for i, value in enumerate(values):
+                            content_hash = hashlib.sha256(value.encode("utf-8")).hexdigest()
                             embedding = embeddings_list[i].tolist()
-                            self.embedding_store._upsert_value(
-                                namespace=namespace,
+                            self.embedding_store.upsert_value(
                                 table_name=table_name,
                                 column_name=column_info.name,
                                 value=value,
+                                content_hash=content_hash,
                                 embedding=embedding,
                             )
+                        # Load embeddings into memory for scoring
+                        value_embeddings = self.embedding_store.get_value_embeddings(
+                            table_name, column_info.name
+                        )
+                        self.embeddings[key] = np.array([value_embeddings[v] for v in values if v in value_embeddings])
+                    elif self.embedder is not None:
+                        self.embeddings[key] = self.embedder.embed(values)
                 except (sa.exc.SQLAlchemyError, KeyError):
                     LOGGER.debug("Value index skipped a column", extra={"column": key})
-        # No longer persist to local disk
+        if self.storage_path is not None:
+            self.storage_path.parent.mkdir(parents=True, exist_ok=True)
+            self.storage_path.write_text(
+                json.dumps({
+                    "values": self.values,
+                    "embeddings": {
+                        key: vectors.tolist() for key, vectors in self.embeddings.items()
+                    },
+                }),
+                encoding="utf-8",
+            )
         return self.values
 
     def report(self, sample_size: int = 5) -> list[dict[str, Any]]:
@@ -272,16 +325,15 @@ class ValueIndex:
             if query_embedding is not None and candidate_column in self.values:
                 try:
                     value_index = indexed_values.index(value)
-                    # Try to get vector score from EmbeddingStore
+                    # Try to get vector score from EmbeddingStore first
                     if self.embedding_store is not None:
                         namespace = self.embedding_store.namespace
                         search_results = self.embedding_store.search_values(
-                            query_embedding=[query_embedding],
+                            query_embedding=query_embedding.tolist(),
                             top_k=1,
                             namespace=namespace,
                         )
                         if search_results:
-                            # Find the matching value's similarity
                             for result in search_results:
                                 if result.get("value") == value:
                                     vector_score = result.get("similarity", 0.0)
