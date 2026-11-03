@@ -151,6 +151,9 @@ class ValueIndex:
             name.casefold()
             for name in self.config.get("status_filter_column_names", [])
         }
+        self.activity_query_expansion = tuple(
+            str(term) for term in self.config.get("activity_query_expansion", [])
+        )
         self.embedding_store = embedding_store
 
     def _is_internal_table(self, table: Any) -> bool:

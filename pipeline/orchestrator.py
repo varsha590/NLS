@@ -162,7 +162,13 @@ class TextToSQLPipeline:
                 return result
 
             retrieval_started = time.monotonic()
-            retrieval = self.retriever.retrieve(question, self.schema_top_k)
+            retrieval_question = question
+            metric_terms = getattr(self.value_index, "metric_terms", set())
+            question_words = set(re.findall(r"[\w'-]+", question.casefold()))
+            if question_words.intersection(metric_terms):
+                expansion = getattr(self.value_index, "activity_query_expansion", ())
+                retrieval_question = " ".join((question, *expansion))
+            retrieval = self.retriever.retrieve(retrieval_question, self.schema_top_k)
             result.tables_used = retrieval["tables"]
             result.timings["schema_retrieval_ms"] = (time.monotonic() - retrieval_started) * 1000
             examples = self.examples.retrieve(question, self.value_top_k) if self.examples else []

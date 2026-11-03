@@ -139,10 +139,22 @@ def test_pipeline_retries_unverified_metric_word_as_measure():
     value_index = ValueIndex(adapter, catalog)
     value_index.build()
     generator = CorrectingGenerator()
+
+    class CapturingRetriever:
+        query = ""
+
+        def retrieve(self, question, top_k):
+            self.query = question
+            return {
+                "tables": ["inventory"],
+                "ddl": "TABLE inventory (status VARCHAR)",
+            }
+
+    retriever = CapturingRetriever()
     pipeline = TextToSQLPipeline(
         adapter=adapter,
         metadata=catalog,
-        retriever=HybridSchemaRetriever(catalog, FakeEmbedder()),
+        retriever=retriever,
         generator=generator,
         value_index=value_index,
         max_rows=10,
@@ -155,3 +167,5 @@ def test_pipeline_retries_unverified_metric_word_as_measure():
     assert result.retries == 2
     assert result.errors == []
     assert result.rows == [{"status": "Available"}]
+    assert "purchase" in retriever.query
+    assert "quantity" in retriever.query

@@ -445,3 +445,15 @@ status_filter_column_names:
   - availability
   - inventory_status
   - stock_status
+
+activity_query_expansion:
+  - event
+  - events
+  - transaction
+  - transactions
+  - purchase
+  - purchases
+  - sale
+  - sales
+  - quantity
+  - amount
