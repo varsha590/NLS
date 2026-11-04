@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import uuid
 import warnings
 from pathlib import Path
 from typing import Any
@@ -60,6 +62,20 @@ def _value_document(table: str, column: str, value: str) -> dict[str, Any]:
         "value": value,
         "content": f"{table} {column} {value}",
     }
+
+
+def _typed_documents(label: str) -> list[dict[str, Any]]:
+    return [
+        {**_document("records", f"{label} table"), "document_type": "table"},
+        {**_document("records", f"{label} column", "name"), "document_type": "column"},
+        {
+            "document_type": "relationship",
+            "table_name": "records",
+            "column_name": "parent_id",
+            "content": f"{label} relationship",
+        },
+        _value_document("records", "name", f"{label} master value"),
+    ]
 
 
 def _make_store(client: QdrantClient) -> QdrantVectorStore:
@@ -242,10 +258,24 @@ def test_search_requires_both_scope_values_and_filters_results(tmp_path):
 def test_search_refuses_unindexed_or_changed_embedding_metadata(tmp_path):
     store = _make_store(_client())
     metadata_path = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
-    with pytest.raises(QdrantStorageError, match="embeddings do not match"):
+    with pytest.raises(QdrantStorageError, match="Dataset index is unavailable or incompatible"):
         store.search(
             VECTOR, "tenant-a", "dataset-a", 5,
             dataset_metadata_path=metadata_path, embedding_model_name="model-384", dimension=384,
+        )
+    store.reindex_dataset(
+        "tenant-a", "dataset-a", [_document("regions", "North")],
+        [VECTOR], metadata_path, "hash", "model-384", 384,
+    )
+    with pytest.raises(QdrantMetadataMismatchError, match="Dataset index is unavailable or incompatible"):
+        store.search(
+            VECTOR, "tenant-a", "dataset-a", 5,
+            dataset_metadata_path=metadata_path, embedding_model_name="different-model", dimension=384,
+        )
+    with pytest.raises(QdrantStorageError, match="384 dimensions"):
+        store.search(
+            VECTOR, "tenant-a", "dataset-a", 5,
+            dataset_metadata_path=metadata_path, embedding_model_name="model-384", dimension=768,
         )
 
 
@@ -300,7 +330,7 @@ def test_retrieve_propagates_real_store_metadata_mismatch_before_search(
     client.close()
 
 
-def test_search_metadata_failures_share_one_message(tmp_path):
+def test_search_metadata_failures_share_one_message_and_log_safe_reasons(tmp_path, caplog):
     store = _make_store(_client())
     valid_metadata = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
     valid_metadata.write_text(json.dumps({
@@ -325,31 +355,25 @@ def test_search_metadata_failures_share_one_message(tmp_path):
         (valid_metadata, "tenant-a", "different-model", QdrantMetadataMismatchError),
     ]
     messages = []
-    for metadata_path, tenant_id, model_name, expected_error in cases:
-        with pytest.raises(expected_error) as error:
-            store.search_table(
-                VECTOR, tenant_id, "dataset-a", 5, metadata_path, model_name, 384
-            )
-        messages.append(str(error.value))
+    with caplog.at_level("WARNING", logger="retrieval.qdrant_store"):
+        for metadata_path, tenant_id, model_name, expected_error in cases:
+            with pytest.raises(expected_error) as error:
+                store.search_table(
+                    VECTOR, tenant_id, "dataset-a", 5, metadata_path, model_name, 384
+                )
+            messages.append(str(error.value))
 
     assert messages[0] == messages[1] == messages[2]
     assert messages[0] == (
-        "Dataset embeddings do not match the active model or dimension; re-index is required."
+        "Dataset index is unavailable or incompatible; search was refused."
     )
-    store.reindex_dataset(
-        "tenant-a", "dataset-a", [_document("regions", "North")],
-        [VECTOR], metadata_path, "hash", "model-384", 384,
-    )
-    with pytest.raises(QdrantStorageError, match="model or dimension"):
-        store.search(
-            VECTOR, "tenant-a", "dataset-a", 5,
-            dataset_metadata_path=metadata_path, embedding_model_name="different-model", dimension=384,
-        )
-    with pytest.raises(QdrantStorageError, match="384 dimensions"):
-        store.search(
-            VECTOR, "tenant-a", "dataset-a", 5,
-            dataset_metadata_path=metadata_path, embedding_model_name="model-384", dimension=768,
-        )
+    warning_text = caplog.text
+    assert "metadata is missing or unreadable" in warning_text
+    assert "index scope is invalid" in warning_text
+    assert "embedding model metadata is incompatible" in warning_text
+    assert "tenant-a" not in warning_text
+    assert "tenant-b" not in warning_text
+    assert "dataset-a" not in warning_text
 
 
 def test_dataset_indexer_embeds_tables_columns_relationships_and_values(tmp_path):
@@ -424,62 +448,128 @@ def test_settings_hide_qdrant_url_and_api_key_from_repr(monkeypatch):
     assert "secret-qdrant-key" not in repr(settings)
 
 
-@pytest.mark.integration
-def test_docker_qdrant_isolates_two_tenants_and_two_datasets(tmp_path):
-    import os
-
+@pytest.fixture
+def docker_qdrant_scope(tmp_path):
     endpoint = os.getenv("QDRANT_INTEGRATION_URL")
     if not endpoint:
         pytest.skip("Set QDRANT_INTEGRATION_URL to run Docker Qdrant integration coverage.")
+    suffix = uuid.uuid4().hex
+    tenant_ids = (f"nls-test-{suffix}-a", f"nls-test-{suffix}-b")
+    dataset_ids = (f"nls-test-{suffix}-a", f"nls-test-{suffix}-b")
     store = QdrantVectorStore(
         url=endpoint,
         api_key=os.getenv("QDRANT_API_KEY") or None,
         collection_name=os.getenv("QDRANT_COLLECTION", DEFAULT_COLLECTION),
     )
-    scopes = [
-        ("integration-tenant-a", "integration-dataset-a", "A/A"),
-        ("integration-tenant-a", "integration-dataset-b", "A/B"),
-        ("integration-tenant-b", "integration-dataset-a", "B/A"),
-        ("integration-tenant-b", "integration-dataset-b", "B/B"),
-    ]
-    metadata_paths: dict[tuple[str, str], Path] = {}
     try:
-        for tenant_id, dataset_id, content in scopes:
-            metadata_path = _dataset_metadata(tmp_path, tenant_id, dataset_id)
-            metadata_paths[(tenant_id, dataset_id)] = metadata_path
-            store.reindex_dataset(
-                tenant_id,
-                dataset_id,
-                [_document("integration_table", content)],
-                [VECTOR],
-                metadata_path,
-                f"hash-{content}",
-                "integration-model-384",
-                384,
-            )
-        for tenant_id, dataset_id, expected in scopes:
-            found = store.search(
-                VECTOR,
-                tenant_id,
-                dataset_id,
-                10,
-                dataset_metadata_path=metadata_paths[(tenant_id, dataset_id)],
-                embedding_model_name="integration-model-384",
-                dimension=384,
-            )
-            assert [item["content"] for item in found] == [expected]
+        yield store, tenant_ids, dataset_ids, tmp_path
     finally:
-        for tenant_id, dataset_id, _ in scopes:
-            client_filter = models.Filter(must=[
-                models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
-                models.FieldCondition(key="dataset_id", match=models.MatchValue(value=dataset_id)),
-            ])
-            store.client.delete(
-                collection_name=store.collection_name,
-                points_selector=client_filter,
-                wait=True,
+        for tenant_id in tenant_ids:
+            for dataset_id in dataset_ids:
+                client_filter = models.Filter(must=[
+                    models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
+                    models.FieldCondition(key="dataset_id", match=models.MatchValue(value=dataset_id)),
+                ])
+                store.client.delete(
+                    collection_name=store.collection_name,
+                    points_selector=client_filter,
+                    wait=True,
+                )
+        store.client.close()
+
+
+@pytest.mark.integration
+def test_docker_qdrant_tenant_isolation(docker_qdrant_scope):
+    store, tenant_ids, dataset_ids, tmp_path = docker_qdrant_scope
+    dataset_id = dataset_ids[0]
+    metadata_paths = {}
+    contents = ("tenant one", "tenant two")
+    expected_by_tenant = {}
+    for tenant_id, content in zip(tenant_ids, contents, strict=True):
+        metadata_path = _dataset_metadata(tmp_path, tenant_id, dataset_id)
+        metadata_paths[tenant_id] = metadata_path
+        documents = _typed_documents(content)
+        expected_by_tenant[tenant_id] = {
+            document["document_type"]: document["content"] for document in documents
+        }
+        store.reindex_dataset(
+            tenant_id, dataset_id, documents, [VECTOR] * len(documents),
+            metadata_path, content, "integration-model-384", 384,
+        )
+    searches = (
+        ("table", store.search_table),
+        ("column", store.search_column),
+        ("relationship", store.search_relationship),
+        ("master_value", store.search_master_value),
+    )
+    for tenant_id, other_tenant_id in zip(tenant_ids, reversed(tenant_ids), strict=True):
+        other_label = contents[tenant_ids.index(other_tenant_id)]
+        for document_type, search in searches:
+            results = search(
+                VECTOR, tenant_id, dataset_id, 10, metadata_paths[tenant_id], "integration-model-384", 384
             )
-        store.close()
+            assert len(results) == 1
+            assert results[0]["content"] == expected_by_tenant[tenant_id][document_type]
+            assert all(other_label not in item["content"] for item in results)
+
+
+@pytest.mark.integration
+def test_docker_qdrant_dataset_isolation(docker_qdrant_scope):
+    store, tenant_ids, dataset_ids, tmp_path = docker_qdrant_scope
+    tenant_id = tenant_ids[0]
+    metadata_paths = {}
+    contents = ("dataset one", "dataset two")
+    expected_by_dataset = {}
+    for dataset_id, content in zip(dataset_ids, contents, strict=True):
+        metadata_path = _dataset_metadata(tmp_path, tenant_id, dataset_id)
+        metadata_paths[dataset_id] = metadata_path
+        documents = _typed_documents(content)
+        expected_by_dataset[dataset_id] = {
+            document["document_type"]: document["content"] for document in documents
+        }
+        store.reindex_dataset(
+            tenant_id, dataset_id, documents, [VECTOR] * len(documents),
+            metadata_path, content, "integration-model-384", 384,
+        )
+    searches = (
+        ("table", store.search_table),
+        ("column", store.search_column),
+        ("relationship", store.search_relationship),
+        ("master_value", store.search_master_value),
+    )
+    for dataset_id, other_dataset_id in zip(dataset_ids, reversed(dataset_ids), strict=True):
+        other_label = contents[dataset_ids.index(other_dataset_id)]
+        for document_type, search in searches:
+            results = search(
+                VECTOR, tenant_id, dataset_id, 10, metadata_paths[dataset_id], "integration-model-384", 384
+            )
+            assert len(results) == 1
+            assert results[0]["content"] == expected_by_dataset[dataset_id][document_type]
+            assert all(other_label not in item["content"] for item in results)
+
+
+@pytest.mark.integration
+def test_docker_qdrant_document_type_isolation(docker_qdrant_scope):
+    store, tenant_ids, dataset_ids, tmp_path = docker_qdrant_scope
+    tenant_id, dataset_id = tenant_ids[0], dataset_ids[0]
+    metadata_path = _dataset_metadata(tmp_path, tenant_id, dataset_id)
+    documents = _typed_documents("type isolation")
+    store.reindex_dataset(
+        tenant_id, dataset_id, documents, [VECTOR] * len(documents), metadata_path,
+        "document-types", "integration-model-384", 384,
+    )
+    searches = (
+        ("table", store.search_table),
+        ("column", store.search_column),
+        ("relationship", store.search_relationship),
+        ("master_value", store.search_master_value),
+    )
+    for expected_type, search in searches:
+        results = search(
+            VECTOR, tenant_id, dataset_id, 10, metadata_path, "integration-model-384", 384
+        )
+        assert results
+        assert {item["document_type"] for item in results} == {expected_type}
 
 
 def test_search_table_applies_tenant_and_dataset_filters(tmp_path):
@@ -499,7 +589,7 @@ def test_search_table_applies_tenant_and_dataset_filters(tmp_path):
     assert [item["content"] for item in results] == ["tenant B table"]
 
     # Wrong tenant/dataset is refused with the same safe metadata message.
-    with pytest.raises(QdrantStorageError, match="embeddings do not match"):
+    with pytest.raises(QdrantStorageError, match="Dataset index is unavailable or incompatible"):
         store.search_table(VECTOR, "tenant-c", "dataset-a", 5, path_a, "m", 384)
 
 
@@ -514,7 +604,7 @@ def test_search_column_applies_tenant_and_dataset_filters_and_correct_limit(tmp_
     assert len(results) <= 6  # limit is top_k * 3 = 6
 
     # Wrong dataset should find nothing (scope mismatch)
-    with pytest.raises(QdrantStorageError, match="embeddings do not match"):
+    with pytest.raises(QdrantStorageError, match="Dataset index is unavailable or incompatible"):
         store.search_column(VECTOR, "tenant-a", "dataset-b", 2, path_a, "m", 384)
 
 
@@ -529,7 +619,7 @@ def test_search_relationship_applies_tenant_and_dataset_filters_and_correct_limi
     assert len(results) <= 4  # limit is top_k * 2 = 4
 
     # Wrong dataset should find nothing (scope mismatch)
-    with pytest.raises(QdrantStorageError, match="embeddings do not match"):
+    with pytest.raises(QdrantStorageError, match="Dataset index is unavailable or incompatible"):
         store.search_relationship(VECTOR, "tenant-a", "dataset-b", 2, path_a, "m", 384)
 
 
@@ -548,7 +638,7 @@ def test_search_master_value_applies_tenant_and_dataset_filters_and_correct_limi
     assert len(results) <= 50  # limit is min(50, top_k * 2) = 50
 
     # Wrong dataset should find nothing (scope mismatch)
-    with pytest.raises(QdrantStorageError, match="scope does not match"):
+    with pytest.raises(QdrantStorageError, match="Dataset index is unavailable or incompatible"):
         store.search_master_value(VECTOR, "tenant-a", "dataset-b", 5, path_a, "m", 384)
 
 
@@ -559,7 +649,7 @@ def test_metadata_mismatch_prevents_table_search(tmp_path):
     store.reindex_dataset("tenant-a", "dataset-a", [_document("t", "test")], [VECTOR], path_a, "a", "m", 384)
 
     # Wrong model name
-    with pytest.raises(QdrantStorageError, match="model or dimension"):
+    with pytest.raises(QdrantMetadataMismatchError, match="Dataset index is unavailable or incompatible"):
         store.search_table(VECTOR, "tenant-a", "dataset-a", 5, path_a, "different-model", 384)
 
     # Wrong dimension
@@ -573,7 +663,7 @@ def test_metadata_mismatch_prevents_column_search(tmp_path):
     path_a = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
     store.reindex_dataset("tenant-a", "dataset-a", [_document("t", "test")], [VECTOR], path_a, "a", "m", 384)
 
-    with pytest.raises(QdrantStorageError, match="model or dimension"):
+    with pytest.raises(QdrantMetadataMismatchError, match="Dataset index is unavailable or incompatible"):
         store.search_column(VECTOR, "tenant-a", "dataset-a", 5, path_a, "different-model", 384)
 
     with pytest.raises(QdrantStorageError, match="384 dimensions"):
@@ -586,7 +676,7 @@ def test_metadata_mismatch_prevents_relationship_search(tmp_path):
     path_a = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
     store.reindex_dataset("tenant-a", "dataset-a", [_document("t", "test")], [VECTOR], path_a, "a", "m", 384)
 
-    with pytest.raises(QdrantStorageError, match="model or dimension"):
+    with pytest.raises(QdrantMetadataMismatchError, match="Dataset index is unavailable or incompatible"):
         store.search_relationship(VECTOR, "tenant-a", "dataset-a", 5, path_a, "different-model", 384)
 
     with pytest.raises(QdrantStorageError, match="384 dimensions"):
@@ -599,7 +689,7 @@ def test_metadata_mismatch_prevents_master_value_search(tmp_path):
     path_a = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
     store.reindex_dataset("tenant-a", "dataset-a", [_value_document("t", "c", "val")], [VECTOR], path_a, "a", "m", 384)
 
-    with pytest.raises(QdrantStorageError, match="model or dimension"):
+    with pytest.raises(QdrantMetadataMismatchError, match="Dataset index is unavailable or incompatible"):
         store.search_master_value(VECTOR, "tenant-a", "dataset-a", 5, path_a, "different-model", 384)
 
     with pytest.raises(QdrantStorageError, match="384 dimensions"):

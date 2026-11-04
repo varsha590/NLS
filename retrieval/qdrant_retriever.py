@@ -300,6 +300,7 @@ def retrieve(
 
     # Optional: perform four typed Qdrant searches if a store and scope are provided
     qdrant_results: dict[str, list[dict[str, Any]]] = {}
+    qdrant_search_succeeded = False
     if qdrant_store is not None and qdrant_tenant_id and qdrant_dataset_id:
         try:
             # Table search
@@ -314,8 +315,6 @@ def retrieve(
                     qdrant_embedding_dimension,
                 )
                 qdrant_results["table"] = table_search
-            # Column search (limit: selected_k * 3)
-            column_limit = max(1, selected_k * 3)
             column_search = qdrant_store.search_column(
                 [0.0] * qdrant_embedding_dimension,
                 qdrant_tenant_id,
@@ -337,8 +336,6 @@ def retrieve(
                 qdrant_embedding_dimension,
             )
             qdrant_results["relationship"] = rel_search
-            # Master value search (limit: min(50, selected_k * 2))
-            master_limit = min(50, max(1, selected_k * 2))
             master_search = qdrant_store.search_master_value(
                 [0.0] * qdrant_embedding_dimension,
                 qdrant_tenant_id,
@@ -349,6 +346,7 @@ def retrieve(
                 qdrant_embedding_dimension,
             )
             qdrant_results["master_value"] = master_search
+            qdrant_search_succeeded = True
         except QdrantMetadataMismatchError:
             raise
         except QdrantStorageError as error:
@@ -372,55 +370,33 @@ def retrieve(
             )
 
     scored_tables: List[Tuple[str, float]] = []
+    query_tokens = set(_lexical_tokens(query))
     for table_name, table in metadata.tables.items():
-        # Simplified: use default dummy scores since we don't have vector scores
-        # In a real implementation, S_val, S_col, S_rel, S_tbl would come from vector search
-        # Here we use lexical scoring as a baseline
-        s_val = 0.0
-        s_col = 0.0
-        s_rel = 0.0
-        s_tbl = 0.0
-        types_present = 0
-
-        # Compute lexical scores against the query
-        query_tokens = set(_lexical_tokens(query))
-        if query_tokens:
-            table_tokens = set()
-            for column in table.columns:
-                table_tokens.update(_lexical_tokens(column.name))
-                table_tokens.update(_lexical_tokens(column.data_type))
-            for col in table.columns:
-                if col.name.casefold() in query_tokens:
-                    s_rel += 0.5  # relevance signal
-            # S_col: lexical coverage of columns
-            col_token_count = sum(
-                len(_lexical_tokens(col.name)) + len(_lexical_tokens(col.data_type))
-                for col in table.columns
-            )
-            query_token_count = max(len(query_tokens), 1)
-            s_col = min(1.0, col_token_count / query_token_count) if col_token_count else 0.0
-        # S_tbl: table name token overlap
-        table_name_tokens = set(_lexical_tokens(table_name))
-        if table_name_tokens and query_tokens:
-            s_tbl = len(table_name_tokens & query_tokens) / max(len(query_tokens), 1)
-
-        # S_val: value-based signal (if query matches column values, etc.)
-        # For now, keep at 0 or derive from exact matches
-        if table_name in exact_value_tables:
-            s_val = 1.0
-
-        types_present = sum(
-            1 for column in table.columns
-            if not column.name.casefold() in {c.casefold() for c in []}
-        )
-
-        if table_name in vector_scores:
-            table_scores = vector_scores[table_name]
+        if qdrant_search_succeeded:
+            table_scores = vector_scores.get(table_name, {})
             s_val = table_scores.get("master_value", 0.0)
             s_col = table_scores.get("column", 0.0)
             s_rel = table_scores.get("relationship", 0.0)
             s_tbl = table_scores.get("table", 0.0)
             types_present = len(table_scores)
+        else:
+            s_val = 1.0 if table_name in exact_value_tables else 0.0
+            s_col = 0.0
+            s_rel = 0.0
+            s_tbl = 0.0
+            types_present = 0
+            if query_tokens:
+                for column in table.columns:
+                    if column.name.casefold() in query_tokens:
+                        s_rel += 0.5
+                col_token_count = sum(
+                    len(_lexical_tokens(column.name)) + len(_lexical_tokens(column.data_type))
+                    for column in table.columns
+                )
+                s_col = min(1.0, col_token_count / len(query_tokens)) if col_token_count else 0.0
+            table_name_tokens = set(_lexical_tokens(table_name))
+            if table_name_tokens and query_tokens:
+                s_tbl = len(table_name_tokens & query_tokens) / len(query_tokens)
 
         score = compute_rollup_score(s_val, s_col, s_rel, s_tbl, types_present)
         scored_tables.append((table_name, score))

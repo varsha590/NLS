@@ -6,8 +6,11 @@ table selection, ambiguity flag, and context building logic.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 import numpy as np
+from qdrant_client import QdrantClient
 
 import retrieval.qdrant_retriever as retriever_module
 from retrieval.qdrant_retriever import (
@@ -19,7 +22,7 @@ from retrieval.qdrant_retriever import (
     _compute_ambiguity_flag,
     _split_into_tokens,
 )
-from retrieval.qdrant_store import QdrantStorageError
+from retrieval.qdrant_store import QdrantStorageError, QdrantVectorStore
 from schema.metadata import SchemaMetadata, TableInfo, ColumnInfo
 
 
@@ -571,6 +574,94 @@ def test_non_mismatch_qdrant_error_falls_back_to_lexical_scoring(caplog, tmp_pat
 
     assert result.tables[0] == "orders"
     assert "falling back to pure-logic lexical scoring" in caplog.text
+
+
+def test_qdrant_hits_rank_above_lexical_only_tables_but_exact_values_still_force():
+    metadata = SchemaMetadata({
+        "orders": TableInfo("orders", "", [ColumnInfo("status", "TEXT")], [], []),
+        "archive": TableInfo("archive", "", [ColumnInfo("status", "TEXT")], [], []),
+    })
+
+    class FakeStore:
+        def search_table(self, *args):
+            return [{"table_name": "archive", "similarity": 0.8}]
+
+        def search_column(self, *args):
+            return []
+
+        def search_relationship(self, *args):
+            return []
+
+        def search_master_value(self, *args):
+            return []
+
+    common = {
+        "qdrant_store": FakeStore(),
+        "qdrant_tenant_id": "tenant",
+        "qdrant_dataset_id": "dataset",
+    }
+    result = retrieve(metadata, "orders", selected_k=1, max_tables=1, **common)
+    assert result.tables == ["archive"]
+
+    exact_result = retrieve(
+        metadata,
+        "orders",
+        selected_k=1,
+        max_tables=1,
+        exact_value_tables={"orders"},
+        **common,
+    )
+    assert exact_result.tables == ["orders"]
+
+
+def test_retrieve_passes_document_specific_limits_to_real_store(tmp_path):
+    class CapturingClient:
+        def __init__(self):
+            self.delegate = QdrantClient(location=":memory:")
+            self.limits = []
+
+        def __getattr__(self, name):
+            return getattr(self.delegate, name)
+
+        def query_points(self, *args, **kwargs):
+            self.limits.append(kwargs["limit"])
+            return self.delegate.query_points(*args, **kwargs)
+
+    client = CapturingClient()
+    store = QdrantVectorStore(client=client)
+    metadata_path = tmp_path / "dataset.json"
+    metadata_path.write_text(json.dumps({
+        "tenant_id": "tenant",
+        "dataset_id": "dataset",
+        "indexed": True,
+        "embedding_model_name": "model-384",
+        "vector_dimension": 384,
+    }))
+    schema = SchemaMetadata({
+        "records": TableInfo("records", "", [ColumnInfo("id", "INTEGER")], [], []),
+    })
+
+    try:
+        for top_k in (2, 30):
+            client.limits.clear()
+            retrieve(
+                schema,
+                "records",
+                selected_k=top_k,
+                qdrant_store=store,
+                qdrant_tenant_id="tenant",
+                qdrant_dataset_id="dataset",
+                qdrant_embedding_model_name="model-384",
+                qdrant_dataset_metadata_path=str(metadata_path),
+            )
+            assert client.limits == [
+                top_k,
+                top_k * 3,
+                top_k * 2,
+                min(50, top_k * 2),
+            ]
+    finally:
+        client.close()
 
 
 if __name__ == "__main__":
