@@ -390,3 +390,127 @@ def test_docker_qdrant_isolates_two_tenants_and_two_datasets(tmp_path):
                 wait=True,
             )
         store.close()
+
+
+def test_search_table_applies_tenant_and_dataset_filters(tmp_path):
+    """Table search applies both tenant_id and dataset_id filters."""
+    store = _make_store(_client())
+    path_a = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
+    path_b = _dataset_metadata(tmp_path, "tenant-b", "dataset-a")
+    store.reindex_dataset("tenant-a", "dataset-a", [_document("t", "tenant A table")], [VECTOR], path_a, "a", "m", 384)
+    store.reindex_dataset("tenant-b", "dataset-a", [_document("t", "tenant B table")], [VECTOR], path_b, "b", "m", 384)
+
+    # Tenant-a searching dataset-a should find "tenant A table"
+    results = store.search_table(VECTOR, "tenant-a", "dataset-a", 5, path_a, "m", 384)
+    assert [item["content"] for item in results] == ["tenant A table"]
+
+    # Tenant-b searching dataset-a should find "tenant B table"
+    results = store.search_table(VECTOR, "tenant-b", "dataset-a", 5, path_b, "m", 384)
+    assert [item["content"] for item in results] == ["tenant B table"]
+
+    # Wrong tenant/dataset should find nothing (scope mismatch)
+    with pytest.raises(QdrantStorageError, match="scope does not match"):
+        store.search_table(VECTOR, "tenant-c", "dataset-a", 5, path_a, "m", 384)
+
+
+def test_search_column_applies_tenant_and_dataset_filters_and_correct_limit(tmp_path):
+    """Column search applies filters and uses limit top_k * 3."""
+    store = _make_store(_client())
+    path_a = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
+    store.reindex_dataset("tenant-a", "dataset-a", [_document("t", "col content")], [VECTOR], path_a, "a", "m", 384)
+
+    # top_k=2 → limit should be 6
+    results = store.search_column(VECTOR, "tenant-a", "dataset-a", 2, path_a, "m", 384)
+    assert len(results) <= 6  # limit is top_k * 3 = 6
+
+    # Wrong dataset should find nothing (scope mismatch)
+    with pytest.raises(QdrantStorageError, match="scope does not match"):
+        store.search_column(VECTOR, "tenant-a", "dataset-b", 2, path_a, "m", 384)
+
+
+def test_search_relationship_applies_tenant_and_dataset_filters_and_correct_limit(tmp_path):
+    """Relationship search applies filters and uses limit top_k * 2."""
+    store = _make_store(_client())
+    path_a = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
+    store.reindex_dataset("tenant-a", "dataset-a", [_document("t", "rel content")], [VECTOR], path_a, "a", "m", 384)
+
+    # top_k=2 → limit should be 4
+    results = store.search_relationship(VECTOR, "tenant-a", "dataset-a", 2, path_a, "m", 384)
+    assert len(results) <= 4  # limit is top_k * 2 = 4
+
+    # Wrong dataset should find nothing (scope mismatch)
+    with pytest.raises(QdrantStorageError, match="scope does not match"):
+        store.search_relationship(VECTOR, "tenant-a", "dataset-b", 2, path_a, "m", 384)
+
+
+def test_search_master_value_applies_tenant_and_dataset_filters_and_correct_limit(tmp_path):
+    """Master value search applies filters and uses limit min(50, top_k * 2)."""
+    store = _make_store(_client())
+    path_a = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
+    store.reindex_dataset("tenant-a", "dataset-a", [_value_document("t", "c", "val")], [VECTOR], path_a, "a", "m", 384)
+
+    # top_k=5 → limit should be min(50, 10) = 10
+    results = store.search_master_value(VECTOR, "tenant-a", "dataset-a", 5, path_a, "m", 384)
+    assert len(results) <= 10  # limit is min(50, top_k * 2) = 10
+
+    # top_k=30 → limit should be min(50, 60) = 50
+    results = store.search_master_value(VECTOR, "tenant-a", "dataset-a", 30, path_a, "m", 384)
+    assert len(results) <= 50  # limit is min(50, top_k * 2) = 50
+
+    # Wrong dataset should find nothing (scope mismatch)
+    with pytest.raises(QdrantStorageError, match="scope does not match"):
+        store.search_master_value(VECTOR, "tenant-a", "dataset-b", 5, path_a, "m", 384)
+
+
+def test_metadata_mismatch_prevents_table_search(tmp_path):
+    """Metadata model/dimension mismatch prevents table search."""
+    store = _make_store(_client())
+    path_a = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
+    store.reindex_dataset("tenant-a", "dataset-a", [_document("t", "test")], [VECTOR], path_a, "a", "m", 384)
+
+    # Wrong model name
+    with pytest.raises(QdrantStorageError, match="model or dimension"):
+        store.search_table(VECTOR, "tenant-a", "dataset-a", 5, path_a, "different-model", 384)
+
+    # Wrong dimension
+    with pytest.raises(QdrantStorageError, match="384 dimensions"):
+        store.search_table(VECTOR, "tenant-a", "dataset-a", 5, path_a, "model-384", 768)
+
+
+def test_metadata_mismatch_prevents_column_search(tmp_path):
+    """Metadata mismatch prevents column search."""
+    store = _make_store(_client())
+    path_a = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
+    store.reindex_dataset("tenant-a", "dataset-a", [_document("t", "test")], [VECTOR], path_a, "a", "m", 384)
+
+    with pytest.raises(QdrantStorageError, match="model or dimension"):
+        store.search_column(VECTOR, "tenant-a", "dataset-a", 5, path_a, "different-model", 384)
+
+    with pytest.raises(QdrantStorageError, match="384 dimensions"):
+        store.search_column(VECTOR, "tenant-a", "dataset-a", 5, path_a, "model-384", 768)
+
+
+def test_metadata_mismatch_prevents_relationship_search(tmp_path):
+    """Metadata mismatch prevents relationship search."""
+    store = _make_store(_client())
+    path_a = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
+    store.reindex_dataset("tenant-a", "dataset-a", [_document("t", "test")], [VECTOR], path_a, "a", "m", 384)
+
+    with pytest.raises(QdrantStorageError, match="model or dimension"):
+        store.search_relationship(VECTOR, "tenant-a", "dataset-a", 5, path_a, "different-model", 384)
+
+    with pytest.raises(QdrantStorageError, match="384 dimensions"):
+        store.search_relationship(VECTOR, "tenant-a", "dataset-a", 5, path_a, "model-384", 768)
+
+
+def test_metadata_mismatch_prevents_master_value_search(tmp_path):
+    """Metadata mismatch prevents master_value search."""
+    store = _make_store(_client())
+    path_a = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
+    store.reindex_dataset("tenant-a", "dataset-a", [_value_document("t", "c", "val")], [VECTOR], path_a, "a", "m", 384)
+
+    with pytest.raises(QdrantStorageError, match="model or dimension"):
+        store.search_master_value(VECTOR, "tenant-a", "dataset-a", 5, path_a, "different-model", 384)
+
+    with pytest.raises(QdrantStorageError, match="384 dimensions"):
+        store.search_master_value(VECTOR, "tenant-a", "dataset-a", 5, path_a, "model-384", 768)

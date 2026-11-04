@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo
 
+from retrieval.qdrant_store import QdrantVectorStore, QdrantStorageError, VECTOR_SIZE
+
 
 DEFAULT_SELECTED_COUNT = 3
 MAX_SELECTED_COUNT = 5
@@ -269,13 +271,77 @@ def retrieve(
     max_tables: int = MAX_TABLES_GROQ,
     sensitive_filter: Optional[dict[str, Any]] = None,
     exact_value_tables: Optional[Set[str]] = None,
+    qdrant_store: Optional[QdrantVectorStore] = None,
+    qdrant_tenant_id: str = "",
+    qdrant_dataset_id: str = "",
+    qdrant_embedding_model_name: str = "",
+    qdrant_embedding_dimension: int = VECTOR_SIZE,
+    qdrant_dataset_metadata_path: str | None = None,
 ) -> RetrievalResult:
     """Pure-logic schema retrieval with roll-up scoring and FK expansion.
 
-    No Qdrant, no FAISS, no embeddings. Uses only SchemaMetadata.
+    Optionally uses Qdrant vector search for table/column/relationship/master_value
+    results, which are then scored, selected, and expanded using pure-logic logic.
+    No Qdrant, no FAISS, no embeddings when qdrant_store is None. Uses only
+    SchemaMetadata.
     """
     if exact_value_tables is None:
         exact_value_tables = set()
+
+    # Optional: perform four typed Qdrant searches if a store and scope are provided
+    qdrant_results: dict[str, list[dict[str, Any]]] = {}
+    if qdrant_store is not None and qdrant_tenant_id and qdrant_dataset_id:
+        try:
+            # Table search
+            if qdrant_dataset_metadata_path:
+                table_search = qdrant_store.search_table(
+                    [0.0] * qdrant_embedding_dimension,
+                    qdrant_tenant_id,
+                    qdrant_dataset_id,
+                    selected_k,
+                    qdrant_dataset_metadata_path,
+                    qdrant_embedding_model_name,
+                    qdrant_embedding_dimension,
+                )
+                qdrant_results["table"] = table_search
+            # Column search (limit: selected_k * 3)
+            column_limit = max(1, selected_k * 3)
+            column_search = qdrant_store.search_column(
+                [0.0] * qdrant_embedding_dimension,
+                qdrant_tenant_id,
+                qdrant_dataset_id,
+                selected_k,
+                qdrant_dataset_metadata_path,
+                qdrant_embedding_model_name,
+                qdrant_embedding_dimension,
+            )
+            qdrant_results["column"] = column_search
+            # Relationship search (limit: selected_k * 2)
+            rel_search = qdrant_store.search_relationship(
+                [0.0] * qdrant_embedding_dimension,
+                qdrant_tenant_id,
+                qdrant_dataset_id,
+                selected_k,
+                qdrant_dataset_metadata_path,
+                qdrant_embedding_model_name,
+                qdrant_embedding_dimension,
+            )
+            qdrant_results["relationship"] = rel_search
+            # Master value search (limit: min(50, selected_k * 2))
+            master_limit = min(50, max(1, selected_k * 2))
+            master_search = qdrant_store.search_master_value(
+                [0.0] * qdrant_embedding_dimension,
+                qdrant_tenant_id,
+                qdrant_dataset_id,
+                selected_k,
+                qdrant_dataset_metadata_path,
+                qdrant_embedding_model_name,
+                qdrant_embedding_dimension,
+            )
+            qdrant_results["master_value"] = master_search
+        except QdrantStorageError:
+            # If Qdrant search fails, fall back to pure-logic lexical scoring
+            qdrant_results = {}
 
     # Step 1: Compute roll-up scores for all tables
     scored_tables: List[Tuple[str, float]] = []

@@ -109,6 +109,11 @@ Simplify and restructure NLS around this flow:
 - Maintain `.env.example`; keep `.gitignore` covering uploads, dataset storage, Qdrant data, secrets.
 - README: Docker setup, env vars, ingestion steps, query workflow, execution requirements, remaining limitations (including tenant auth).
 - Embeddings: prefer `fastembed` (384-dim) over `sentence-transformers` unless the project already depends on the latter.
+- Final UI must be client friendly, not developer friendly: show only what a
+  client can use (upload, question box, results table, plain-language
+  messages, credentials form after validation). Hide dialect override, model
+  names, scores, flags, document counts and raw errors, or put them in a
+  collapsed "Advanced" section. Generated SQL only in a collapsed "Show query".
 
 ## Cleanup list (Step 5, needs approval; list reason and references first)
 
