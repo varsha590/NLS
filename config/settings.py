@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
@@ -43,6 +43,9 @@ class Settings:
     value_high_cache_total_values: int = 200000
     value_high_db_lookup_limit: int = 20
     send_high_cardinality_values_to_llm: bool = False
+    qdrant_url: str = field(default="http://127.0.0.1:6333", repr=False)
+    qdrant_api_key: str = field(default="", repr=False)
+    qdrant_collection: str = "nls_documents"
 
     @classmethod
     def from_env(cls, dotenv_path: str | None = None) -> "Settings":
@@ -113,4 +116,7 @@ class Settings:
                 os.getenv("SEND_HIGH_CARDINALITY_VALUES_TO_LLM", "false").casefold()
                 in {"1", "true", "yes", "on"}
             ),
+            qdrant_url=os.getenv("QDRANT_URL", "http://127.0.0.1:6333"),
+            qdrant_api_key=os.getenv("QDRANT_API_KEY", ""),
+            qdrant_collection=os.getenv("QDRANT_COLLECTION", "nls_documents"),
         )

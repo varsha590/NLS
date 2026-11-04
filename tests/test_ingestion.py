@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import sys
+import warnings
 
 import pytest
 
@@ -174,24 +175,63 @@ def test_non_text_sql_and_upload_limits_are_rejected(tmp_path):
 
 def test_sql_upload_hash_skips_unchanged_and_persists_schema(tmp_path, monkeypatch):
     import ingestion.datasets as datasets
+    import numpy as np
+    from qdrant_client import QdrantClient
+
+    from retrieval.qdrant_store import QdrantVectorStore
 
     registry = DatasetRegistry(tmp_path)
     result = registry.register(
         "catalog.sql",
         b"CREATE TABLE regions (id INTEGER PRIMARY KEY, name TEXT);",
         tenant_id="tenant-a",
+        embedding_model_name="tiny-384",
+    )
+    assert result["status"] == "registered"
+    metadata_path = registry.dataset_directory("tenant-a", result["dataset_id"]) / "dataset.json"
+    before_index = json.loads(metadata_path.read_text())
+    assert before_index["indexed"] is False
+    assert "dataset_hash" not in before_index
+    assert "embedding_model_name" not in before_index
+    assert "vector_dimension" not in before_index
+
+    class TinyEmbedder:
+        model_name = "tiny-384"
+        dim = 384
+
+        def embed(self, texts):
+            return np.tile(np.asarray([[1.0] + [0.0] * 383]), (len(texts), 1))
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Payload indexes have no effect in the local Qdrant")
+        store = QdrantVectorStore(client=QdrantClient(location=":memory:"))
+    doc = [{
+        "document_type": "table",
+        "table_name": "regions",
+        "column_name": None,
+        "content": "regions",
+    }]
+    store.reindex_dataset(
+        "tenant-a",
+        result["dataset_id"],
+        doc,
+        TinyEmbedder().embed(["regions"]).tolist(),
+        metadata_path,
+        result["dataset_hash"],
+        TinyEmbedder.model_name,
+        TinyEmbedder.dim,
+    )
+
+    monkeypatch.setattr(
+        datasets,
+        "parse_sql_dump",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unchanged upload was reparsed")),
     )
     unchanged = registry.register(
         "catalog.sql",
         b"CREATE TABLE regions (id INTEGER PRIMARY KEY, name TEXT);",
         tenant_id="tenant-a",
-    )
-
-    assert result["status"] == "registered"
-    monkeypatch.setattr(
-        datasets,
-        "parse_sql_dump",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unchanged upload was reparsed")),
+        embedding_model_name="tiny-384",
     )
     assert unchanged["status"] == "unchanged"
     assert registry.load_schema("tenant-a", result["dataset_id"]).dialect == "sqlite"

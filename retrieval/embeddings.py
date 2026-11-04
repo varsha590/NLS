@@ -5,6 +5,8 @@ import numpy as np
 
 from sentence_transformers import SentenceTransformer
 
+EXPECTED_EMBEDDING_DIMENSION = 384
+
 
 # ---------------------------------------------------------------------------
 # Model metadata
@@ -25,6 +27,11 @@ class EmbeddingModel:
         )
         self.model = SentenceTransformer(canonical_name)
         self.dim = self.model.get_sentence_embedding_dimension()
+        if self.dim != EXPECTED_EMBEDDING_DIMENSION:
+            raise ValueError(
+                f"Embedding model {self.model_name!r} returns {self.dim} dimensions; "
+                f"Qdrant requires {EXPECTED_EMBEDDING_DIMENSION}."
+            )
 
     def embed(self, texts: List[str]) -> np.ndarray:
         """Generate embeddings for a list of text strings.

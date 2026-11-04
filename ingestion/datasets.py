@@ -22,6 +22,7 @@ from sqlglot.errors import ErrorLevel
 
 from catalog.classifier import is_key_column, is_pii_shaped_value, is_text_type
 from config.data_policy import is_blocked, is_masked
+from retrieval.qdrant_store import make_dataset_hash
 from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo
 
 DATASET_NAMESPACE = uuid.UUID("ec8f4bc1-0661-4f34-9b91-dffb31759b7b")
@@ -656,6 +657,21 @@ class DatasetRegistry:
             raise UploadError("Could not load the registered dataset schema.") from error
         return SchemaMetadata.from_dict(payload)
 
+    def dataset_directory(self, tenant_id: str, dataset_id: str) -> Path:
+        """Return the tenant-scoped local dataset directory."""
+        return self._tenant_root(tenant_id) / dataset_id
+
+    def load_value_documents(self, tenant_id: str, dataset_id: str) -> list[dict[str, Any]]:
+        """Load persisted low-cardinality master values for vector indexing."""
+        path = self.dataset_directory(tenant_id, dataset_id) / "value_documents.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise UploadError("Could not load registered dataset values.") from error
+        if not isinstance(payload, list):
+            raise UploadError("Registered dataset values have an invalid format.")
+        return payload
+
     def register(
         self,
         filename: str,
@@ -665,6 +681,7 @@ class DatasetRegistry:
         max_upload_mb: int | None = None,
         parse_timeout_seconds: float | None = None,
         low_cardinality_max: int | None = None,
+        embedding_model_name: str | None = None,
     ) -> dict[str, Any]:
         selected_tenant = tenant_id or os.getenv("TENANT_ID", "default")
         if not selected_tenant.strip():
@@ -691,6 +708,10 @@ class DatasetRegistry:
             raise UploadError("Low-cardinality threshold cannot be negative.")
 
         digest = hashlib.sha256(content).hexdigest()
+        model_name = embedding_model_name or os.getenv(
+            "EMBEDDING_MODEL", "all-MiniLM-L6-v2"
+        )
+        dataset_hash = make_dataset_hash(content, dialect_override, model_name)
         dataset_id = self._dataset_id(selected_tenant, filename)
         dataset_dir = self._tenant_root(selected_tenant) / dataset_id
         metadata_path = dataset_dir / "dataset.json"
@@ -699,8 +720,17 @@ class DatasetRegistry:
                 previous = json.loads(metadata_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError):
                 previous = {}
-            if previous.get("file_sha256") == digest:
-                return {**previous, "status": "unchanged", "warnings": []}
+            if (
+                previous.get("indexed") is True
+                and previous.get("dataset_hash") == dataset_hash
+                and previous.get("embedding_model_name") == model_name
+            ):
+                return {
+                    **previous,
+                    "dataset_hash": dataset_hash,
+                    "status": "unchanged",
+                    "warnings": [],
+                }
 
         warnings: list[str] = []
         temporary_db: Path | None = None
@@ -760,15 +790,22 @@ class DatasetRegistry:
             "filename": filename,
             "source_type": "sql" if suffix == ".sql" else "sqlite",
             "file_sha256": digest,
+            "dialect_override": dialect_override,
             "dialect": schema.dialect,
             "created_at": timestamp,
             "table_count": len(schema.tables),
             "value_document_count": len(value_documents),
+            "indexed": False,
         }
         self._write_json(dataset_dir / "schema.json", schema.to_dict())
         self._write_json(dataset_dir / "dataset.json", metadata)
         self._write_json(dataset_dir / "value_documents.json", value_documents)
-        return {**metadata, "status": "registered", "warnings": sorted(set(warnings))}
+        return {
+            **metadata,
+            "dataset_hash": dataset_hash,
+            "status": "registered",
+            "warnings": sorted(set(warnings)),
+        }
 
     @staticmethod
     def _write_json(path: Path, payload: Any) -> None:

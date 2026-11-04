@@ -7,9 +7,13 @@ import os
 from typing import Any
 
 import streamlit as st
+from dotenv import load_dotenv
 
 from core.startup import init_app
 from ingestion.datasets import DatasetRegistry, UploadError
+from retrieval.dataset_indexer import index_registered_dataset
+from retrieval.embeddings import EmbeddingModel
+from retrieval.qdrant_store import QdrantStorageError, QdrantVectorStore
 
 LOGGER = logging.getLogger(__name__)
 
@@ -187,6 +191,7 @@ def _render_result(result: dict[str, Any], question: str, runtime: dict[str, Any
 
 def main() -> None:
     """Register a dataset and inspect its stored schema without DB connections."""
+    load_dotenv(override=False)
     st.title("Natural Language to SQL")
     st.subheader("Register a dataset")
     st.caption(
@@ -225,16 +230,45 @@ def main() -> None:
                     uploaded_file.getvalue(),
                     tenant_id=tenant_id.strip(),
                     dialect_override=override,
+                    embedding_model_name=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
                 )
                 st.session_state["selected_dataset_id"] = result["dataset_id"]
-                message = (
-                    "Dataset is unchanged; existing schema and values were kept."
-                    if result["status"] == "unchanged"
-                    else "Dataset schema registered."
-                )
-                st.success(message)
                 for warning in result.get("warnings", []):
                     st.warning(warning)
+                if result["status"] == "unchanged":
+                    st.success("Dataset and Qdrant index are unchanged.")
+                else:
+                    try:
+                        embedding_model = EmbeddingModel(
+                            os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+                        )
+                        qdrant_store = QdrantVectorStore(
+                            url=os.getenv("QDRANT_URL", "http://127.0.0.1:6333"),
+                            api_key=os.getenv("QDRANT_API_KEY") or None,
+                            collection_name=os.getenv("QDRANT_COLLECTION", "nls_documents"),
+                        )
+                        try:
+                            document_count = index_registered_dataset(
+                                registry,
+                                qdrant_store,
+                                tenant_id.strip(),
+                                result["dataset_id"],
+                                result["dataset_hash"],
+                                embedding_model,
+                            )
+                        finally:
+                            qdrant_store.close()
+                        st.success(f"Dataset indexed: {document_count} documents.")
+                    except QdrantStorageError as error:
+                        st.error(str(error), title="Dataset not indexed")
+                    except ValueError as error:
+                        st.error(f"Embedding configuration is invalid: {error}", title="Dataset not indexed")
+                    except (OSError, RuntimeError, TypeError):
+                        st.error(
+                            "Dataset registration succeeded, but embedding or indexing failed. "
+                            "The dataset remains unindexed.",
+                            title="Dataset not indexed",
+                        )
             except UploadError as error:
                 st.error(str(error), title="Upload rejected")
 
