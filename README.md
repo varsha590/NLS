@@ -1,5 +1,11 @@
 # Natural Language to SQL
 
+## Current status
+
+Dataset registration is available in Streamlit for `.sql` schema dumps and SQLite `.db` uploads. SQL files are parsed, never executed; SQLite uploads are inspected read-only. Question generation and query execution are not connected to registered datasets yet and are planned for Step 4. Until then, the app is an ingestion and schema-preview workflow, not a working search interface. A `.sql` upload does not create a live database.
+
+The legacy query-runtime notes below describe the previous database-connected implementation and are being replaced as the dataset-backed workflow is completed.
+
 A Streamlit text-to-SQL application using SQLAlchemy, local sentence-transformer embeddings, FAISS, Groq, and SQLGlot. Schema and value vectors and verified examples are stored in local namespace files; the target database is read-only.
 
 ## Configure a database
