@@ -466,5 +466,4 @@ def test_expand_fk_neighbors_shortest_path_ordering():
     # since we don't traverse 2-hop
 
 
-if __name__ == "__main__":
     pytest.main([__file__, "-v"])

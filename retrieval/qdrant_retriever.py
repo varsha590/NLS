@@ -5,12 +5,17 @@ No Qdrant, no FAISS, no external dependencies. Uses only SchemaMetadata from sch
 
 from __future__ import annotations
 
+import logging
+
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo
 
 from retrieval.qdrant_store import QdrantVectorStore, QdrantStorageError, VECTOR_SIZE
+from config.data_policy import is_blocked, is_masked
+
+LOGGER = logging.getLogger(__name__)
 
 
 DEFAULT_SELECTED_COUNT = 3
@@ -339,8 +344,17 @@ def retrieve(
                 qdrant_embedding_dimension,
             )
             qdrant_results["master_value"] = master_search
-        except QdrantStorageError:
-            # If Qdrant search fails, fall back to pure-logic lexical scoring
+        except QdrantStorageError as error:
+            # Model/dimension mismatch: refuse retrieval entirely, zero search calls
+            if "model or dimension" in str(error) or "384 dimensions" in str(error):
+                raise QdrantStorageError(
+                    "Dataset embeddings do not match the active model or dimension; re-index is required."
+                ) from error
+            # Other Qdrant errors: explicit logged fallback to pure-logic lexical scoring
+            LOGGER.warning(
+                "Qdrant search failed; falling back to pure-logic lexical scoring: %s",
+                error,
+            )
             qdrant_results = {}
 
     # Step 1: Compute roll-up scores for all tables
