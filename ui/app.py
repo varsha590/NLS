@@ -193,6 +193,10 @@ def main() -> None:
         "A .sql upload provides schema metadata and optional master values; it does not create a live database. "
         "Execution will require a separate database connection."
     )
+    st.info(
+        "Dataset registration is available now. Question generation and execution are not active yet; "
+        "they are scheduled for Step 4."
+    )
 
     # Tenant IDs currently scope local data only; they are not user authentication.
     st.session_state.setdefault("tenant_id", os.getenv("TENANT_ID", "default"))
