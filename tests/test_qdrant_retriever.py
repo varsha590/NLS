@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 import numpy as np
 
+import retrieval.qdrant_retriever as retriever_module
 from retrieval.qdrant_retriever import (
     compute_rollup_score,
     RetrievalResult,
@@ -18,6 +19,7 @@ from retrieval.qdrant_retriever import (
     _compute_ambiguity_flag,
     _split_into_tokens,
 )
+from retrieval.qdrant_store import QdrantStorageError
 from schema.metadata import SchemaMetadata, TableInfo, ColumnInfo
 
 
@@ -466,4 +468,110 @@ def test_expand_fk_neighbors_shortest_path_ordering():
     # since we don't traverse 2-hop
 
 
+def test_retrieve_uses_all_qdrant_search_results(monkeypatch, tmp_path):
+    columns = [ColumnInfo("id", "INTEGER", is_primary_key=True), ColumnInfo("customer_id", "INTEGER")]
+    orders = TableInfo("orders", "", columns, ["id"], [{
+        "local_cols": ["customer_id"],
+        "remote_table": "customers",
+        "remote_cols": ["id"],
+        "constrain_name": "fk_orders_customers",
+    }])
+    customers = TableInfo("customers", "", [ColumnInfo("id", "INTEGER", is_primary_key=True)], ["id"], [])
+    metadata = SchemaMetadata({"orders": orders, "customers": customers})
+
+    class FakeStore:
+        def __init__(self):
+            self.calls = []
+            self.results = {
+                "table": [{"table_name": "orders", "similarity": 0.5}],
+                "column": [{"table_name": "orders", "similarity": 0.8}],
+                "relationship": [{"table_name": "orders", "similarity": 0.7}],
+                "master_value": [{"table_name": "customers", "similarity": 0.9}],
+            }
+
+        def _search(self, kind):
+            self.calls.append(kind)
+            return self.results[kind]
+
+        def search_table(self, *args):
+            return self._search("table")
+
+        def search_column(self, *args):
+            return self._search("column")
+
+        def search_relationship(self, *args):
+            return self._search("relationship")
+
+        def search_master_value(self, *args):
+            return self._search("master_value")
+
+    store = FakeStore()
+    selected_scores = []
+    expanded_inputs = []
+    ambiguity_inputs = []
+    original_select = retriever_module.select_tables
+    original_expand = retriever_module.expand_fk_neighbors
+    original_ambiguity = retriever_module._compute_ambiguity_flag
+
+    def capture_select(scores, **kwargs):
+        selected_scores.extend(scores)
+        return original_select(scores, **kwargs)
+
+    def capture_expand(schema, selected, **kwargs):
+        expanded_inputs.extend(selected)
+        return original_expand(schema, selected, **kwargs)
+
+    def capture_ambiguity(query, schema, table_names):
+        ambiguity_inputs.extend(table_names)
+        return original_ambiguity(query, schema, table_names)
+
+    monkeypatch.setattr(retriever_module, "select_tables", capture_select)
+    monkeypatch.setattr(retriever_module, "expand_fk_neighbors", capture_expand)
+    monkeypatch.setattr(retriever_module, "_compute_ambiguity_flag", capture_ambiguity)
+
+    result = retrieve(
+        metadata,
+        "show id",
+        selected_k=1,
+        qdrant_store=store,
+        qdrant_tenant_id="tenant",
+        qdrant_dataset_id="dataset",
+        qdrant_embedding_model_name="model",
+        qdrant_dataset_metadata_path=str(tmp_path / "dataset.json"),
+    )
+
+    assert store.calls == ["table", "column", "relationship", "master_value"]
+    assert selected_scores[0] == ("orders", pytest.approx(1.72))
+    assert selected_scores[1] == ("customers", pytest.approx(1.08))
+    assert expanded_inputs == ["orders", "customers"]
+    assert ambiguity_inputs == ["orders", "customers"]
+    assert result.tables == ["orders", "customers"]
+    assert result.ambiguity_flag is True
+
+
+def test_non_mismatch_qdrant_error_falls_back_to_lexical_scoring(caplog, tmp_path):
+    metadata = SchemaMetadata({
+        "orders": TableInfo("orders", "", [ColumnInfo("order_id", "INTEGER")], [], []),
+        "users": TableInfo("users", "", [ColumnInfo("user_id", "INTEGER")], [], []),
+    })
+
+    class FailingStore:
+        def search_table(self, *args):
+            raise QdrantStorageError("temporary search failure")
+
+    with caplog.at_level("WARNING", logger=retriever_module.__name__):
+        result = retrieve(
+            metadata,
+            "orders",
+            qdrant_store=FailingStore(),
+            qdrant_tenant_id="tenant",
+            qdrant_dataset_id="dataset",
+            qdrant_dataset_metadata_path=str(tmp_path / "dataset.json"),
+        )
+
+    assert result.tables[0] == "orders"
+    assert "falling back to pure-logic lexical scoring" in caplog.text
+
+
+if __name__ == "__main__":
     pytest.main([__file__, "-v"])

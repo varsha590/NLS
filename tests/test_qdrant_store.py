@@ -17,6 +17,7 @@ from retrieval.dataset_indexer import index_registered_dataset
 from retrieval import embeddings as embeddings_module
 from retrieval.qdrant_store import (
     DEFAULT_COLLECTION,
+    QdrantMetadataMismatchError,
     QdrantStorageError,
     QdrantVectorStore,
     deterministic_point_id,
@@ -241,11 +242,100 @@ def test_search_requires_both_scope_values_and_filters_results(tmp_path):
 def test_search_refuses_unindexed_or_changed_embedding_metadata(tmp_path):
     store = _make_store(_client())
     metadata_path = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
-    with pytest.raises(QdrantStorageError, match="not indexed"):
+    with pytest.raises(QdrantStorageError, match="embeddings do not match"):
         store.search(
             VECTOR, "tenant-a", "dataset-a", 5,
             dataset_metadata_path=metadata_path, embedding_model_name="model-384", dimension=384,
         )
+
+
+@pytest.mark.parametrize(
+    ("metadata_model", "metadata_dimension"),
+    [("different-model", 384), ("model-384", 768)],
+)
+def test_retrieve_propagates_real_store_metadata_mismatch_before_search(
+    tmp_path, metadata_model, metadata_dimension
+):
+    class CapturingClient:
+        def __init__(self):
+            self.delegate = QdrantClient(location=":memory:")
+            self.search_calls = []
+
+        def __getattr__(self, name):
+            return getattr(self.delegate, name)
+
+        def query_points(self, *args, **kwargs):
+            self.search_calls.append((args, kwargs))
+            return self.delegate.query_points(*args, **kwargs)
+
+    client = CapturingClient()
+    store = _make_store(client)
+    metadata_path = tmp_path / "dataset.json"
+    metadata_path.write_text(json.dumps({
+        "tenant_id": "tenant-a",
+        "dataset_id": "dataset-a",
+        "indexed": True,
+        "embedding_model_name": metadata_model,
+        "vector_dimension": metadata_dimension,
+    }))
+
+    from retrieval.qdrant_retriever import retrieve
+    from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo
+
+    schema = SchemaMetadata({
+        "regions": TableInfo("regions", "", [ColumnInfo("id", "INTEGER")], [], []),
+    })
+    with pytest.raises(QdrantMetadataMismatchError):
+        retrieve(
+            schema,
+            "regions",
+            qdrant_store=store,
+            qdrant_tenant_id="tenant-a",
+            qdrant_dataset_id="dataset-a",
+            qdrant_embedding_model_name="model-384",
+            qdrant_embedding_dimension=384,
+            qdrant_dataset_metadata_path=str(metadata_path),
+        )
+    assert client.search_calls == []
+    client.close()
+
+
+def test_search_metadata_failures_share_one_message(tmp_path):
+    store = _make_store(_client())
+    valid_metadata = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
+    valid_metadata.write_text(json.dumps({
+        "tenant_id": "tenant-a",
+        "dataset_id": "dataset-a",
+        "indexed": True,
+        "embedding_model_name": "model-384",
+        "vector_dimension": 384,
+    }))
+    wrong_tenant_metadata = tmp_path / "wrong-tenant.json"
+    wrong_tenant_metadata.write_text(json.dumps({
+        "tenant_id": "tenant-b",
+        "dataset_id": "dataset-a",
+        "indexed": True,
+        "embedding_model_name": "model-384",
+        "vector_dimension": 384,
+    }))
+
+    cases = [
+        (tmp_path / "missing.json", "tenant-a", "model-384", QdrantStorageError),
+        (wrong_tenant_metadata, "tenant-a", "model-384", QdrantStorageError),
+        (valid_metadata, "tenant-a", "different-model", QdrantMetadataMismatchError),
+    ]
+    messages = []
+    for metadata_path, tenant_id, model_name, expected_error in cases:
+        with pytest.raises(expected_error) as error:
+            store.search_table(
+                VECTOR, tenant_id, "dataset-a", 5, metadata_path, model_name, 384
+            )
+        messages.append(str(error.value))
+
+    assert messages[0] == messages[1] == messages[2]
+    assert messages[0] == (
+        "Dataset embeddings do not match the active model or dimension; re-index is required."
+    )
     store.reindex_dataset(
         "tenant-a", "dataset-a", [_document("regions", "North")],
         [VECTOR], metadata_path, "hash", "model-384", 384,
@@ -408,8 +498,8 @@ def test_search_table_applies_tenant_and_dataset_filters(tmp_path):
     results = store.search_table(VECTOR, "tenant-b", "dataset-a", 5, path_b, "m", 384)
     assert [item["content"] for item in results] == ["tenant B table"]
 
-    # Wrong tenant/dataset should find nothing (scope mismatch)
-    with pytest.raises(QdrantStorageError, match="scope does not match"):
+    # Wrong tenant/dataset is refused with the same safe metadata message.
+    with pytest.raises(QdrantStorageError, match="embeddings do not match"):
         store.search_table(VECTOR, "tenant-c", "dataset-a", 5, path_a, "m", 384)
 
 
@@ -424,7 +514,7 @@ def test_search_column_applies_tenant_and_dataset_filters_and_correct_limit(tmp_
     assert len(results) <= 6  # limit is top_k * 3 = 6
 
     # Wrong dataset should find nothing (scope mismatch)
-    with pytest.raises(QdrantStorageError, match="scope does not match"):
+    with pytest.raises(QdrantStorageError, match="embeddings do not match"):
         store.search_column(VECTOR, "tenant-a", "dataset-b", 2, path_a, "m", 384)
 
 
@@ -439,7 +529,7 @@ def test_search_relationship_applies_tenant_and_dataset_filters_and_correct_limi
     assert len(results) <= 4  # limit is top_k * 2 = 4
 
     # Wrong dataset should find nothing (scope mismatch)
-    with pytest.raises(QdrantStorageError, match="scope does not match"):
+    with pytest.raises(QdrantStorageError, match="embeddings do not match"):
         store.search_relationship(VECTOR, "tenant-a", "dataset-b", 2, path_a, "m", 384)
 
 

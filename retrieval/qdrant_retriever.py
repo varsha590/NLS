@@ -12,7 +12,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo
 
-from retrieval.qdrant_store import QdrantVectorStore, QdrantStorageError, VECTOR_SIZE
+from retrieval.qdrant_store import (
+    QdrantMetadataMismatchError,
+    QdrantStorageError,
+    QdrantVectorStore,
+    VECTOR_SIZE,
+)
 from config.data_policy import is_blocked, is_masked
 
 LOGGER = logging.getLogger(__name__)
@@ -344,12 +349,9 @@ def retrieve(
                 qdrant_embedding_dimension,
             )
             qdrant_results["master_value"] = master_search
+        except QdrantMetadataMismatchError:
+            raise
         except QdrantStorageError as error:
-            # Model/dimension mismatch: refuse retrieval entirely, zero search calls
-            if "model or dimension" in str(error) or "384 dimensions" in str(error):
-                raise QdrantStorageError(
-                    "Dataset embeddings do not match the active model or dimension; re-index is required."
-                ) from error
             # Other Qdrant errors: explicit logged fallback to pure-logic lexical scoring
             LOGGER.warning(
                 "Qdrant search failed; falling back to pure-logic lexical scoring: %s",
@@ -358,6 +360,17 @@ def retrieve(
             qdrant_results = {}
 
     # Step 1: Compute roll-up scores for all tables
+    vector_scores: dict[str, dict[str, float]] = {}
+    for document_type, results in qdrant_results.items():
+        for result in results:
+            table_name = result.get("table_name")
+            if not table_name:
+                continue
+            scores = vector_scores.setdefault(table_name, {})
+            scores[document_type] = max(
+                scores.get(document_type, 0.0), float(result.get("similarity", 0.0))
+            )
+
     scored_tables: List[Tuple[str, float]] = []
     for table_name, table in metadata.tables.items():
         # Simplified: use default dummy scores since we don't have vector scores
@@ -400,6 +413,14 @@ def retrieve(
             1 for column in table.columns
             if not column.name.casefold() in {c.casefold() for c in []}
         )
+
+        if table_name in vector_scores:
+            table_scores = vector_scores[table_name]
+            s_val = table_scores.get("master_value", 0.0)
+            s_col = table_scores.get("column", 0.0)
+            s_rel = table_scores.get("relationship", 0.0)
+            s_tbl = table_scores.get("table", 0.0)
+            types_present = len(table_scores)
 
         score = compute_rollup_score(s_val, s_col, s_rel, s_tbl, types_present)
         scored_tables.append((table_name, score))

@@ -22,6 +22,15 @@ class QdrantStorageError(RuntimeError):
     """Safe user-facing Qdrant error that never includes connection details."""
 
 
+class QdrantMetadataMismatchError(QdrantStorageError):
+    """Dataset embedding metadata does not match the active query model."""
+
+
+_DATASET_SEARCH_ERROR = (
+    "Dataset embeddings do not match the active model or dimension; re-index is required."
+)
+
+
 def make_dataset_hash(
     file_bytes: bytes,
     dialect_override: str | None,
@@ -69,6 +78,31 @@ def _scope_conditions(tenant_id: str, dataset_id: str) -> list[models.FieldCondi
         models.FieldCondition(key="tenant_id", match=models.MatchValue(value=tenant_id)),
         models.FieldCondition(key="dataset_id", match=models.MatchValue(value=dataset_id)),
     ]
+
+
+def _read_search_metadata(
+    dataset_metadata_path: str | Path,
+    tenant_id: str,
+    dataset_id: str,
+    embedding_model_name: str,
+    dimension: int,
+) -> dict[str, Any]:
+    try:
+        metadata = json.loads(Path(dataset_metadata_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        raise QdrantStorageError(_DATASET_SEARCH_ERROR) from None
+    if (
+        metadata.get("tenant_id") != tenant_id
+        or metadata.get("dataset_id") != dataset_id
+        or metadata.get("indexed") is not True
+    ):
+        raise QdrantStorageError(_DATASET_SEARCH_ERROR)
+    if (
+        metadata.get("embedding_model_name") != embedding_model_name
+        or metadata.get("vector_dimension") != dimension
+    ):
+        raise QdrantMetadataMismatchError(_DATASET_SEARCH_ERROR)
+    return metadata
 
 
 class QdrantVectorStore:
@@ -277,23 +311,9 @@ class QdrantVectorStore:
         _validate_scope(tenant_id, dataset_id)
         if dimension != self.vector_size or len(query_vector) != self.vector_size:
             raise QdrantStorageError(f"Query embeddings must have {self.vector_size} dimensions.")
-        try:
-            metadata = json.loads(Path(dataset_metadata_path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raise QdrantStorageError("Dataset index metadata is unavailable; search was refused.") from None
-        if (
-            metadata.get("tenant_id") != tenant_id
-            or metadata.get("dataset_id") != dataset_id
-            or metadata.get("indexed") is not True
-        ):
-            raise QdrantStorageError("Dataset is not indexed for this tenant; search was refused.")
-        if (
-            metadata.get("embedding_model_name") != embedding_model_name
-            or metadata.get("vector_dimension") != dimension
-        ):
-            raise QdrantStorageError(
-                "Dataset embeddings do not match the active model or dimension; re-index is required."
-            )
+        _read_search_metadata(
+            dataset_metadata_path, tenant_id, dataset_id, embedding_model_name, dimension
+        )
         conditions = _scope_conditions(tenant_id, dataset_id)
         if document_types:
             conditions.append(
@@ -333,18 +353,9 @@ class QdrantVectorStore:
         _validate_scope(tenant_id, dataset_id)
         if dimension != self.vector_size or len(query_vector) != self.vector_size:
             raise QdrantStorageError(f"Query embeddings must have {self.vector_size} dimensions.")
-        try:
-            metadata = json.loads(Path(dataset_metadata_path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raise QdrantStorageError("Dataset index metadata is unavailable; search was refused.") from None
-        if metadata.get("tenant_id") != tenant_id or metadata.get("dataset_id") != dataset_id:
-            raise QdrantStorageError("Dataset scope does not match the request.")
-        if metadata.get("indexed") is not True:
-            raise QdrantStorageError("Dataset is not indexed for this tenant; search was refused.")
-        if metadata.get("embedding_model_name") != embedding_model_name or metadata.get("vector_dimension") != dimension:
-            raise QdrantStorageError(
-                "Dataset embeddings do not match the active model or dimension; re-index is required."
-            )
+        _read_search_metadata(
+            dataset_metadata_path, tenant_id, dataset_id, embedding_model_name, dimension
+        )
         conditions = _scope_conditions(tenant_id, dataset_id)
         conditions.append(models.FieldCondition(key="document_type", match=models.MatchValue(value="table")))
         query_filter = models.Filter(must=conditions)
@@ -378,18 +389,9 @@ class QdrantVectorStore:
         _validate_scope(tenant_id, dataset_id)
         if dimension != self.vector_size or len(query_vector) != self.vector_size:
             raise QdrantStorageError(f"Query embeddings must have {self.vector_size} dimensions.")
-        try:
-            metadata = json.loads(Path(dataset_metadata_path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raise QdrantStorageError("Dataset index metadata is unavailable; search was refused.") from None
-        if metadata.get("tenant_id") != tenant_id or metadata.get("dataset_id") != dataset_id:
-            raise QdrantStorageError("Dataset scope does not match the request.")
-        if metadata.get("indexed") is not True:
-            raise QdrantStorageError("Dataset is not indexed for this tenant; search was refused.")
-        if metadata.get("embedding_model_name") != embedding_model_name or metadata.get("vector_dimension") != dimension:
-            raise QdrantStorageError(
-                "Dataset embeddings do not match the active model or dimension; re-index is required."
-            )
+        _read_search_metadata(
+            dataset_metadata_path, tenant_id, dataset_id, embedding_model_name, dimension
+        )
         conditions = _scope_conditions(tenant_id, dataset_id)
         conditions.append(models.FieldCondition(key="document_type", match=models.MatchValue(value="column")))
         query_filter = models.Filter(must=conditions)
@@ -423,18 +425,9 @@ class QdrantVectorStore:
         _validate_scope(tenant_id, dataset_id)
         if dimension != self.vector_size or len(query_vector) != self.vector_size:
             raise QdrantStorageError(f"Query embeddings must have {self.vector_size} dimensions.")
-        try:
-            metadata = json.loads(Path(dataset_metadata_path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raise QdrantStorageError("Dataset index metadata is unavailable; search was refused.") from None
-        if metadata.get("tenant_id") != tenant_id or metadata.get("dataset_id") != dataset_id:
-            raise QdrantStorageError("Dataset scope does not match the request.")
-        if metadata.get("indexed") is not True:
-            raise QdrantStorageError("Dataset is not indexed for this tenant; search was refused.")
-        if metadata.get("embedding_model_name") != embedding_model_name or metadata.get("vector_dimension") != dimension:
-            raise QdrantStorageError(
-                "Dataset embeddings do not match the active model or dimension; re-index is required."
-            )
+        _read_search_metadata(
+            dataset_metadata_path, tenant_id, dataset_id, embedding_model_name, dimension
+        )
         conditions = _scope_conditions(tenant_id, dataset_id)
         conditions.append(models.FieldCondition(key="document_type", match=models.MatchValue(value="relationship")))
         query_filter = models.Filter(must=conditions)
