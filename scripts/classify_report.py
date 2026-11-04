@@ -37,8 +37,9 @@ from catalog.classifier import (
     split_identifier_tokens,
 )
 from catalog.introspect import introspect_catalog
-from config.data_policy import get_policy_overrides
+from config.data_policy import get_policy_overrides, load_database_overrides
 from config.settings import Settings
+from db.adapter import DatabaseAdapter
 from schema.metadata import is_internal_table_name
 
 LOGGER = logging.getLogger(__name__)
@@ -101,7 +102,12 @@ def generate_classification_report(output_path: Path | None = None) -> str:
         allowed_schemas=settings.allowed_schemas,
         excluded_tables=settings.excluded_tables,
     )
-    overrides = get_policy_overrides()
+    adapter = DatabaseAdapter(settings.database_url, engine=engine)
+    overrides_path = Path(settings.vector_store_path) / adapter.namespace() / "overrides.yaml"
+    database_overrides, stale_overrides, override_warnings = load_database_overrides(
+        overrides_path, metadata
+    )
+    overrides = get_policy_overrides(database_overrides)
 
     class_priority = {
         ColumnClass.BLOCKED.value: 0,
@@ -250,7 +256,7 @@ def generate_classification_report(output_path: Path | None = None) -> str:
                     flag_like_columns.append({
                         "table": table_key,
                         "column": col_name,
-                        "options": options,
+                        "option_count": len(options),
                     })
 
                 records.append({
@@ -259,7 +265,7 @@ def generate_classification_report(output_path: Path | None = None) -> str:
                     "type": str(col_type),
                     "class": class_str,
                     "count": cnt if cnt is not None else "-",
-                    "options": options if class_str == ColumnClass.VALUE_LOW.value else None,
+                    "option_count": len(options) if options is not None else None,
                     "reason": final_reason,
                     "is_weak": is_weak,
                 })
@@ -294,11 +300,23 @@ def generate_classification_report(output_path: Path | None = None) -> str:
         f"Tables included: **{len(report_tables)}**",
         f"Columns included: **{total_columns}**",
         "",
+        "## STALE OVERRIDES",
+        "",
+    ]
+    if stale_overrides:
+        lines.extend(f"- `{name}`" for name in stale_overrides)
+    else:
+        lines.append("No stale table or column overrides.")
+    if override_warnings:
+        lines.extend(["", "Rejected overrides:"])
+        lines.extend(f"- {warning}" for warning in override_warnings)
+    lines.extend([
+        "",
         "## POSSIBLE DUPLICATE TABLES",
         "",
         f"Structure similarity threshold: {DEFAULT_DUPLICATE_SIMILARITY_THRESHOLD:.0%}. Detection uses column-name/type structure only; groups are advisory and no tables are excluded automatically.",
         "",
-    ]
+    ])
 
     if duplicate_groups:
         lines.extend([
@@ -335,13 +353,12 @@ def generate_classification_report(output_path: Path | None = None) -> str:
         lines.extend([
             "VALUE_LOW columns whose declared options are all digits or a recognized boolean-like pair. Meaning is intentionally not inferred.",
             "",
-            "| Table | Column | Option count | Options |",
-            "|---|---|---:|---|",
+            "| Table | Column | Option count |",
+            "|---|---|---:|",
         ])
         for candidate in flag_like_columns:
-            display_options = ", ".join(candidate["options"]).replace("|", "\\|")
             lines.append(
-                f"| `{candidate['table']}` | `{candidate['column']}` | {len(candidate['options'])} | {display_options} |"
+                f"| `{candidate['table']}` | `{candidate['column']}` | {candidate['option_count']} |"
             )
         lines.append("")
     else:
@@ -402,11 +419,8 @@ def generate_classification_report(output_path: Path | None = None) -> str:
         "|---|---|---|---|---|---|",
     ])
     for r in records:
-        option_text = ""
-        if r["options"] is not None:
-            option_text = " (options: " + ", ".join(r["options"]).replace("|", "\\|") + ")"
         lines.append(
-            f"| `{r['table']}` | `{r['column']}` | `{r['type']}`{option_text} | **{r['class']}** | {r['count']} | {r['reason']} |"
+            f"| `{r['table']}` | `{r['column']}` | `{r['type']}` | **{r['class']}** | {r['count']} | {r['reason']} |"
         )
     lines.append("")
 

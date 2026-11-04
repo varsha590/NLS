@@ -118,6 +118,7 @@ class LocalVectorStore:
             "vector_dimension": self.dimension,
             "normalization_version": NORMALIZATION_VERSION,
             "config_policy_hash": self.policy_hash,
+            "generic_policy_hash": None,
             "build_time": self._clock(),
             "global_schema_fingerprint": None,
             "table_fingerprints": {},
@@ -243,8 +244,7 @@ class LocalVectorStore:
         manifest = self._manifest or {}
         expected_hash = manifest.get("classification_cache_sha256")
         if (
-            manifest.get("config_policy_hash") != self.policy_hash
-            or not expected_hash
+            not expected_hash
             or not self.classification_cache_path.exists()
         ):
             return None
@@ -252,7 +252,10 @@ class LocalVectorStore:
             if self._sha256_file(self.classification_cache_path) != expected_hash:
                 raise ValueError("classification cache checksum mismatch")
             payload = json.loads(self.classification_cache_path.read_text(encoding="utf-8"))
-            if payload.get("policy_hash") != self.policy_hash or not isinstance(payload.get("tables"), dict):
+            if (
+                payload.get("policy_hash") != manifest.get("config_policy_hash")
+                or not isinstance(payload.get("tables"), dict)
+            ):
                 raise ValueError("classification cache metadata mismatch")
             return payload["tables"]
         except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
@@ -266,6 +269,7 @@ class LocalVectorStore:
         last_value_scan_at: dict[str, float],
         classification_cache: dict[str, Any],
         incomplete_tables: dict[str, str] | None = None,
+        generic_policy_hash: str | None = None,
     ) -> None:
         """Atomically persist fingerprints and count/class-only classifications."""
         safe_tables: dict[str, Any] = {}
@@ -286,6 +290,8 @@ class LocalVectorStore:
                 "fingerprint": table_cache.get("fingerprint"),
                 "columns": safe_columns,
             }
+            if "policy_fingerprint" in table_cache:
+                safe_entry["policy_fingerprint"] = table_cache["policy_fingerprint"]
             if "column_fingerprints" in table_cache:
                 safe_entry["column_fingerprints"] = {
                     key: str(value)
@@ -303,6 +309,7 @@ class LocalVectorStore:
                 "vector_dimension": self.dimension,
                 "normalization_version": NORMALIZATION_VERSION,
                 "config_policy_hash": self.policy_hash,
+                "generic_policy_hash": generic_policy_hash,
                 "global_schema_fingerprint": global_schema_fingerprint,
                 "table_fingerprints": dict(table_fingerprints),
                 "last_value_scan_at": {

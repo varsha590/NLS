@@ -8,19 +8,25 @@ from typing import Any
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from db.adapter import DatabaseAdapter
 from retrieval.value_index import ValueIndex
 from schema.metadata import SchemaMetadata
 
 try:
-    from config.data_policy import is_blocked, blocked_columns_for_table
+    from config.data_policy import is_blocked, is_masked, blocked_columns_for_table
 except Exception:
     # Fail closed: treat every column as blocked if policy cannot be imported
-    def is_blocked(key: str) -> bool:
+    def is_blocked(key: str, **kwargs: Any) -> bool:
         return True
 
-    def blocked_columns_for_table(table_name: str, column_names: list) -> set:
+    def is_masked(key: str, **kwargs: Any) -> bool:
+        return True
+
+    def blocked_columns_for_table(
+        table_name: str, column_names: list, policy_overrides: dict[str, Any] | None = None
+    ) -> set:
         return set(column_names)
 
 
@@ -98,6 +104,78 @@ def _is_value_column(column_key: str, value_index: ValueIndex | None) -> bool:
     return column_key in value_index.values
 
 
+def _column_class(column_key: str, value_index: ValueIndex) -> str:
+    if column_key in value_index.values:
+        return "VALUE_LOW"
+    if column_key in value_index.large_columns:
+        return "VALUE_HIGH"
+    table_name, _, column_name = column_key.rpartition(".")
+    table = next(
+        (item for name, item in value_index.metadata.tables.items() if name.casefold() == table_name.casefold()),
+        None,
+    )
+    if table is None:
+        return "SKIP"
+    entry = value_index.classification_cache.get(table.name, {}).get("columns", {}).get(column_name, {})
+    return str(entry.get("class", "SKIP"))
+
+
+def _scope_column_key(
+    column: exp.Column,
+    scope: Scope | None,
+    metadata: SchemaMetadata,
+    scope_by_expression: dict[int, Scope],
+    visited: set[tuple[int, str]],
+) -> str | None:
+    if scope is None:
+        return None
+    marker = (id(scope.expression), column.sql())
+    if marker in visited:
+        return None
+    visited.add(marker)
+
+    def resolve_source(source: Any, source_scope: Scope, name: str) -> str | None:
+        if isinstance(source, exp.Table):
+            table_key = _table_key(source)
+            table = next(
+                (item for key, item in metadata.tables.items() if key.casefold() == table_key.casefold()),
+                None,
+            )
+            if table is None:
+                return None
+            actual_column = next(
+                (item.name for item in table.columns if item.name.casefold() == name.casefold()),
+                None,
+            )
+            return f"{table.name}.{actual_column}" if actual_column else None
+        if isinstance(source, Scope):
+            projections = [
+                projection for projection in source.expression.selects
+                if projection.alias_or_name.casefold() == name.casefold()
+            ]
+            if len(projections) != 1:
+                return None
+            child_scope = scope_by_expression.get(id(source.expression))
+            inner_columns = list(projections[0].find_all(exp.Column))
+            if child_scope is None or len(inner_columns) != 1:
+                return None
+            return _scope_column_key(
+                inner_columns[0], child_scope, metadata, scope_by_expression, visited
+            )
+        return None
+
+    if column.table:
+        source = scope.sources.get(column.table.casefold())
+        return resolve_source(source, scope, column.name) if source is not None else None
+
+    matches = []
+    for source in scope.sources.values():
+        resolved = resolve_source(source, scope, column.name)
+        if resolved and resolved not in matches:
+            matches.append(resolved)
+    return matches[0] if len(matches) == 1 else None
+
+
 def _resolve_literal_against_index(
     literal: str,
     column_key: str,
@@ -166,6 +244,7 @@ def _check_and_rewrite_literals(
     resolved_values: list[dict[str, Any]] | None,
     dialect: str | None,
     used_tables: dict[str, object] | None = None,
+    policy_overrides: dict[str, Any] | None = None,
 ) -> tuple[str | None, list[str]]:
     """Check string literals in comparisons against value index.
 
@@ -186,6 +265,13 @@ def _check_and_rewrite_literals(
 
     errors: list[str] = []
     rewrites: list[tuple[exp.Expression, str]] = []  # (node, new_value)
+    scopes = list(traverse_scope(parsed))
+    scope_by_expression = {id(scope.expression): scope for scope in scopes}
+    scope_by_column = {
+        id(column): scope
+        for scope in scopes
+        for column in scope.columns
+    }
     
     # Find all comparisons: EQ, IN, LIKE, ILIKE
     for node in parsed.walk():
@@ -220,23 +306,45 @@ def _check_and_rewrite_literals(
             
             if column_node and literal_node:
                 literal_value = literal_node.this
-                # Resolve column to qualified name
-                col_table = column_node.table
-                col_name = column_node.name
-                column_key = None
-                
-                if col_table:
-                    table_key = table_aliases.get(col_table.casefold())
-                    if table_key:
-                        column_key = f"{table_key}.{col_name}"
-                else:
-                    # Unqualified column — search only the tables used by this query (0g fix).
-                    for table_key, table in column_scope.items():
-                        if col_name.casefold() in {c.name.casefold() for c in table.columns}:
-                            column_key = f"{table_key}.{col_name}"
-                            break
-                
-                if column_key and _is_value_column(column_key, value_index):
+                scope = scope_by_column.get(id(column_node))
+                column_key = _scope_column_key(
+                    column_node, scope, value_index.metadata, scope_by_expression, set()
+                )
+                column_class = _column_class(column_key, value_index) if column_key else "SKIP"
+                if column_key and (
+                    column_class in {"BLOCKED", "MASKED"}
+                    or is_blocked(column_key, policy_overrides=policy_overrides)
+                    or is_masked(column_key, policy_overrides=policy_overrides)
+                ):
+                    errors.append(f"Literal filter on restricted column {column_key} rejected.")
+                elif column_key and isinstance(node, (exp.Like, exp.ILike)):
+                    continue
+                elif column_key and column_class == "VALUE_HIGH":
+                    confirmed = next(
+                        (
+                            item for item in (resolved_values or [])
+                            if item.get("column", "").casefold() == column_key.casefold()
+                            and item.get("mention", "").casefold() == literal_value.casefold()
+                            and item.get("value")
+                        ),
+                        None,
+                    )
+                    resolved = (
+                        {"status": "resolved", "value": confirmed["value"]}
+                        if confirmed is not None
+                        else value_index.resolve_high_value(column_key, literal_value)
+                    )
+                    if resolved["status"] == "resolved":
+                        if resolved["value"] != literal_value:
+                            rewrites.append((literal_node, resolved["value"]))
+                    elif resolved["status"] == "ambiguous":
+                        value_index.pending_confirmation = {
+                            "mention": literal_value,
+                            "column": column_key,
+                            "candidates": resolved["candidates"],
+                        }
+                        errors.append(f"Ambiguous VALUE_HIGH value for {column_key}.")
+                elif column_key and column_class == "VALUE_LOW" and _is_value_column(column_key, value_index):
                     canonical, error, closest = _resolve_literal_against_index(
                         literal_value, column_key, value_index, resolved_values
                     )
@@ -284,22 +392,44 @@ def _check_and_rewrite_literals(
                         literal_nodes.append(expr)
                 
                 if literal_values and literal_nodes:
-                    col_table = column_node.table
-                    col_name = column_node.name
-                    column_key = None
-                    
-                    if col_table:
-                        table_key = table_aliases.get(col_table.casefold())
-                        if table_key:
-                            column_key = f"{table_key}.{col_name}"
-                    else:
-                        # Unqualified column — search only the tables used by this query (0g fix).
-                        for table_key, table in column_scope.items():
-                            if col_name.casefold() in {c.name.casefold() for c in table.columns}:
-                                column_key = f"{table_key}.{col_name}"
-                                break
-                    
-                    if column_key and _is_value_column(column_key, value_index):
+                    scope = scope_by_column.get(id(column_node))
+                    column_key = _scope_column_key(
+                        column_node, scope, value_index.metadata, scope_by_expression, set()
+                    )
+                    column_class = _column_class(column_key, value_index) if column_key else "SKIP"
+                    if column_key and (
+                        column_class in {"BLOCKED", "MASKED"}
+                        or is_blocked(column_key, policy_overrides=policy_overrides)
+                        or is_masked(column_key, policy_overrides=policy_overrides)
+                    ):
+                        errors.append(f"Literal filter on restricted column {column_key} rejected.")
+                    elif column_key and column_class == "VALUE_HIGH":
+                        for literal_value, literal_node in zip(literal_values, literal_nodes):
+                            confirmed = next(
+                                (
+                                    item for item in (resolved_values or [])
+                                    if item.get("column", "").casefold() == column_key.casefold()
+                                    and item.get("mention", "").casefold() == literal_value.casefold()
+                                    and item.get("value")
+                                ),
+                                None,
+                            )
+                            resolved = (
+                                {"status": "resolved", "value": confirmed["value"]}
+                                if confirmed is not None
+                                else value_index.resolve_high_value(column_key, literal_value)
+                            )
+                            if resolved["status"] == "resolved":
+                                if resolved["value"] != literal_value:
+                                    rewrites.append((literal_node, resolved["value"]))
+                            elif resolved["status"] == "ambiguous":
+                                value_index.pending_confirmation = {
+                                    "mention": literal_value,
+                                    "column": column_key,
+                                    "candidates": resolved["candidates"],
+                                }
+                                errors.append(f"Ambiguous VALUE_HIGH value for {column_key}.")
+                    elif column_key and column_class == "VALUE_LOW" and _is_value_column(column_key, value_index):
                         for literal_value, literal_node in zip(literal_values, literal_nodes):
                             canonical, error, closest = _resolve_literal_against_index(
                                 literal_value, column_key, value_index, resolved_values
@@ -339,6 +469,7 @@ def validate_sql(
     adapter: DatabaseAdapter | None = None,
     value_index: ValueIndex | None = None,
     resolved_values: list[dict[str, Any]] | None = None,
+    policy_overrides: dict[str, Any] | None = None,
 ) -> str:
     """Validate one SELECT, verify catalog references, enforce LIMIT, and explain it."""
     source = sql.strip().rstrip(";").strip()
@@ -397,6 +528,15 @@ def validate_sql(
         for projection in parsed.expressions
         if isinstance(projection, exp.Alias) and projection.alias
     }
+    validation_scopes = list(traverse_scope(parsed))
+    validation_scope_by_expression = {
+        id(scope.expression): scope for scope in validation_scopes
+    }
+    validation_scope_by_column = {
+        id(column): scope
+        for scope in validation_scopes
+        for column in scope.columns
+    }
     for column_node in parsed.find_all(exp.Column):
         if column_node.name == "*" or column_node.name.casefold() in projection_aliases:
             continue
@@ -405,6 +545,16 @@ def validate_sql(
             resolved_table_name = table_aliases.get(column_node.table.casefold())
             if resolved_table_name is None and column_node.table.casefold() in cte_names:
                 continue
+            if resolved_table_name is None:
+                scoped_key = _scope_column_key(
+                    column_node,
+                    validation_scope_by_column.get(id(column_node)),
+                    metadata,
+                    validation_scope_by_expression,
+                    set(),
+                )
+                if scoped_key is not None:
+                    continue
             if resolved_table_name is None:
                 resolved_table_name = column_node.table.casefold()
             table = catalog.get(resolved_table_name)
@@ -443,8 +593,7 @@ def validate_sql(
                 table_obj = catalog.get(table_key)
                 if table_obj:
                     cols = [c.name for c in table_obj.columns]
-                    tbl_name = table_key.rsplit(".", 1)[-1]
-                    if blocked_columns_for_table(tbl_name, cols):
+                    if blocked_columns_for_table(table_key, cols, policy_overrides):
                         raise ValidationError(_BLOCKED_MSG)
         elif isinstance(parent, exp.Select):
             # SELECT * case - check all used tables
@@ -452,8 +601,7 @@ def validate_sql(
                 table_obj = catalog.get(table_key)
                 if table_obj:
                     cols = [c.name for c in table_obj.columns]
-                    tbl_name = table_key.rsplit(".", 1)[-1]
-                    if blocked_columns_for_table(tbl_name, cols):
+                    if blocked_columns_for_table(table_key, cols, policy_overrides):
                         raise ValidationError(_BLOCKED_MSG)
 
     # Check all column references (including in functions, subqueries, CTEs, etc.)
@@ -473,9 +621,10 @@ def validate_sql(
                     table_key = tk
                     break
         if table_key:
-            tbl_name = table_key.rsplit(".", 1)[-1]
-            full_key = f"{tbl_name}.{col_name}"
-            if is_blocked(full_key):
+            full_key = f"{table_key}.{col_name}"
+            if is_blocked(full_key, policy_overrides=policy_overrides):
+                raise ValidationError(_BLOCKED_MSG)
+            if is_masked(full_key, policy_overrides=policy_overrides):
                 raise ValidationError(_BLOCKED_MSG)
 
     limit = parsed.args.get("limit")
@@ -490,12 +639,32 @@ def validate_sql(
             limit.set("expression", exp.Literal.number(max_rows))
     # Literal safety net: check string literals against value index
     rewritten_sql, errors = _check_and_rewrite_literals(
-        parsed, table_aliases, catalog, value_index, resolved_values, dialect, used_tables=used_tables
+        parsed,
+        table_aliases,
+        catalog,
+        value_index,
+        resolved_values,
+        dialect,
+        used_tables=used_tables,
+        policy_overrides=policy_overrides,
     )
     if errors:
         # Parse first error to extract structured info
         error_msg = errors[0]
         # Determine kind
+        if "Ambiguous VALUE_HIGH" in error_msg:
+            column_match = re.search(r"for (\S+)\.", error_msg)
+            column = column_match.group(1) if column_match else None
+            confirmation = getattr(value_index, "pending_confirmation", {})
+            raise ValueSafetyError(
+                "An ambiguous value needs user confirmation.",
+                "ambiguous",
+                "",
+                column,
+                [],
+            )
+        if "restricted column" in error_msg:
+            raise ValidationError("That information isn't available.")
         if "Ambiguous value" in error_msg:
             kind = "ambiguous"
             import re

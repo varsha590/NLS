@@ -1144,4 +1144,19 @@ Columns blocked by a short or generic token where manual review may be helpful:
 
 ### Hiresanta Measurement
 
-Live `nls_ro` first/second-startup measurements are recorded after the required full-suite run below. The record will contain only elapsed stage seconds, data-table statement counts, embedding batch/vector counts, and fast-path status; no row values are inspected or reported.
+Measured against the local hiresanta MySQL database with the SELECT-only `nls_ro` account, using a fresh temporary local-store directory and the configured embedding model. The probe counted SELECT statements referencing reflected data tables and counted embedding batches/vectors; it emitted no table or row values. Catalog size was 72 tables and 876 columns.
+
+| Run | Total startup seconds | Data-table statements | Embedding calls (batches) | Vectors embedded | Path |
+|---|---:|---:|---:|---:|---|
+| First startup | 17.880 | 221 | 2 | 4903 | rebuild |
+| Second startup | 3.503 | 0 | 0 | 0 | fast path |
+
+| Stage | First startup seconds | Second startup seconds |
+|---|---:|---:|
+| Introspect | 0.074 | 0.043 |
+| Classify | 4.023 | skipped |
+| Scan | 0.739 | skipped |
+| Embed | 4.966 | skipped |
+| Save | 0.057 | skipped |
+
+The first build scanned 49 tables in 221 bounded statements and produced 845 schema vectors and 5454 value vectors. The second startup validated/reloaded both vector parts and classifications with no data-table statements or embedding calls. The embedding model still initializes on the second startup; its model-loading time is included in total startup seconds but not in `embed` stage time.

@@ -37,11 +37,14 @@ class HybridSchemaRetriever:
         self, 
         metadata: SchemaMetadata, 
         embedding_model: Embedder, 
-        local_store: LocalVectorStore | None = None
+        local_store: LocalVectorStore | None = None,
+        policy_overrides: dict[str, Any] | None = None,
     ):
         self.metadata = metadata
         self.embedding_model = embedding_model
         self.local_store = local_store
+        self.policy_overrides = policy_overrides
+        self.call_counts = {"embedding_calls": 0, "faiss_searches": 0}
         self.documents = []
         for table in metadata.tables.values():
             if is_internal_table_name(table.name):
@@ -49,8 +52,8 @@ class HybridSchemaRetriever:
             column_text = [
                 f"{column.name} {column.data_type} {column.comment or ''}".strip()
                 for column in table.columns
-                if not is_blocked(f"{table.name}.{column.name}")
-                and not is_masked(f"{table.name}.{column.name}")
+                if not is_blocked(f"{table.name}.{column.name}", policy_overrides=policy_overrides)
+                and not is_masked(f"{table.name}.{column.name}", policy_overrides=policy_overrides)
             ]
             self.documents.append({
                 "table_name": table.name,
@@ -65,6 +68,7 @@ class HybridSchemaRetriever:
         
         query_tokens = _lexical_tokens(query)
         query_vector = self.embedding_model.embed([query])[0]
+        self.call_counts["embedding_calls"] += 1
         
         # Search local vectors and associate results by schema-qualified table key.
         semantic_results = []
@@ -72,6 +76,7 @@ class HybridSchemaRetriever:
             semantic_results = self.local_store.search_schema(
                 query_vector.tolist(), top_k=max(top_k, MAX_TOP_K), metadata_type="table_ddl"
             )
+            self.call_counts["faiss_searches"] += 1
         
         # Build a lookup of semantic scores from the search results, keyed by
         # the schema-qualified table name returned by the store.  The store key
@@ -127,13 +132,12 @@ class HybridSchemaRetriever:
             "scores": {document["table_name"]: float(score) for score, document in expanded},
         }
 
-    @staticmethod
-    def _document_for(table: Any) -> dict[str, Any]:
+    def _document_for(self, table: Any) -> dict[str, Any]:
         unblocked_columns = [
             column.name
             for column in table.columns
-            if not is_blocked(f"{table.name}.{column.name}")
-            and not is_masked(f"{table.name}.{column.name}")
+            if not is_blocked(f"{table.name}.{column.name}", policy_overrides=self.policy_overrides)
+            and not is_masked(f"{table.name}.{column.name}", policy_overrides=self.policy_overrides)
         ]
         return {
             "table_name": table.name,
@@ -151,7 +155,9 @@ class HybridSchemaRetriever:
             columns = []
             for column in table.columns:
                 # Omit BLOCKED columns completely from DDL
-                if is_blocked(f"{table.name}.{column.name}"):
+                if is_blocked(
+                    f"{table.name}.{column.name}", policy_overrides=self.policy_overrides
+                ):
                     continue
                 details = f"{column.name} {column.data_type}"
                 if column.is_primary_key:

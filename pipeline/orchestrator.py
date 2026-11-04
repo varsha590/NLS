@@ -70,6 +70,8 @@ class PipelineResult:
     ambiguous_values: list[dict[str, Any]] = field(default_factory=list)
     not_found_values: list[dict[str, Any]] = field(default_factory=list)
     columns: list[str] = field(default_factory=list)
+    call_counts: dict[str, Any] = field(default_factory=dict)
+    run_details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-friendly representation."""
@@ -91,6 +93,7 @@ class TextToSQLPipeline:
         max_retries: int = 3,
         schema_top_k: int = 8,
         value_top_k: int = 5,
+        send_high_cardinality_values_to_llm: bool = False,
     ) -> None:
         self.adapter = adapter
         self.metadata = metadata
@@ -102,6 +105,7 @@ class TextToSQLPipeline:
         self.max_retries = max_retries
         self.schema_top_k = schema_top_k
         self.value_top_k = value_top_k
+        self.send_high_cardinality_values_to_llm = send_high_cardinality_values_to_llm
 
     def _uses_status_as_activity_proxy(self, question: str, sql: str) -> bool:
         """Detect status filters in questions phrased as activity metrics."""
@@ -124,15 +128,83 @@ class TextToSQLPipeline:
             for column in where.find_all(exp.Column)
         )
 
+    def _redact_high_mentions(
+        self, question: str, matches: list[dict[str, Any]]
+    ) -> tuple[str, dict[str, str]]:
+        tokens: dict[str, str] = {}
+        redacted = question
+        for item in matches:
+            mention = str(item.get("mention", ""))
+            if not mention:
+                continue
+            token = f"__PRIVATE_VALUE_{len(tokens)}__"
+            pattern = re.compile(rf"(?<!\w){re.escape(mention)}(?!\w)", re.IGNORECASE)
+            redacted, count = pattern.subn(token, redacted, count=1)
+            if count:
+                tokens[token] = mention
+        return redacted, tokens
+
+    def _restore_high_sql_literals(
+        self, sql: str, placeholders: dict[str, str]
+    ) -> str:
+        if not placeholders:
+            return sql
+        parsed = sqlglot.parse_one(sql, read=self.adapter.get_sqlglot_dialect())
+        replacements = {key.casefold(): value for key, value in placeholders.items()}
+        for literal in parsed.find_all(exp.Literal):
+            if literal.is_string and literal.this.casefold() in replacements:
+                literal.set("this", replacements[literal.this.casefold()])
+            for column in list(parsed.find_all(exp.Column)):
+                replacement = replacements.get(column.name.casefold())
+                if replacement is not None:
+                    column.replace(exp.Literal.string(replacement))
+        return parsed.sql(dialect=self.adapter.get_sqlglot_dialect())
+
     def run(self, question: str, confirmed_values: list[dict[str, Any]] | None = None) -> PipelineResult:
         """Process a natural-language question and return rows plus an answer."""
         result = PipelineResult()
         total_started = time.monotonic()
+        self.adapter.reset_call_counts()
+        if self.value_index is not None:
+            reset_counts = getattr(self.value_index, "reset_question_counts", None)
+            if reset_counts is not None:
+                reset_counts()
+            if hasattr(self.value_index, "pending_confirmation"):
+                self.value_index.pending_confirmation = None
+        if hasattr(self.retriever, "call_counts"):
+            self.retriever.call_counts = {"embedding_calls": 0, "faiss_searches": 0}
+
+        def record_run_details() -> None:
+            value_counts = getattr(self.value_index, "call_counts", {})
+            schema_counts = getattr(self.retriever, "call_counts", {})
+            self.adapter.call_counts["value_lookup_db_calls"] = max(
+                self.adapter.call_counts["value_lookup_db_calls"],
+                int(value_counts.get("value_lookup_db_calls", 0)),
+            )
+            result.call_counts = {
+                "embedding_calls": int(value_counts.get("embedding_calls", 0))
+                + int(schema_counts.get("embedding_calls", 0)),
+                "faiss_searches": int(value_counts.get("faiss_searches", 0))
+                + int(schema_counts.get("faiss_searches", 0)),
+                **self.adapter.call_counts,
+                "llm_calls": int(result.call_counts.get("llm_calls", 0)),
+            }
+            if self.value_index and getattr(self.value_index, "unmatched_high_count", 0):
+                result.run_details["value_resolution"] = (
+                    f"no matching value found ({self.value_index.unmatched_high_count})"
+                )
         try:
             value_started = time.monotonic()
             raw_value_matches = (
                 self.value_index.resolve_question(question, self.value_top_k)
                 if self.value_index else []
+            )
+            high_matches = [
+                match for match in raw_value_matches
+                if match.get("high_cardinality")
+            ]
+            prompt_question, private_placeholders = self._redact_high_mentions(
+                question, high_matches
             )
             supplied_values = confirmed_values or []
             skipped_mentions = {
@@ -151,18 +223,20 @@ class TextToSQLPipeline:
             ]
             result.not_found_values = [
                 match for match in raw_value_matches
-                if match.get("not_found")
+                if match.get("not_found") and not match.get("high_cardinality")
                 and match.get("mention", "").casefold() not in skipped_mentions
             ]
             result.resolved_values = [
                 match for match in raw_value_matches
                 if not match.get("ambiguous") and not match.get("not_found")
+                and not match.get("high_cardinality")
             ]
             result.resolved_values.extend(value for value in supplied_values if not value.get("skip"))
             result.timings["value_resolution_ms"] = (time.monotonic() - value_started) * 1000
             if result.ambiguous_values:
                 result.answer = "Please confirm the highlighted value before I generate a query."
                 result.timings["total_ms"] = (time.monotonic() - total_started) * 1000
+                record_run_details()
                 return result
 
             retrieval_started = time.monotonic()
@@ -175,7 +249,11 @@ class TextToSQLPipeline:
             retrieval = self.retriever.retrieve(retrieval_question, self.schema_top_k)
             result.tables_used = retrieval["tables"]
             result.timings["schema_retrieval_ms"] = (time.monotonic() - retrieval_started) * 1000
-            examples = self.examples.retrieve(question, self.value_top_k) if self.examples else []
+            examples = (
+                self.examples.retrieve(question, self.value_top_k)
+                if self.examples and self.send_high_cardinality_values_to_llm
+                else []
+            )
 
             correction = None
             for attempt in range(self.max_retries + 1):
@@ -188,7 +266,7 @@ class TextToSQLPipeline:
                 ]
                 local_store = getattr(self.retriever, "local_store", None)
                 messages = build_prompt(
-                    question=question,
+                    question=prompt_question,
                     dialect=self.adapter.get_dialect(),
                     ddl=retrieval["ddl"],
                     resolved_values=llm_resolved_values,
@@ -203,7 +281,11 @@ class TextToSQLPipeline:
                 )
                 generation_started = time.monotonic()
                 try:
+                    result.call_counts["llm_calls"] = result.call_counts.get("llm_calls", 0) + 1
                     generated_sql = self.generator.generate(messages)
+                    generated_sql = self._restore_high_sql_literals(
+                        generated_sql, private_placeholders
+                    )
                     result.timings["generation_ms"] = result.timings.get("generation_ms", 0) + (
                         time.monotonic() - generation_started
                     ) * 1000
@@ -217,6 +299,7 @@ class TextToSQLPipeline:
                         adapter=self.adapter,
                         value_index=self.value_index,
                         resolved_values=result.resolved_values,
+                        policy_overrides=getattr(self.value_index, "policy_overrides", None),
                     )
                     if self._uses_status_as_activity_proxy(question, result.sql):
                         raise ValidationError(
@@ -239,16 +322,43 @@ class TextToSQLPipeline:
                     break
                 except ValueSafetyError as error:
                     col_key = error.column or ""
-                    is_restricted_col = (
-                        is_blocked(col_key)
-                        or is_masked(col_key)
-                        or (self.value_index is not None and col_key in getattr(self.value_index, "large_columns", set()))
+                    is_high_value_col = (
+                        self.value_index is not None
+                        and col_key in getattr(self.value_index, "large_columns", set())
                     )
+                    policy_overrides = getattr(self.value_index, "policy_overrides", None)
+                    is_restricted_col = is_blocked(
+                        col_key, policy_overrides=policy_overrides
+                    ) or is_masked(col_key, policy_overrides=policy_overrides)
                     safe_error_str = (
                         f"Literal filter on restricted column '{col_key}' rejected."
                         if is_restricted_col
+                        else (
+                            "An ambiguous value needs user confirmation."
+                            if error.kind == "ambiguous"
+                            else "No matching value found."
+                        )
+                        if is_high_value_col
                         else str(error)
                     )
+                    if is_high_value_col:
+                        if error.kind == "ambiguous":
+                            pending = getattr(self.value_index, "pending_confirmation", None) or {}
+                            result.ambiguous_values = [{
+                                "mention": pending.get("mention", ""),
+                                "ambiguous": True,
+                                "candidates": pending.get("candidates", []),
+                                "confidence": 0.0,
+                            }]
+                            result.answer = "Please confirm the highlighted value before I generate a query."
+                        else:
+                            result.run_details["value_resolution"] = "no matching value found"
+                            result.answer = "No matching value was found."
+                        result.errors.append(safe_error_str)
+                        result.sql = ""
+                        result.timings["total_ms"] = (time.monotonic() - total_started) * 1000
+                        record_run_details()
+                        return result
                     metric_terms = getattr(self.value_index, "metric_terms", set())
                     excluded_terms = getattr(self.value_index, "excluded_terms", set())
                     mention_words = {word.casefold() for word in error.mention.split()}
@@ -298,6 +408,7 @@ class TextToSQLPipeline:
                     else:
                         result.answer = "I couldn't verify all values in the generated query."
                     result.timings["total_ms"] = (time.monotonic() - total_started) * 1000
+                    record_run_details()
                     return result
 
                 execution_started = time.monotonic()
@@ -307,12 +418,21 @@ class TextToSQLPipeline:
                     result.columns = query_result.columns
                     # Apply masking for 'mask' columns
                     if result.rows and result.columns:
-                        masked_columns = [col for col in result.columns if is_masked(f"{result.tables_used[0] if result.tables_used else ''}.{col}".strip("."))]
+                        masked_columns = [
+                            col for col in result.columns
+                            if is_masked(
+                                f"{result.tables_used[0] if result.tables_used else ''}.{col}".strip("."),
+                                policy_overrides=getattr(self.value_index, "policy_overrides", None),
+                            )
+                        ]
                         # More robust: check all tables
                         mask_cols = set()
                         for col in result.columns:
                             for tbl in (result.tables_used or [""]):
-                                if is_masked(f"{tbl}.{col}"):
+                                if is_masked(
+                                    f"{tbl}.{col}",
+                                    policy_overrides=getattr(self.value_index, "policy_overrides", None),
+                                ):
                                     mask_cols.add(col)
                         if mask_cols:
                             for row in result.rows:
@@ -342,14 +462,6 @@ class TextToSQLPipeline:
                     closest_values = []
                     if nf.get("candidates"):
                         closest_values = [c.get("value", c) for c in nf["candidates"] if isinstance(c, dict)]
-                    if not closest_values and self.value_index:
-                        # Look up closest from score candidates
-                        try:
-                            col = nf.get("column")
-                            sc = self.value_index._score_candidates(nf["mention"], col, 5)
-                            closest_values = [c["value"] for c in sc[:3]]
-                        except Exception:
-                            pass
                     # For safety-net not_found, closest may be stored in candidates
                     if not closest_values:
                         # Check if candidates have value key (safety net stores them)
@@ -379,4 +491,5 @@ class TextToSQLPipeline:
             result.errors.append(str(error))
             result.answer = "The request could not be completed. Check the connection and try again."
         result.timings["total_ms"] = (time.monotonic() - total_started) * 1000
+        record_run_details()
         return result

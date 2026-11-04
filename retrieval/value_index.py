@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -97,6 +98,14 @@ class ValueIndex:
         cardinality_threshold: int = 500,
         embedder: Any = None,
         local_store: LocalVectorStore | None = None,
+        phrase_span_limit: int = 40,
+        top_k_per_span: int = 5,
+        high_cache_max_values: int = 20000,
+        high_cache_total_values: int = 200000,
+        high_db_lookup_limit: int = 20,
+        index_refresh_ttl_hours: float = 24.0,
+        database_overrides: dict[str, Any] | None = None,
+        policy_overrides: dict[str, Any] | None = None,
     ) -> None:
         self.adapter = adapter
         self.metadata = metadata
@@ -108,11 +117,54 @@ class ValueIndex:
         self.local_store = local_store
         self.build_success = True
         self.config = _load_config()
+        self.database_overrides = database_overrides or {}
+        self.policy_overrides = policy_overrides or (
+            get_policy_overrides(self.database_overrides)
+            if self.database_overrides
+            else get_policy_overrides()
+        )
+        resolution_overrides = self.database_overrides.get("value_resolution", {})
+        if isinstance(resolution_overrides, dict):
+            for key, value in resolution_overrides.items():
+                if isinstance(value, dict) and isinstance(self.config.get(key), dict):
+                    self.config[key] = {**self.config[key], **value}
+                elif isinstance(value, list) and isinstance(self.config.get(key), list):
+                    self.config[key] = list(dict.fromkeys([*self.config[key], *value]))
+                else:
+                    self.config[key] = value
+            synonyms = resolution_overrides.get("synonyms", {})
+            if isinstance(synonyms, dict):
+                cue_aliases = dict(self.config.get("cue_aliases", {}))
+                for semantic, terms in synonyms.items():
+                    cue_aliases[semantic] = list(dict.fromkeys([
+                        *cue_aliases.get(semantic, []), *terms
+                    ]))
+                self.config["cue_aliases"] = cue_aliases
         self.thresholds = self.config.get("thresholds", {})
         self.accept_score = float(self.thresholds.get("accept_score", 0.88))
         self.ambiguous_gap = float(self.thresholds.get("ambiguous_gap", 0.08))
         self.min_score = float(self.thresholds.get("min_score", 0.65))
         self.max_candidates = int(self.thresholds.get("max_candidates", 5))
+        self.phrase_span_limit = max(1, int(phrase_span_limit))
+        self.top_k_per_span = max(1, int(top_k_per_span))
+        self.high_cache_max_values = max(1, int(high_cache_max_values))
+        self.high_cache_total_values = max(1, int(high_cache_total_values))
+        self.high_db_lookup_limit = max(1, int(high_db_lookup_limit))
+        self.high_cache_ttl_seconds = max(0.0, float(index_refresh_ttl_hours) * 3600)
+        self.high_value_cache: OrderedDict[str, tuple[float, list[str] | None]] = OrderedDict()
+        self.high_value_cache_count = 0
+        self.high_resolution_cache: dict[tuple[str, str], dict[str, Any]] = {}
+        self.uncacheable_high_columns: set[str] = set()
+        self.call_counts = {
+            "embedding_calls": 0,
+            "faiss_searches": 0,
+        }
+        self.last_call_counts = {
+            "embedding_calls": 0,
+            "faiss_searches": 0,
+            "value_lookup_db_calls": 0,
+        }
+        self.unmatched_high_count = 0
         self.excluded_terms = {
             token.casefold()
             for token in self.config.get("excluded_terms", [])
@@ -171,6 +223,130 @@ class ValueIndex:
         self.scan_seconds = 0.0
         self.classify_seconds = 0.0
 
+    def reset_question_counts(self) -> None:
+        self.call_counts = {"embedding_calls": 0, "faiss_searches": 0}
+        self.unmatched_high_count = 0
+        self.high_resolution_cache.clear()
+
+    def _high_column_values(self, column_key: str) -> list[str] | None:
+        """Return a cached bounded high-cardinality column, or None when oversized."""
+        now = time.monotonic()
+        cached = self.high_value_cache.get(column_key)
+        if cached is not None:
+            expires_at, values = cached
+            if expires_at >= now:
+                self.high_value_cache.move_to_end(column_key)
+                return values
+            if values is not None:
+                self.high_value_cache_count -= len(values)
+            del self.high_value_cache[column_key]
+
+        table_name, column_name = column_key.rsplit(".", 1)
+        table_info = self.metadata.tables.get(table_name)
+        if table_info is None or column_name not in {col.name for col in table_info.columns}:
+            return None
+        self.call_counts["value_lookup_db_calls"] = self.call_counts.get(
+            "value_lookup_db_calls", 0
+        ) + 1
+        values = self.adapter.distinct_text_values(
+            table_info, column_name, self.high_cache_max_values + 1
+        )
+        expires_at = now + self.high_cache_ttl_seconds
+        if len(values) > self.high_cache_max_values:
+            self.high_value_cache[column_key] = (expires_at, None)
+            self.uncacheable_high_columns.add(column_key)
+            self._evict_high_columns()
+            return None
+
+        self.high_value_cache[column_key] = (expires_at, values)
+        self.high_value_cache_count += len(values)
+        self._evict_high_columns()
+        current = self.high_value_cache.get(column_key)
+        return current[1] if current is not None else None
+
+    def _evict_high_columns(self) -> None:
+        while (
+            self.high_value_cache_count > self.high_cache_total_values
+            or len(self.high_value_cache) > self.high_cache_total_values
+        ) and self.high_value_cache:
+            _, (_, values) = self.high_value_cache.popitem(last=False)
+            if values is not None:
+                self.high_value_cache_count -= len(values)
+
+    def resolve_high_value(self, column_key: str, mention: str) -> dict[str, Any]:
+        """Resolve VALUE_HIGH text locally; oversized columns use a bounded SQL lookup."""
+        cache_key = (column_key, mention.casefold())
+        cached_result = self.high_resolution_cache.get(cache_key)
+        if cached_result is not None:
+            return dict(cached_result)
+        self.call_counts.setdefault("value_lookup_db_calls", 0)
+        if column_key not in self.large_columns:
+            return {"status": "not_found", "candidates": []}
+        values = self._high_column_values(column_key)
+        if values is None:
+            table_name, column_name = column_key.rsplit(".", 1)
+            table_info = self.metadata.tables.get(table_name)
+            if table_info is None or column_name not in {col.name for col in table_info.columns}:
+                self.unmatched_high_count += 1
+                return {"status": "not_found", "candidates": []}
+            self.call_counts["value_lookup_db_calls"] = self.call_counts.get(
+                "value_lookup_db_calls", 0
+            ) + 1
+            candidates = self.adapter.lookup_text_candidates(
+                table_info, column_name, mention, self.high_db_lookup_limit
+            )
+        else:
+            candidates = values
+
+        exact = [value for value in candidates if value == mention]
+        if exact:
+            result = {"status": "resolved", "value": exact[0], "candidates": []}
+            self.high_resolution_cache[cache_key] = result
+            return dict(result)
+        casefolded = [value for value in candidates if value.casefold() == mention.casefold()]
+        if len(casefolded) == 1:
+            result = {"status": "resolved", "value": casefolded[0], "candidates": []}
+            self.high_resolution_cache[cache_key] = result
+            return dict(result)
+        if len(casefolded) > 1:
+            result = {"status": "ambiguous", "candidates": casefolded[:self.max_candidates]}
+            self.high_resolution_cache[cache_key] = result
+            return dict(result)
+
+        matches = process.extract(
+            mention,
+            candidates,
+            scorer=_mention_value_score,
+            limit=min(self.max_candidates + 1, len(candidates)),
+        )
+        scored = [
+            {"column": column_key, "value": str(value), "confidence": score / 100}
+            for value, score, _ in matches
+            if score / 100 >= self.min_score
+        ]
+        if not scored:
+            self.unmatched_high_count += 1
+            result = {"status": "not_found", "candidates": []}
+            self.high_resolution_cache[cache_key] = result
+            return dict(result)
+        best = scored[0]
+        close = [
+            item for item in scored
+            if best["confidence"] - item["confidence"] < self.ambiguous_gap
+        ]
+        if best["confidence"] >= self.accept_score and len(close) == 1:
+            result = {"status": "resolved", "value": best["value"], "candidates": []}
+            self.high_resolution_cache[cache_key] = result
+            return dict(result)
+        if len(close) > 1:
+            result = {"status": "ambiguous", "candidates": close[:self.max_candidates]}
+            self.high_resolution_cache[cache_key] = result
+            return dict(result)
+        self.unmatched_high_count += 1
+        result = {"status": "not_found", "candidates": []}
+        self.high_resolution_cache[cache_key] = result
+        return dict(result)
+
     def _is_internal_table(self, table: Any) -> bool:
         """Recognize common metadata/index structures by name or by structural columns."""
         if is_internal_table_name(table.name):
@@ -181,14 +357,27 @@ class ValueIndex:
             or {"embedding", "relationships", "business_relevance"}.issubset(names)
         )
 
+    def _table_policy_fingerprint(self, table_name: str) -> str:
+        bare_name = table_name.rsplit(".", 1)[-1].casefold()
+        scoped = {}
+        for action in (
+            "force_block", "force_mask", "force_allow", "force_value_low", "force_value_high"
+        ):
+            scoped[action] = sorted(
+                target
+                for target in self.policy_overrides.get(action, [])
+                if str(target).rsplit(".", 1)[0].casefold() in {table_name.casefold(), bare_name}
+            )
+        payload = json.dumps(scoped, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     def _is_value_column(self, column: Any, table_name: str = "") -> bool:
         """Check column eligibility using the unified classifier."""
-        policy_overrides = get_policy_overrides()
         col_class, _ = classify_catalog_column(
             table_name=table_name,
             column_name=column.name,
             sql_type=column.type,
-            overrides=policy_overrides,
+            overrides=self.policy_overrides,
             cardinality_threshold=self.threshold,
         )
         return col_class not in (ColumnClass.BLOCKED, ColumnClass.MASKED, ColumnClass.SKIP)
@@ -345,6 +534,7 @@ class ValueIndex:
         return (
             {
                 "fingerprint": table_fingerprint,
+                "policy_fingerprint": self._table_policy_fingerprint(table_info.name),
                 "column_fingerprints": column_fingerprints,
                 "columns": columns,
             },
@@ -411,7 +601,7 @@ class ValueIndex:
         self.scanned_tables = 0
         self.scan_seconds = 0.0
         scan_started = time.perf_counter()
-        policy_overrides = get_policy_overrides()
+        policy_overrides = self.policy_overrides
         previous_cache = classification_cache or {}
         prior_scan_times = dict(last_value_scan_at or {})
         now_value = time.time() if now is None else float(now)
@@ -432,6 +622,8 @@ class ValueIndex:
             if (
                 cached is None
                 or cached.get("fingerprint") != table_fingerprints.get(table_name)
+                or cached.get("policy_fingerprint")
+                != self._table_policy_fingerprint(table_name)
             ):
                 tables_to_process.add(table_name)
 
@@ -584,80 +776,121 @@ class ValueIndex:
             })
         return rows
 
-    def _score_candidates(self, mention: str, column: str | None, top_k: int) -> list[dict[str, Any]]:
-        candidate_values = [
-            (key, value)
-            for key, values in self.values.items()
-            if column is None or key == column
-            for value in values
-            if not self._is_schema_value(value)
-        ]
-        unique = list(dict.fromkeys(candidate_values))
-        if not unique:
+    def _score_candidate_batch(
+        self,
+        mentions: list[str],
+        columns: list[str | None],
+        top_k: int,
+    ) -> list[list[dict[str, Any]]]:
+        """Embed spans once and score only the bounded FAISS shortlist per span."""
+        self.last_call_counts = {
+            "embedding_calls": 0,
+            "faiss_searches": 0,
+            "value_lookup_db_calls": 0,
+        }
+        if not mentions:
             return []
-        lexical_matches = process.extract(
-            mention,
-            [value for _, value in unique],
-            scorer=_mention_value_score,
-            limit=len(unique),
-        )
-        lexical_scores = {index: score / 100 for _, score, index in lexical_matches}
-        query_embedding = self.embedder.embed([mention])[0] if self.embedder is not None else None
-        vector_scores: dict[tuple[str, str], float] = {}
-        if query_embedding is not None and self.local_store is not None:
-            table_filter, column_filter = (column.rsplit(".", 1) if column else (None, None))
-            search_results = self.local_store.search_values(
-                query_embedding,
-                top_k=len(unique),
-                table=table_filter,
-                column=column_filter,
-            )
-            vector_scores = {
-                (f"{item['table_name']}.{item['column_name']}", item["value"]): item["similarity"]
-                for item in search_results
-            }
-        candidates = []
-        for index, (candidate_column, value) in enumerate(unique):
-            lexical_score = lexical_scores.get(index, 0.0)
-            vector_score = vector_scores.get((candidate_column, value), 0.0)
-            if query_embedding is not None and self.local_store is None and candidate_column in self.embeddings:
-                indexed_values = self.values.get(candidate_column, [])
-                try:
-                    value_vector = self.embeddings[candidate_column][indexed_values.index(value)]
-                    denominator = np.linalg.norm(query_embedding) * np.linalg.norm(value_vector)
-                    vector_score = max(0.0, float(np.dot(query_embedding, value_vector) / denominator)) if denominator else 0.0
-                except (ValueError, IndexError):
-                    vector_score = 0.0
-            confidence = max(
-                lexical_score,
-                0.8 * lexical_score + 0.2 * vector_score if query_embedding is not None else lexical_score,
-            )
-            if mention.casefold() == value.casefold():
-                confidence = 1.0
-            candidates.append({
-                "column": candidate_column,
-                "value": value,
-                "confidence": confidence,
-            })
 
-        # Boost unique token-subset/prefix matches per column
-        from collections import defaultdict
-        by_column: dict[str, list[int]] = defaultdict(list)
-        for i, cand in enumerate(candidates):
-            by_column[cand["column"]].append(i)
-        for indices in by_column.values():
-            subset_indices = [
-                i for i in indices
-                if _is_token_subset_or_prefix(mention, candidates[i]["value"])
-            ]
-            if len(subset_indices) == 1:
-                # Unique token-subset/prefix match in this column -> strong signal
-                candidates[subset_indices[0]]["confidence"] = max(
-                    candidates[subset_indices[0]]["confidence"], 0.95
+        query_embeddings = None
+        if self.embedder is not None:
+            query_embeddings = self.embedder.embed(mentions)
+            self.call_counts["embedding_calls"] = self.call_counts.get("embedding_calls", 0) + 1
+
+        search_limit = min(max(1, int(top_k)), self.top_k_per_span)
+        scored: list[list[dict[str, Any]]] = []
+        exact_by_column = {
+            key: {value.casefold(): value for value in values}
+            for key, values in self.values.items()
+        }
+
+        for position, mention in enumerate(mentions):
+            column = columns[position]
+            exact_value = None
+            exact_column = column
+            if column is not None:
+                exact_value = exact_by_column.get(column, {}).get(mention.casefold())
+            else:
+                for candidate_column, value_map in exact_by_column.items():
+                    match = value_map.get(mention.casefold())
+                    if match is not None:
+                        exact_column, exact_value = candidate_column, match
+                        break
+
+            if query_embeddings is not None and self.local_store is not None:
+                table_filter, column_filter = (
+                    column.rsplit(".", 1) if column else (None, None)
                 )
+                search_results = self.local_store.search_values(
+                    query_embeddings[position:position + 1],
+                    top_k=search_limit,
+                    table=table_filter,
+                    column=column_filter,
+                )
+                self.last_call_counts["faiss_searches"] += 1
+                self.call_counts["faiss_searches"] = self.call_counts.get("faiss_searches", 0) + 1
+                candidates = []
+                for item in search_results:
+                    candidate_column = f"{item['table_name']}.{item['column_name']}"
+                    value = str(item["value"])
+                    lexical_score = _mention_value_score(mention, value) / 100
+                    vector_score = max(0.0, float(item.get("similarity", 0.0)))
+                    confidence = max(lexical_score, 0.8 * lexical_score + 0.2 * vector_score)
+                    if mention.casefold() == value.casefold():
+                        confidence = 1.0
+                    candidates.append({
+                        "column": candidate_column,
+                        "value": value,
+                        "confidence": confidence,
+                    })
+            else:
+                candidate_values = [
+                    (key, value)
+                    for key, values in self.values.items()
+                    if column is None or key == column
+                    for value in values
+                    if not self._is_schema_value(value)
+                ]
+                matches = process.extract(
+                    mention,
+                    [value for _, value in candidate_values],
+                    scorer=_mention_value_score,
+                    limit=search_limit,
+                )
+                candidates = [
+                    {
+                        "column": candidate_values[index][0],
+                        "value": candidate_values[index][1],
+                        "confidence": score / 100,
+                    }
+                    for _, score, index in matches
+                ]
 
-        candidates.sort(key=lambda candidate: candidate["confidence"], reverse=True)
-        return candidates[:top_k]
+            if exact_value is not None and exact_column is not None:
+                candidates = [
+                    item for item in candidates
+                    if (item["column"], item["value"]) != (exact_column, exact_value)
+                ]
+                candidates.insert(0, {
+                    "column": exact_column,
+                    "value": exact_value,
+                    "confidence": 1.0,
+                })
+
+            subset_matches = [
+                item for item in candidates
+                if _is_token_subset_or_prefix(mention, item["value"])
+            ]
+            if len(subset_matches) == 1:
+                subset_matches[0]["confidence"] = max(
+                    subset_matches[0]["confidence"], 0.95
+                )
+            candidates.sort(key=lambda item: item["confidence"], reverse=True)
+            scored.append(candidates[:search_limit])
+        return scored
+
+    def _score_candidates(self, mention: str, column: str | None, top_k: int) -> list[dict[str, Any]]:
+        """Score one mention through the same bounded batch path used per question."""
+        return self._score_candidate_batch([mention], [column], top_k)[0]
 
     def resolve(self, mention: str, column: str | None = None, top_k: int = 5) -> dict[str, Any]:
         """Apply configured accept/ambiguity thresholds for one mention."""
@@ -681,15 +914,24 @@ class ValueIndex:
     def _cue_columns(self, words: set[str]) -> set[str]:
         """Map configured cue terms to reflected columns without table literals in code."""
         result: set[str] = set()
+        eligible_columns = set(self.values) | self.large_columns
         cues = self.config.get("cue_aliases", {})
         for semantic, cue_words in cues.items():
             if not words.intersection({word.casefold() for word in cue_words}):
                 continue
-            for column in self.values:
+            for column in eligible_columns:
                 table_name, column_name = column.rsplit(".", 1)
                 vocabulary = _word_forms(table_name) | _word_forms(column_name)
                 if semantic in vocabulary or any(alias.casefold() in vocabulary for alias in cue_words):
                     result.add(column)
+        if not result:
+            for column in eligible_columns:
+                _, column_name = column.rsplit(".", 1)
+                column_words = _word_forms(column_name)
+                result.update(
+                    key for key in eligible_columns
+                    if key == column and words.intersection(column_words)
+                )
         return result
 
     def _eligible_tokens(self, question: str) -> list[tuple[str, int, int]]:
@@ -724,7 +966,10 @@ class ValueIndex:
                 if not mention or any(_NUMBER_RE.search(word) for word in mention_tokens):
                     continue
                 spans.append({"mention": mention, "start": start, "end": end, "tokens": mention_tokens})
-        return spans
+        if len(spans) <= self.phrase_span_limit:
+            return spans
+        stride = len(spans) / self.phrase_span_limit
+        return [spans[int(index * stride)] for index in range(self.phrase_span_limit)]
 
     def _direct_cue_value(self, question: str, span: dict[str, Any]) -> tuple[str | None, set[str]]:
         """Find a category/product/city/department cue immediately before or after a mention."""
@@ -733,6 +978,11 @@ class ValueIndex:
         after = question[span["end"]:]
         after_words = [match.group().casefold() for match in _TOKEN_RE.finditer(after)]
         cue_aliases = self.config.get("cue_aliases", {})
+        known_column_cues = {
+            word
+            for key in set(self.values) | self.large_columns
+            for word in _word_forms(key.rsplit(".", 1)[-1])
+        }
         for semantic, aliases in cue_aliases.items():
             alias_set = {alias.casefold() for alias in aliases}
             if before_words and before_words[-1] in alias_set:
@@ -741,6 +991,9 @@ class ValueIndex:
             if after_words and after_words[0] in alias_set:
                 columns = self._cue_columns({semantic.casefold()})
                 return semantic, columns
+        for cue_word in (*before_words[-1:], *after_words[:1]):
+            if cue_word in known_column_cues:
+                return cue_word, self._cue_columns({cue_word})
         return None, set()
 
     def _is_cued_metric_mention(self, question: str, mention: str, cue: str | None) -> bool:
@@ -762,6 +1015,8 @@ class ValueIndex:
         """Resolve only value-like phrases, apply cue/not-found rules, then prune overlaps."""
         spans = self._candidate_spans(question)
         output: list[dict[str, Any]] = []
+        eligible_spans: list[dict[str, Any]] = []
+        cue_columns_by_span: list[set[str]] = []
         for span in spans:
             mention = span["mention"]
             cue, cue_columns = self._direct_cue_value(question, span)
@@ -769,11 +1024,78 @@ class ValueIndex:
             # Metric-like words ("sales") only count when a cue names their type.
             if not self._is_cued_metric_mention(question, mention, cue):
                 continue
+            eligible_spans.append(span)
+            cue_columns_by_span.append(cue_columns)
 
-            matches = self._score_candidates(mention, None, max(top_k, self.max_candidates))
+        low_value_spans = [
+            (span, columns)
+            for span, columns in zip(eligible_spans, cue_columns_by_span, strict=True)
+            if not columns or not columns.issubset(self.large_columns)
+        ]
+        scored_by_span = self._score_candidate_batch(
+            [span["mention"] for span, _ in low_value_spans],
+            [next(iter(columns)) if len(columns) == 1 else None for _, columns in low_value_spans],
+            min(max(top_k, self.max_candidates), self.top_k_per_span),
+        )
+        score_lookup = {
+            id(span): matches
+            for (span, _), matches in zip(low_value_spans, scored_by_span, strict=True)
+        }
+        for span, cue_columns, matches in zip(
+            eligible_spans,
+            cue_columns_by_span,
+            [score_lookup.get(id(span), []) for span in eligible_spans],
+            strict=True,
+        ):
+            mention = span["mention"]
             if cue_columns:
                 matches = [candidate for candidate in matches if candidate["column"] in cue_columns]
             matches = [candidate for candidate in matches if candidate["confidence"] >= self.min_score]
+            high_columns = cue_columns & self.large_columns
+            high_resolutions = [
+                (column, self.resolve_high_value(column, mention))
+                for column in sorted(high_columns)
+            ]
+            high_resolutions = [
+                (column, resolution)
+                for column, resolution in high_resolutions
+                if resolution["status"] != "not_found"
+            ]
+            if high_resolutions:
+                if len(high_resolutions) > 1 or any(
+                    resolution["status"] == "ambiguous"
+                    for _, resolution in high_resolutions
+                ):
+                    candidates = [
+                        candidate
+                        for column, resolution in high_resolutions
+                        for candidate in resolution.get("candidates", [])
+                        or ([{"column": column, "value": resolution["value"], "confidence": 1.0}]
+                            if resolution.get("status") == "resolved" else [])
+                    ]
+                    output.append({
+                        "mention": mention,
+                        "ambiguous": True,
+                        "high_cardinality": True,
+                        "candidates": candidates[:self.max_candidates],
+                        "confidence": 0.0,
+                        "start": span["start"],
+                        "end": span["end"],
+                        "exact_match": False,
+                    })
+                else:
+                    column, resolution = high_resolutions[0]
+                    output.append({
+                        "mention": mention,
+                        "column": column,
+                        "value": resolution["value"],
+                        "high_cardinality": True,
+                        "confidence": 1.0,
+                        "start": span["start"],
+                        "end": span["end"],
+                        "exact_match": mention.casefold() == resolution["value"].casefold(),
+                    })
+                continue
             if matches:
                 best = matches[0]
                 close = [
@@ -816,6 +1138,7 @@ class ValueIndex:
                     "start": span["start"],
                     "end": span["end"],
                     "exact_match": False,
+                    "high_cardinality": bool(high_columns),
                 })
 
         def overlap_sort_key(item: dict[str, Any]) -> tuple:

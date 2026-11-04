@@ -39,6 +39,16 @@ class DatabaseAdapter:
         self.url = make_url(database_url) if isinstance(database_url, str) else database_url
         self.engine = engine or sa.create_engine(self.url, pool_pre_ping=True)
         self.timeout_seconds = max(1, timeout_seconds)
+        self.call_counts = {
+            "value_lookup_db_calls": 0,
+            "explain_db_calls": 0,
+            "execution_db_calls": 0,
+        }
+
+    def reset_call_counts(self) -> None:
+        """Reset per-question target database operation counters."""
+        for key in self.call_counts:
+            self.call_counts[key] = 0
 
     def connect(self) -> Any:
         """Open a connection, wrapping errors without exposing credentials."""
@@ -129,6 +139,7 @@ class DatabaseAdapter:
 
     def run_readonly_query(self, sql: str, max_rows: int = 100) -> QueryResult:
         """Execute pre-validated SQL using supported read-only settings and a row bound."""
+        self.call_counts["execution_db_calls"] += 1
         connection = self.connect()
         started = time.monotonic()
         sqlite_raw = None
@@ -173,6 +184,7 @@ class DatabaseAdapter:
 
     def explain(self, sql: str) -> str | None:
         """Return an execution plan using a read-only transaction where supported."""
+        self.call_counts["explain_db_calls"] += 1
         dialect = self.get_dialect()
         if dialect not in {"postgresql", "mysql", "sqlite", "mariadb"}:
             return None
@@ -203,3 +215,74 @@ class DatabaseAdapter:
             return None
         finally:
             connection.close()
+
+    def distinct_text_values(self, table_info: Any, column_name: str, limit: int) -> list[str]:
+        """Fetch at most ``limit`` distinct non-null strings under read-only controls."""
+        columns = {column.name for column in table_info.columns}
+        if column_name not in columns:
+            return []
+        table_name = table_info.name.rsplit(".", 1)[-1]
+        table = sa.table(
+            table_name,
+            *(sa.column(column.name, sa.String()) for column in table_info.columns),
+            schema=table_info.schema,
+        )
+        column = table.c[column_name]
+        statement = (
+            sa.select(column)
+            .where(column.is_not(None))
+            .distinct()
+            .limit(max(1, int(limit)))
+        )
+        self.call_counts["value_lookup_db_calls"] += 1
+        try:
+            with self.readonly_connection() as connection:
+                return [str(row[0]) for row in connection.execute(statement).fetchall()]
+        except sa.exc.SQLAlchemyError:
+            raise DatabaseUnavailableError(
+                "A bounded value lookup could not be completed."
+            ) from None
+
+    def lookup_text_candidates(
+        self,
+        table_info: Any,
+        column_name: str,
+        text: str,
+        limit: int,
+    ) -> list[str]:
+        """Use a parameterized, escaped case-insensitive LIKE lookup with a hard row cap."""
+        columns = {column.name for column in table_info.columns}
+        if column_name not in columns:
+            return []
+        table_name = table_info.name.rsplit(".", 1)[-1]
+        table = sa.table(
+            table_name,
+            *(sa.column(column.name, sa.String()) for column in table_info.columns),
+            schema=table_info.schema,
+        )
+        column = table.c[column_name]
+        escaped_text = text.casefold().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped_text}%"
+        exact_order = sa.case(
+            (sa.func.lower(column) == sa.func.lower(sa.bindparam("exact_text")), 0),
+            else_=1,
+        )
+        statement = (
+            sa.select(column)
+            .where(sa.func.lower(column).like(sa.bindparam("pattern"), escape="\\"))
+            .group_by(column)
+            .order_by(exact_order)
+            .limit(max(1, int(limit)))
+        )
+        self.call_counts["value_lookup_db_calls"] += 1
+        try:
+            with self.readonly_connection() as connection:
+                rows = connection.execute(
+                    statement,
+                    {"pattern": pattern, "exact_text": text},
+                ).fetchall()
+                return [str(row[0]) for row in rows]
+        except sa.exc.SQLAlchemyError:
+            raise DatabaseUnavailableError(
+                "A bounded value lookup could not be completed."
+            ) from None

@@ -37,6 +37,12 @@ class Settings:
     index_refresh_ttl_hours: float = 24.0
     index_scan_workers: int = 1
     embed_cache_max_entries: int = 250000
+    value_phrase_span_limit: int = 40
+    value_top_k_per_span: int = 5
+    value_high_cache_max_values: int = 20000
+    value_high_cache_total_values: int = 200000
+    value_high_db_lookup_limit: int = 20
+    send_high_cardinality_values_to_llm: bool = False
 
     @classmethod
     def from_env(cls, dotenv_path: str | None = None) -> "Settings":
@@ -87,5 +93,24 @@ class Settings:
             ),
             embed_cache_max_entries=max(
                 1, int(os.getenv("EMBED_CACHE_MAX_ENTRIES", "250000"))
+            ),
+            value_phrase_span_limit=max(
+                1, int(os.getenv("VALUE_PHRASE_SPAN_LIMIT", "40"))
+            ),
+            value_top_k_per_span=max(
+                1, int(os.getenv("VALUE_TOP_K_PER_SPAN", "5"))
+            ),
+            value_high_cache_max_values=max(
+                1, int(os.getenv("VALUE_HIGH_CACHE_MAX_VALUES", "20000"))
+            ),
+            value_high_cache_total_values=max(
+                1, int(os.getenv("VALUE_HIGH_CACHE_TOTAL_VALUES", "200000"))
+            ),
+            value_high_db_lookup_limit=max(
+                1, int(os.getenv("VALUE_HIGH_DB_LOOKUP_LIMIT", "20"))
+            ),
+            send_high_cardinality_values_to_llm=(
+                os.getenv("SEND_HIGH_CARDINALITY_VALUES_TO_LLM", "false").casefold()
+                in {"1", "true", "yes", "on"}
             ),
         )

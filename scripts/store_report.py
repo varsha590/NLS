@@ -12,6 +12,8 @@ import faiss
 
 from config.settings import Settings
 from db.adapter import DatabaseAdapter
+from catalog.introspect import introspect_catalog
+from config.data_policy import load_database_overrides
 
 
 def _read_json(path: Path) -> Any:
@@ -28,7 +30,12 @@ def _matches_checksum(path: Path, expected: str | None) -> bool:
     return digest == expected
 
 
-def format_store_report(root: str | Path, namespace: str) -> str:
+def format_store_report(
+    root: str | Path,
+    namespace: str,
+    stale_overrides: list[str] | None = None,
+    override_warnings: list[str] | None = None,
+) -> str:
     """Return classes, counts, and manifest metadata; never format value text."""
     store_path = Path(root) / namespace
     manifest = _read_json(store_path / "manifest.json") or {}
@@ -94,6 +101,13 @@ def format_store_report(root: str | Path, namespace: str) -> str:
             )
     if not vector_file_valid and values_meta:
         lines.append("Vector status: invalid or unavailable")
+    lines.extend(["", "STALE OVERRIDES"])
+    if stale_overrides:
+        lines.extend(f"  {name}" for name in stale_overrides)
+    else:
+        lines.append("  none")
+    for warning in override_warnings or []:
+        lines.append(f"Override warning: {warning}")
     return "\n".join(lines)
 
 
@@ -103,7 +117,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     settings = Settings.from_env()
     adapter = DatabaseAdapter(settings.database_url, settings.query_timeout_seconds)
-    print(format_store_report(args.root or settings.vector_store_path, adapter.namespace()))
+    metadata = introspect_catalog(
+        adapter.engine,
+        allowed_schemas=settings.allowed_schemas,
+        excluded_tables=settings.excluded_tables,
+    )
+    overrides_path = Path(settings.vector_store_path) / adapter.namespace() / "overrides.yaml"
+    _, stale_overrides, override_warnings = load_database_overrides(
+        overrides_path, metadata
+    )
+    print(format_store_report(
+        args.root or settings.vector_store_path,
+        adapter.namespace(),
+        stale_overrides,
+        override_warnings,
+    ))
     return 0
 
 

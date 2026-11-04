@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from catalog.classifier import is_candidate_text_column, parse_enum_options
 from catalog.introspect import introspect_catalog
-from config.data_policy import get_policy_overrides
+from config.data_policy import get_policy_overrides, load_database_overrides
 from config.settings import Settings
 from db.adapter import DatabaseAdapter
 from llm.generator import GroqGenerator
@@ -32,13 +32,29 @@ LOGGER = logging.getLogger(__name__)
 _runtime: dict[str, Any] = {}
 
 
-def _config_policy_hash(threshold: int) -> str:
-    """Fingerprint policy/config inputs that affect index eligibility and content."""
+def _generic_policy_hash(threshold: int) -> str:
+    """Fingerprint generic policy/config inputs that affect every table."""
     digest = hashlib.sha256()
     root = Path(__file__).resolve().parents[1]
     for relative_path in ("config/data_policy.yaml", "config/value_resolution.yaml"):
         digest.update((root / relative_path).read_bytes())
     digest.update(str(threshold).encode("ascii"))
+    return digest.hexdigest()
+
+
+def _config_policy_hash(threshold: int) -> str:
+    """Fingerprint generic policy/config inputs that affect every table."""
+    return _generic_policy_hash(threshold)
+
+
+def _namespace_policy_hash(threshold: int, overrides_path: Path) -> str:
+    """Fingerprint generic policy plus the active namespace's overrides file."""
+    digest = hashlib.sha256()
+    digest.update(_config_policy_hash(threshold).encode("ascii"))
+    if overrides_path.is_file():
+        digest.update(overrides_path.read_bytes())
+    else:
+        digest.update(b"no-database-overrides")
     return digest.hexdigest()
 
 
@@ -125,8 +141,11 @@ def _schema_fingerprints(metadata: Any) -> tuple[dict[str, str], str]:
     return table_fingerprints, global_fingerprint
 
 
-def _scan_eligible_tables(metadata: Any) -> set[str]:
-    overrides = get_policy_overrides()
+def _scan_eligible_tables(
+    metadata: Any,
+    policy_overrides: dict[str, Any] | None = None,
+) -> set[str]:
+    overrides = policy_overrides if policy_overrides is not None else get_policy_overrides()
     result: set[str] = set()
     for table in metadata.tables.values():
         if is_internal_table_name(table.name):
@@ -141,6 +160,7 @@ def _scan_eligible_tables(metadata: Any) -> set[str]:
                     is_foreign_key=column.is_foreign_key,
                     overrides=overrides,
                 )
+                and column.enum_options is None
                 and parse_enum_options(column.data_type) is None
             ):
                 result.add(table.name)
@@ -162,12 +182,14 @@ def init_app(
         connection.close()
 
     embedding_model = EmbeddingModel(settings.embedding_model)
+    overrides_path = Path(settings.vector_store_path) / adapter.namespace() / "overrides.yaml"
+    generic_policy_hash = _config_policy_hash(settings.value_cardinality_threshold)
     local_store = LocalVectorStore(
         root=settings.vector_store_path,
         namespace=adapter.namespace(),
         model_name=embedding_model.model_name,
         dimension=embedding_model.dim,
-        policy_hash=_config_policy_hash(settings.value_cardinality_threshold),
+        policy_hash=_namespace_policy_hash(settings.value_cardinality_threshold, overrides_path),
         example_candidate_limit=settings.example_candidate_limit,
         clock=clock,
         embed_cache_max_entries=settings.embed_cache_max_entries,
@@ -180,18 +202,27 @@ def init_app(
         excluded_tables=settings.excluded_tables,
     )
     introspect_seconds = time.perf_counter() - introspect_started
+    database_overrides, stale_overrides, override_warnings = load_database_overrides(
+        overrides_path, metadata
+    )
+    policy_overrides = get_policy_overrides(database_overrides)
     table_fingerprints, global_fingerprint = _schema_fingerprints(metadata)
-    scan_tables = _scan_eligible_tables(metadata)
+    scan_tables = _scan_eligible_tables(metadata, policy_overrides)
     now = clock() if clock is not None else time.time()
     previous_manifest = local_store.manifest
     old_table_fingerprints = previous_manifest.get("table_fingerprints", {})
     old_scan_times = previous_manifest.get("last_value_scan_at", {})
     policy_changed = previous_manifest.get("config_policy_hash") != local_store.policy_hash
+    generic_policy_changed = (
+        previous_manifest.get("generic_policy_hash") != generic_policy_hash
+    )
     changed_tables = {
         table_name
         for table_name, fingerprint in table_fingerprints.items()
         if old_table_fingerprints.get(table_name) != fingerprint
     }
+    if generic_policy_changed:
+        changed_tables.update(table_fingerprints)
     force_rebuild = bool(force)
     fast_path = not force_rebuild and local_store.fast_path_valid(
         global_fingerprint,
@@ -206,6 +237,14 @@ def init_app(
         cardinality_threshold=settings.value_cardinality_threshold,
         embedder=embedding_model,
         local_store=local_store,
+        phrase_span_limit=settings.value_phrase_span_limit,
+        top_k_per_span=settings.value_top_k_per_span,
+        high_cache_max_values=settings.value_high_cache_max_values,
+        high_cache_total_values=settings.value_high_cache_total_values,
+        high_db_lookup_limit=settings.value_high_db_lookup_limit,
+        index_refresh_ttl_hours=settings.index_refresh_ttl_hours,
+        database_overrides=database_overrides,
+        policy_overrides=policy_overrides,
     )
     index_metrics: dict[str, Any] = {
         "path": "fast_path" if fast_path else "rebuild",
@@ -236,7 +275,7 @@ def init_app(
         schema_changed = (
             force_rebuild
             or not local_store.part_is_valid("schema")
-            or policy_changed
+            or generic_policy_changed
             or bool(changed_tables)
             or set(old_table_fingerprints) != set(table_fingerprints)
         )
@@ -262,7 +301,7 @@ def init_app(
         value_index.build_incremental(
             classification_cache=local_store.classification_cache,
             table_fingerprints=table_fingerprints,
-            changed_tables=changed_tables | (set(table_fingerprints) if policy_changed else set()),
+            changed_tables=changed_tables,
             stale_tables=stale_tables,
             value_part_valid=local_store.part_is_valid("values"),
             reuse_value_metadata=local_store.part_metadata_is_valid("values"),
@@ -317,6 +356,7 @@ def init_app(
             last_value_scan_at=next_scan_times,
             classification_cache=value_index.classification_cache,
             incomplete_tables=incomplete_tables,
+            generic_policy_hash=generic_policy_hash,
         )
         state_save_seconds = time.perf_counter() - state_save_started
         index_metrics["stages"].update({
@@ -359,7 +399,12 @@ def init_app(
             },
         )
 
-    retriever = HybridSchemaRetriever(metadata, embedding_model, local_store=local_store)
+    retriever = HybridSchemaRetriever(
+        metadata,
+        embedding_model,
+        local_store=local_store,
+        policy_overrides=policy_overrides,
+    )
     generator = GroqGenerator(settings.groq_api_key, settings.llm_model)
     examples = ExampleStore(
         settings.vector_store_path,
@@ -378,6 +423,7 @@ def init_app(
         max_retries=settings.max_retries,
         schema_top_k=settings.schema_top_k,
         value_top_k=settings.value_top_k,
+        send_high_cardinality_values_to_llm=settings.send_high_cardinality_values_to_llm,
     )
 
     catalog_status = (
@@ -401,6 +447,9 @@ def init_app(
         "index_complete": index_complete,
         "incomplete_tables": incomplete_tables,
         "index_metrics": index_metrics,
+        "stale_overrides": stale_overrides,
+        "override_warnings": override_warnings,
+        "overrides_path": str(overrides_path),
     }
     _runtime.clear()
     _runtime.update(runtime)

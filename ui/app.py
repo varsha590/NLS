@@ -31,6 +31,14 @@ def _render_sidebar(runtime: dict[str, Any]) -> None:
     st.sidebar.metric("Tables indexed", runtime["indexed_tables"])
     catalog_status = runtime.get("catalog_status", "unknown")
     st.sidebar.caption(f"Schema index: {catalog_status}")
+    stale_overrides = runtime.get("stale_overrides", [])
+    if stale_overrides:
+        st.sidebar.warning(
+            "STALE OVERRIDES: " + ", ".join(stale_overrides),
+            icon=":material/warning:",
+        )
+    for warning in runtime.get("override_warnings", []):
+        st.sidebar.warning(warning, icon=":material/warning:")
     index_metrics = runtime.get("index_metrics", {})
     index_age = float(index_metrics.get("index_age_seconds", 0.0))
     st.sidebar.caption(f"Index age: {index_age / 3600:.1f} hours")
@@ -162,6 +170,10 @@ def _render_result(result: dict[str, Any], question: str, runtime: dict[str, Any
         with st.expander("Run details"):
             st.write(f"Tables used: {', '.join(result.get('tables_used', [])) or 'None'}")
             st.write(f"Retries: {result.get('retries', 0)}")
+            st.write("Operation counts")
+            st.json(result.get("call_counts", {}))
+            if result.get("run_details"):
+                st.write(result["run_details"])
             st.json(result["timings"])
             index_metrics = runtime.get("index_metrics", {})
             st.write(

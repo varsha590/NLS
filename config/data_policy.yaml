@@ -31,8 +31,7 @@ patterns:
     - lng
 
 overrides:
-  force_block:
-    - customers.email
+  force_block: []
   force_mask: []
   force_allow: []
   force_value_low: []
