@@ -4,6 +4,10 @@
 
 Dataset registration is available in Streamlit for `.sql` schema dumps and SQLite `.db` uploads. SQL files are parsed, never executed; SQLite uploads are inspected read-only. Question generation and query execution are not connected to registered datasets yet and are planned for Step 4. Until then, the app is an ingestion and schema-preview workflow, not a working search interface. A `.sql` upload does not create a live database.
 
+For `.sql` files, the current parser extracts `CREATE TABLE`, foreign-key `ALTER TABLE`, and literal multi-row `INSERT ... VALUES` statements. MySQL `INSERT IGNORE` and version comments are tolerated. PostgreSQL `COPY FROM stdin` blocks are skipped, not imported. Procedure, trigger, view, `DELIMITER`, `SET`, and `LOCK` statements are ignored. Low-cardinality literal insert values are persisted only after sensitive-name and PII-shape checks. SQLite `.db` files use read-only inspection plus bounded `SELECT DISTINCT` scans (`LOW_CARDINALITY_MAX + 1` maximum rows per eligible text column); high-cardinality, key, sensitive, and PII-shaped values are not stored.
+
+Upload configuration: `TENANT_ID` (default tenant scope, not authentication), `DATASET_STORAGE_PATH` (default `datasets`), `MAX_UPLOAD_MB` (default 25), `SQL_PARSE_TIMEOUT_SECONDS` (default 10), and `LOW_CARDINALITY_MAX` (default 50). The SQL parser runs in a timed child process with a restricted environment that excludes database URLs, API keys, and other unapproved variables.
+
 The legacy query-runtime notes below describe the previous database-connected implementation and are being replaced as the dataset-backed workflow is completed.
 
 A Streamlit text-to-SQL application using SQLAlchemy, local sentence-transformer embeddings, FAISS, Groq, and SQLGlot. Schema and value vectors and verified examples are stored in local namespace files; the target database is read-only.
