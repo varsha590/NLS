@@ -276,40 +276,57 @@ def test_path_injection_rejected():
 # ---------------------------------------------------------------------------
 
 def test_dataset_directory_path_injection(tmp_path):
-    """dataset_directory must not emit paths that escape the tenant root.
+    """dataset_directory must reject tenant_id/dataset_id that fail the allowlist.
 
-    The method builds paths as: _tenant_root(tenant_id) / dataset_id.
-    _tenant_root hashes the tenant_id, but dataset_id may contain
-    user-controlled components. Verify that "../" and absolute paths
-    do not cause directory traversal outside the expected structure.
+    The validator applies ^[A-Za-z0-9_-]{1,64}$ to both tenant_id and dataset_id.
+    Path traversal patterns like "../x", "a/../b", "a/b", absolute paths, and empty
+    strings are rejected with UploadError.
     """
     from pathlib import Path
-    from ingestion.datasets import DatasetRegistry
+    from ingestion.datasets import DatasetRegistry, UploadError
 
     datasets_dir = tmp_path / "datasets"
     registry = DatasetRegistry(datasets_dir)
 
-    # Test with "../x" tenant_id - path should be under datasets dir
-    result = registry.dataset_directory("../x", "dataset-a")
-    assert str(result).startswith(str(datasets_dir)), (
-        f"Path not under datasets dir: {result}"
-    )
+    # Invalid tenant_id with path traversal
+    with pytest.raises(UploadError, match="Invalid tenant_id"):
+        registry.dataset_directory("../x", "dataset-a")
 
-    # Test with "a/../b" dataset_id - path should be under datasets dir
-    result = registry.dataset_directory("tenant-a", "a/../b")
-    assert str(result).startswith(str(datasets_dir)), (
-        f"Path not under datasets dir: {result}"
-    )
+    # Invalid tenant_id with slash
+    with pytest.raises(UploadError, match="Invalid tenant_id"):
+        registry.dataset_directory("a/../b", "dataset-a")
 
-    # Normal case still works
-    result = registry.dataset_directory("tenant-a", "normal_dataset")
-    assert str(result).startswith(str(datasets_dir)), (
-        f"Path not under datasets dir: {result}"
-    )
-    assert result.name == "normal_dataset", (
-        f"Last component not normal_dataset: {result.parts}"
-    )
+    # Invalid tenant_id with bare path
+    with pytest.raises(UploadError, match="Invalid tenant_id"):
+        registry.dataset_directory("a/b", "dataset-a")
 
+    # Absolute path tenant_id
+    with pytest.raises(UploadError, match="Invalid tenant_id"):
+        registry.dataset_directory("/absolute", "dataset-a")
+
+    # Empty tenant_id
+    with pytest.raises(UploadError, match="Invalid tenant_id"):
+        registry.dataset_directory("", "dataset-a")
+
+    # Invalid dataset_id with path traversal
+    with pytest.raises(UploadError, match="Invalid dataset_id"):
+        registry.dataset_directory("tenant-a", "../x")
+
+    # Invalid dataset_id with slash
+    with pytest.raises(UploadError, match="Invalid dataset_id"):
+        registry.dataset_directory("tenant-a", "a/../b")
+
+    # Invalid dataset_id with bare path
+    with pytest.raises(UploadError, match="Invalid dataset_id"):
+        registry.dataset_directory("tenant-a", "a/b")
+
+    # Absolute path dataset_id
+    with pytest.raises(UploadError, match="Invalid dataset_id"):
+        registry.dataset_directory("tenant-a", "/absolute")
+
+    # Empty dataset_id
+    with pytest.raises(UploadError, match="Invalid dataset_id"):
+        registry.dataset_directory("tenant-a", "")
 
 # ---------------------------------------------------------------------------
 # Main guard

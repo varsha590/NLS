@@ -43,6 +43,14 @@ PARSER_ENV_ALLOWLIST = (
     "TMP",
 )
 
+_TENANT_DATASET_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _validate_tenant_dataset_id(value: str, label: str) -> None:
+    """Raise UploadError if tenant_id or dataset_id fails the allowlist check."""
+    if not _TENANT_DATASET_ID_PATTERN.fullmatch(value):
+        raise UploadError(f"Invalid {label}: {value!r}. Must match ^[A-Za-z0-9_-]{{1,64}}$")
+
 
 class UploadError(ValueError):
     """Raised when an uploaded dataset is invalid or unsafe to ingest."""
@@ -631,9 +639,11 @@ class DatasetRegistry:
 
     @staticmethod
     def _dataset_id(tenant_id: str, filename: str) -> str:
+        _validate_tenant_dataset_id(tenant_id, "tenant_id")
         return str(uuid.uuid5(DATASET_NAMESPACE, f"{tenant_id}\0{filename}"))
 
     def _tenant_root(self, tenant_id: str) -> Path:
+        _validate_tenant_dataset_id(tenant_id, "tenant_id")
         tenant_key = hashlib.sha256(tenant_id.encode("utf-8")).hexdigest()[:24]
         return self.root / tenant_key
 
@@ -650,6 +660,8 @@ class DatasetRegistry:
         return datasets
 
     def load_schema(self, tenant_id: str, dataset_id: str) -> SchemaMetadata:
+        _validate_tenant_dataset_id(tenant_id, "tenant_id")
+        _validate_tenant_dataset_id(dataset_id, "dataset_id")
         dataset_dir = self._tenant_root(tenant_id) / dataset_id
         try:
             payload = json.loads((dataset_dir / "schema.json").read_text(encoding="utf-8"))
@@ -659,6 +671,8 @@ class DatasetRegistry:
 
     def dataset_directory(self, tenant_id: str, dataset_id: str) -> Path:
         """Return the tenant-scoped local dataset directory."""
+        _validate_tenant_dataset_id(tenant_id, "tenant_id")
+        _validate_tenant_dataset_id(dataset_id, "dataset_id")
         return self._tenant_root(tenant_id) / dataset_id
 
     def load_value_documents(self, tenant_id: str, dataset_id: str) -> list[dict[str, Any]]:
@@ -686,6 +700,7 @@ class DatasetRegistry:
         selected_tenant = tenant_id or os.getenv("TENANT_ID", "default")
         if not selected_tenant.strip():
             raise UploadError("Tenant ID cannot be empty.")
+        _validate_tenant_dataset_id(selected_tenant, "tenant_id")
         filename = Path(filename).name
         suffix = Path(filename).suffix.casefold()
         if suffix not in {".sql", ".db"}:

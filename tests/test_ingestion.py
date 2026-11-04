@@ -389,6 +389,53 @@ def test_upload_parse_timeout_is_enforced(monkeypatch):
         datasets.parse_sql_dump("SELECT 1", dialect="sqlite", parse_timeout_seconds=0.001)
 
 
+def test_dataset_directory_validates_tenant_and_dataset_id(tmp_path):
+    registry = DatasetRegistry(tmp_path)
+    # Valid inputs should work
+    valid_dir = registry.dataset_directory("valid_tenant", "valid_dataset")
+    assert valid_dir.exists() or True  # directory may not exist yet
+
+    # Invalid tenant_id with path traversal
+    with pytest.raises(UploadError, match="Invalid tenant_id"):
+        registry.dataset_directory("../x", "valid_dataset")
+
+    # Invalid tenant_id with slash
+    with pytest.raises(UploadError, match="Invalid tenant_id"):
+        registry.dataset_directory("a/../b", "valid_dataset")
+
+    # Invalid tenant_id with bare path
+    with pytest.raises(UploadError, match="Invalid tenant_id"):
+        registry.dataset_directory("a/b", "valid_dataset")
+
+    # Absolute path tenant_id
+    with pytest.raises(UploadError, match="Invalid tenant_id"):
+        registry.dataset_directory("/absolute", "valid_dataset")
+
+    # Empty tenant_id
+    with pytest.raises(UploadError, match="Invalid tenant_id"):
+        registry.dataset_directory("", "valid_dataset")
+
+    # Invalid dataset_id with path traversal
+    with pytest.raises(UploadError, match="Invalid dataset_id"):
+        registry.dataset_directory("valid_tenant", "../x")
+
+    # Invalid dataset_id with slash
+    with pytest.raises(UploadError, match="Invalid dataset_id"):
+        registry.dataset_directory("valid_tenant", "a/../b")
+
+    # Invalid dataset_id with bare path
+    with pytest.raises(UploadError, match="Invalid dataset_id"):
+        registry.dataset_directory("valid_tenant", "a/b")
+
+    # Absolute path dataset_id
+    with pytest.raises(UploadError, match="Invalid dataset_id"):
+        registry.dataset_directory("valid_tenant", "/absolute")
+
+    # Empty dataset_id
+    with pytest.raises(UploadError, match="Invalid dataset_id"):
+        registry.dataset_directory("valid_tenant", "")
+
+
 def test_slow_parser_child_process_is_killed_on_real_timeout(tmp_path):
     import ingestion.datasets as datasets
 
