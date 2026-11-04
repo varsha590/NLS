@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import sys
 
 import pytest
 
@@ -63,6 +65,59 @@ def test_sql_dump_extracts_table_columns_keys_and_foreign_keys_without_execution
         ("orders", "status", "Closed"),
     }
     assert not warnings
+
+
+def test_realistic_mysqldump_insert_ignore_escaped_values_and_version_comments():
+    sql = r"""
+    /*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
+    CREATE TABLE `publishers` (
+        `id` int NOT NULL,
+        `name` varchar(80) DEFAULT NULL,
+        PRIMARY KEY (`id`)
+    ) ENGINE=InnoDB;
+    INSERT IGNORE INTO `publishers` (`id`, `name`) VALUES
+        (1, 'O\'Reilly, Inc.'),
+        (2, 'Northwind');
+    /*!40101 SET CHARACTER_SET_CLIENT=@OLD_CHARACTER_SET_CLIENT */;
+    """
+    schema, documents, warnings = parse_sql_dump(sql, dialect="mysql")
+    assert set(schema.tables) == {"publishers"}
+    assert {item["value"] for item in documents} == {"O'Reilly, Inc.", "Northwind"}
+    assert not warnings
+
+
+def test_realistic_pg_dump_copy_block_is_skipped_without_crashing():
+    sql = """
+    -- PostgreSQL database dump
+    CREATE TABLE public.regions (
+        id integer NOT NULL,
+        name text
+    );
+    COPY public.regions (id, name) FROM stdin;
+    1\tNorth
+    2\tSouth
+    \\.
+    """
+    schema, documents, warnings = parse_sql_dump(sql, dialect="postgres")
+    assert "public.regions" in schema.tables
+    assert documents == []
+    assert not warnings
+
+
+def test_unsupported_dump_statements_are_ignored_without_losing_tables():
+    sql = """
+    CREATE TABLE visible_table (id INTEGER PRIMARY KEY, label TEXT);
+    CREATE VIEW visible_view AS SELECT label FROM visible_table;
+    CREATE TRIGGER visible_trigger AFTER INSERT ON visible_table BEGIN SELECT 1; END;
+    SET FOREIGN_KEY_CHECKS = 0;
+    LOCK TABLES visible_table WRITE;
+    DELIMITER $$
+    CREATE PROCEDURE hidden_procedure() BEGIN SELECT 1; END$$
+    DELIMITER ;
+    """
+    schema, documents, _ = parse_sql_dump(sql, dialect="mysql")
+    assert set(schema.tables) == {"visible_table"}
+    assert documents == []
 
 
 def test_table_without_insert_has_no_value_documents():
@@ -193,6 +248,96 @@ def test_sqlite_dataset_is_persisted_for_later_read_only_execution(tmp_path):
     assert registry.load_schema("tenant-b", result["dataset_id"]).tables["regions"]
 
 
+def test_db_upload_builds_low_cardinality_values_read_only_and_skips_pii(tmp_path, monkeypatch):
+    import ingestion.datasets as datasets
+
+    source_path = tmp_path / "values.db"
+    connection = sqlite3.connect(source_path)
+    connection.executescript(
+        "CREATE TABLE locations (id INTEGER PRIMARY KEY, name TEXT);"
+        "CREATE TABLE contact_data (id INTEGER PRIMARY KEY, label TEXT, email TEXT);"
+        "CREATE TABLE many_values (id INTEGER PRIMARY KEY, label TEXT);"
+        "INSERT INTO locations VALUES (1, 'North'), (2, 'South');"
+        "INSERT INTO contact_data VALUES (1, '+1 (555) 123-4567', 'person@example.com');"
+        "INSERT INTO many_values VALUES (1, 'One'), (2, 'Two'), (3, 'Three'), (4, 'Four');"
+    )
+    connection.close()
+
+    executed: list[str] = []
+    original_connect = datasets.sqlite3.connect
+
+    class TracedConnection:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        def execute(self, sql, parameters=()):
+            executed.append(sql.strip())
+            return self.wrapped.execute(sql, parameters)
+
+        def enable_load_extension(self, enabled):
+            if hasattr(self.wrapped, "enable_load_extension"):
+                return self.wrapped.enable_load_extension(enabled)
+            return None
+
+        def close(self):
+            return self.wrapped.close()
+
+    def traced_connect(*args, **kwargs):
+        return TracedConnection(original_connect(*args, **kwargs))
+
+    monkeypatch.setattr(datasets.sqlite3, "connect", traced_connect)
+    registry = DatasetRegistry(tmp_path / "datasets")
+    result = registry.register(
+        "values.db",
+        source_path.read_bytes(),
+        tenant_id="tenant-db",
+        low_cardinality_max=3,
+    )
+    dataset_dir = next((tmp_path / "datasets").glob("*/" + result["dataset_id"]))
+    stored_values = json.loads((dataset_dir / "value_documents.json").read_text())
+
+    assert {item["value"] for item in stored_values} == {"North", "South"}
+    assert all("email" not in item["column_name"] for item in stored_values)
+    assert any("PII-shaped values" in warning for warning in result["warnings"])
+    assert any(statement.startswith("SELECT DISTINCT") and "LIMIT ?" in statement for statement in executed)
+    assert not any('"email"' in statement for statement in executed)
+    assert not any(item["table_name"] == "many_values" for item in stored_values)
+    assert all(
+        value not in (dataset_dir / "value_documents.json").read_text()
+        for value in ("555", "person@example.com", "One", "Two", "Three", "Four")
+    )
+    assert all(
+        statement.startswith(("SELECT ", "PRAGMA "))
+        for statement in executed
+    )
+
+
+def test_parser_environment_excludes_credentials_and_unapproved_variables(monkeypatch):
+    import ingestion.datasets as datasets
+
+    monkeypatch.setenv("GROQ_API_KEY", "not-for-child")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://not-for-child")
+    monkeypatch.setenv("ARBITRARY_SECRET", "not-for-child")
+    observed_env: dict[str, str] = {}
+    actual_run = datasets.subprocess.run
+
+    def capture_environment(*args, **kwargs):
+        observed_env.update(kwargs["env"])
+        kwargs.pop("check", None)
+        return actual_run(*args, check=False, **kwargs)
+
+    monkeypatch.setattr(datasets.subprocess, "run", capture_environment)
+    parse_sql_dump(
+        "CREATE TABLE safe_table (id INTEGER PRIMARY KEY, label TEXT);",
+        dialect="sqlite",
+    )
+    child_env = observed_env
+    assert "GROQ_API_KEY" not in child_env
+    assert "DATABASE_URL" not in child_env
+    assert "ARBITRARY_SECRET" not in child_env
+    assert set(child_env) <= set(datasets.PARSER_ENV_ALLOWLIST)
+
+
 def test_upload_parse_timeout_is_enforced(monkeypatch):
     import ingestion.datasets as datasets
 
@@ -202,3 +347,24 @@ def test_upload_parse_timeout_is_enforced(monkeypatch):
     monkeypatch.setattr(datasets.subprocess, "run", timeout)
     with pytest.raises(UploadError, match="time limit"):
         datasets.parse_sql_dump("SELECT 1", dialect="sqlite", parse_timeout_seconds=0.001)
+
+
+def test_slow_parser_child_process_is_killed_on_real_timeout(tmp_path):
+    import ingestion.datasets as datasets
+
+    pid_path = tmp_path / "child.pid"
+    child_code = (
+        "import os, time; "
+        f"open({str(pid_path)!r}, 'w').write(str(os.getpid())); "
+        "time.sleep(30)"
+    )
+    with pytest.raises(UploadError, match="time limit"):
+        datasets.run_parser_process(
+            [sys.executable, "-c", child_code],
+            payload="",
+            timeout_seconds=0.2,
+            working_directory=tmp_path,
+        )
+    child_pid = int(pid_path.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(child_pid, 0)

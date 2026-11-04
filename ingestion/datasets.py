@@ -20,7 +20,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ErrorLevel
 
-from catalog.classifier import is_key_column, is_pii_shaped_value
+from catalog.classifier import is_key_column, is_pii_shaped_value, is_text_type
 from config.data_policy import is_blocked, is_masked
 from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo
 
@@ -31,10 +31,52 @@ DEFAULT_LOW_CARDINALITY_MAX = 50
 _EMAIL_PATTERN = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
 _LONG_ID_PATTERN = re.compile(r"(?<!\d)\d{9,}(?!\d)")
 _PHONE_PATTERN = re.compile(r"(?<!\w)\+?[\d().\-\s]{7,}(?!\w)")
+PARSER_ENV_ALLOWLIST = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "PYTHONIOENCODING",
+    "PYTHONUTF8",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+)
 
 
 class UploadError(ValueError):
     """Raised when an uploaded dataset is invalid or unsafe to ingest."""
+
+
+def parser_environment() -> dict[str, str]:
+    """Pass only non-secret process settings to the isolated parser."""
+    return {
+        key: os.environ[key]
+        for key in PARSER_ENV_ALLOWLIST
+        if key in os.environ
+    }
+
+
+def run_parser_process(
+    command: list[str],
+    payload: str,
+    timeout_seconds: float,
+    working_directory: Path,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            command,
+            input=payload,
+            capture_output=True,
+            check=False,
+            cwd=working_directory,
+            env=parser_environment(),
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise UploadError("SQL parsing exceeded the configured time limit.") from error
+    except OSError as error:
+        raise UploadError("Could not start the SQL parser.") from error
 
 
 def detect_sql_dialect(sql_text: str) -> str:
@@ -420,24 +462,16 @@ def parse_sql_dump(
         selected_low_max = int(os.getenv("LOW_CARDINALITY_MAX", str(DEFAULT_LOW_CARDINALITY_MAX)))
     if selected_low_max < 0:
         raise UploadError("Low-cardinality threshold cannot be negative.")
-    try:
-        completed = subprocess.run(
-            [sys.executable, "-m", "ingestion.sql_worker"],
-            input=json.dumps({
+    completed = run_parser_process(
+        [sys.executable, "-m", "ingestion.sql_worker"],
+        json.dumps({
                 "sql_text": sql_text,
                 "dialect": selected_dialect,
                 "low_cardinality_max": selected_low_max,
             }),
-            capture_output=True,
-            check=False,
-            cwd=Path(__file__).resolve().parents[1],
-            text=True,
-            timeout=parse_timeout_seconds,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise UploadError("SQL parsing exceeded the configured time limit.") from error
-    except OSError as error:
-        raise UploadError("Could not start the SQL parser.") from error
+        parse_timeout_seconds,
+        Path(__file__).resolve().parents[1],
+    )
     if completed.returncode != 0:
         raise UploadError("The SQL upload could not be parsed safely.")
     try:
@@ -519,6 +553,75 @@ def inspect_sqlite_database(database_path: str | Path) -> SchemaMetadata:
             connection.close()
 
 
+def extract_sqlite_value_documents(
+    database_path: str | Path,
+    metadata: SchemaMetadata,
+    low_cardinality_max: int = DEFAULT_LOW_CARDINALITY_MAX,
+) -> tuple[list[dict[str, str]], list[str]]:
+    """Collect only bounded low-cardinality values using read-only SELECT DISTINCT."""
+    path = Path(database_path)
+    if low_cardinality_max < 0:
+        raise UploadError("Low-cardinality threshold cannot be negative.")
+    uri = f"file:{quote(str(path.resolve()))}?mode=ro"
+    value_documents: list[dict[str, str]] = []
+    warnings: list[str] = []
+    upload_has_pii = False
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(uri, uri=True, timeout=2.0)
+        if hasattr(connection, "enable_load_extension"):
+            connection.enable_load_extension(False)
+        connection.execute("PRAGMA query_only = ON")
+        for table in metadata.tables.values():
+            quoted_table = '"' + table.name.replace('"', '""') + '"'
+            for column in table.columns:
+                if (
+                    not is_text_type(column.data_type)
+                    or column.is_primary_key
+                    or column.is_foreign_key
+                    or is_key_column(
+                        column.name,
+                        is_primary_key=column.is_primary_key,
+                        is_foreign_key=column.is_foreign_key,
+                    )
+                    or is_blocked(f"{table.name}.{column.name}")
+                    or is_masked(f"{table.name}.{column.name}")
+                ):
+                    continue
+                quoted_column = '"' + column.name.replace('"', '""') + '"'
+                query = (
+                    f"SELECT DISTINCT {quoted_column} FROM {quoted_table} "
+                    f"WHERE {quoted_column} IS NOT NULL LIMIT ?"
+                )
+                rows = connection.execute(query, (low_cardinality_max + 1,)).fetchall()
+                if len(rows) > low_cardinality_max:
+                    continue
+                values = [str(row[0]) for row in rows]
+                if any(
+                    is_pii_shaped_value(value) or _LONG_ID_PATTERN.fullmatch(value)
+                    for value in values
+                ):
+                    warnings.append(f"Skipped PII-shaped values in {table.name}.{column.name}.")
+                    upload_has_pii = True
+                    continue
+                for value in sorted(set(values), key=str.casefold):
+                    value_documents.append({
+                        "table_name": table.name,
+                        "column_name": column.name,
+                        "value": value,
+                        "content": f"{table.name} {column.name} {value}",
+                        "metadata_type": "master_value",
+                    })
+    except sqlite3.DatabaseError as error:
+        raise UploadError("Could not safely read low-cardinality SQLite values.") from error
+    finally:
+        if connection is not None:
+            connection.close()
+    if upload_has_pii:
+        warnings.append("Upload contains PII-shaped content; matching value columns are excluded.")
+    return value_documents, sorted(set(warnings))
+
+
 class DatasetRegistry:
     """Persist dataset schema and metadata without retaining SQL dump contents."""
 
@@ -579,6 +682,13 @@ class DatasetRegistry:
             raise UploadError("Upload size limit must be at least 1 MB.")
         if len(content) > upload_limit * 1024 * 1024:
             raise UploadError(f"Upload exceeds the {upload_limit} MB size limit.")
+        low_max = (
+            int(os.getenv("LOW_CARDINALITY_MAX", str(DEFAULT_LOW_CARDINALITY_MAX)))
+            if low_cardinality_max is None
+            else low_cardinality_max
+        )
+        if low_max < 0:
+            raise UploadError("Low-cardinality threshold cannot be negative.")
 
         digest = hashlib.sha256(content).hexdigest()
         dataset_id = self._dataset_id(selected_tenant, filename)
@@ -605,11 +715,10 @@ class DatasetRegistry:
             dialect = dialect_override or detected_dialect
             if dialect.casefold() not in {"sqlite", "mysql", "postgres"}:
                 raise UploadError("Choose SQLite, MySQL, or PostgreSQL as the SQL dialect.")
-            timeout = parse_timeout_seconds or float(
-                os.getenv("SQL_PARSE_TIMEOUT_SECONDS", str(DEFAULT_PARSE_TIMEOUT_SECONDS))
-            )
-            low_max = low_cardinality_max if low_cardinality_max is not None else int(
-                os.getenv("LOW_CARDINALITY_MAX", str(DEFAULT_LOW_CARDINALITY_MAX))
+            timeout = (
+                float(os.getenv("SQL_PARSE_TIMEOUT_SECONDS", str(DEFAULT_PARSE_TIMEOUT_SECONDS)))
+                if parse_timeout_seconds is None
+                else parse_timeout_seconds
             )
             schema, value_documents, warnings = parse_sql_dump(
                 sql_text,
@@ -627,10 +736,14 @@ class DatasetRegistry:
                 with os.fdopen(descriptor, "wb") as file_obj:
                     file_obj.write(content)
                 schema = inspect_sqlite_database(temporary_db)
+                value_documents, warnings = extract_sqlite_value_documents(
+                    temporary_db,
+                    schema,
+                    low_cardinality_max=low_max,
+                )
             except Exception:
                 temporary_db.unlink(missing_ok=True)
                 raise
-            value_documents = []
 
         dataset_dir.mkdir(parents=True, exist_ok=True)
         if temporary_db is not None:
