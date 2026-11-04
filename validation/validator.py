@@ -8,26 +8,22 @@ from typing import Any
 
 import sqlglot
 from sqlglot import exp
+from sqlglot.optimizer.qualify import qualify
 from sqlglot.optimizer.scope import Scope, traverse_scope
 
-from db.adapter import DatabaseAdapter
 from retrieval.value_index import ValueIndex
 from schema.metadata import SchemaMetadata
+from config.data_policy import is_blocked, is_masked, blocked_columns_for_table
 
-try:
-    from config.data_policy import is_blocked, is_masked, blocked_columns_for_table
-except Exception:
-    # Fail closed: treat every column as blocked if policy cannot be imported
-    def is_blocked(key: str, **kwargs: Any) -> bool:
-        return True
 
-    def is_masked(key: str, **kwargs: Any) -> bool:
-        return True
-
-    def blocked_columns_for_table(
-        table_name: str, column_names: list, policy_overrides: dict[str, Any] | None = None
-    ) -> set:
-        return set(column_names)
+FORBIDDEN_FUNCTIONS = frozenset({
+    "pg_sleep",
+    "pg_read_file",
+    "load_extension",
+    "dblink",
+    "sleep",
+    "benchmark",
+})
 
 
 class ValidationError(ValueError):
@@ -72,6 +68,80 @@ def _table_key(table: exp.Table) -> str:
 
 def _catalog_lookup(metadata: SchemaMetadata) -> dict[str, object]:
     return {name.casefold(): table for name, table in metadata.tables.items()}
+
+
+def _is_select_alias_reference(column: exp.Column, scope: Scope | None) -> bool:
+    """Allow only this SELECT's aliases in ORDER BY, GROUP BY, or HAVING."""
+    if scope is None or column.table:
+        return False
+    aliases = {
+        projection.alias.casefold()
+        for projection in scope.expression.selects
+        if isinstance(projection, exp.Alias) and projection.alias
+    }
+    if column.name.casefold() not in aliases:
+        return False
+
+    parent = column.parent
+    while parent is not None and parent is not scope.expression:
+        if isinstance(parent, (exp.Order, exp.Group, exp.Having)):
+            return True
+        parent = parent.parent
+    return False
+
+
+def _scope_for_column(
+    column: exp.Column,
+    scope_by_expression: dict[int, Scope],
+) -> Scope | None:
+    """Find the nearest SELECT scope, including columns omitted from scope.columns."""
+    parent: exp.Expression | None = column
+    while parent is not None:
+        if isinstance(parent, exp.Select):
+            return scope_by_expression.get(id(parent))
+        parent = parent.parent
+    return None
+
+
+def _is_derived_column_reference(column: exp.Column, scope: Scope | None) -> bool:
+    """Return whether a qualified name is an output of a CTE or subquery."""
+    if scope is None or not column.table:
+        return False
+    source = scope.sources.get(column.table.casefold())
+    return isinstance(source, Scope) and any(
+        projection.alias_or_name.casefold() == column.name.casefold()
+        for projection in source.expression.selects
+    )
+
+
+def _validate_read_only_ast(parsed: exp.Expression) -> None:
+    """Reject non-query statements and unsafe constructs anywhere in the AST."""
+    if not isinstance(parsed, (exp.Select, exp.SetOperation)):
+        raise ValidationError("Only a single read-only SELECT query is allowed.")
+
+    forbidden_types = tuple(
+        expression
+        for expression in (
+            exp.DML,
+            exp.DDL,
+            getattr(exp, "Command", None),
+            getattr(exp, "Copy", None),
+            getattr(exp, "Pragma", None),
+        )
+        if isinstance(expression, type)
+    )
+    for node in parsed.walk():
+        if forbidden_types and isinstance(node, forbidden_types):
+            raise ValidationError("Mutating or administrative SQL constructs are not allowed.")
+        if isinstance(node, exp.Select):
+            if node.args.get("into") is not None:
+                raise ValidationError("SELECT INTO is not allowed.")
+            if node.args.get("locks"):
+                raise ValidationError("Locking reads are not allowed.")
+        if isinstance(node, exp.Func):
+            function_names = {node.name.casefold(), node.sql_name().casefold()}
+            if function_names & FORBIDDEN_FUNCTIONS:
+                raise ValidationError("A restricted SQL function was requested.")
 
 
 def _suggest_column(table_name: str | None, column_name: str, metadata: SchemaMetadata) -> str:
@@ -466,12 +536,11 @@ def validate_sql(
     dialect: str | None,
     allowed_tables: set[str] | None = None,
     max_rows: int = 100,
-    adapter: DatabaseAdapter | None = None,
     value_index: ValueIndex | None = None,
     resolved_values: list[dict[str, Any]] | None = None,
     policy_overrides: dict[str, Any] | None = None,
 ) -> str:
-    """Validate one SELECT, verify catalog references, enforce LIMIT, and explain it."""
+    """Validate one read-only query locally against the complete schema catalog."""
     source = sql.strip().rstrip(";").strip()
     if not source:
         raise ValidationError("The SQL generator returned an empty statement.")
@@ -484,24 +553,7 @@ def validate_sql(
     if len(statements) != 1:
         raise ValidationError("Multiple SQL statements detected. Only one SELECT is allowed.")
     parsed = statements[0]
-    if not isinstance(parsed, exp.Select):
-        raise ValidationError("Only a single SELECT statement is allowed.")
-    forbidden = tuple(
-        expression
-        for expression in (
-            exp.Insert,
-            exp.Update,
-            exp.Delete,
-            exp.Drop,
-            exp.Alter,
-            exp.Create,
-            getattr(exp, "Truncate", None),
-            getattr(exp, "Grant", None),
-        )
-        if isinstance(expression, type)
-    )
-    if any(parsed.find_all(*forbidden)):
-        raise ValidationError("Mutating SQL statements are not allowed.")
+    _validate_read_only_ast(parsed)
 
     catalog = _catalog_lookup(metadata)
     allowed = {name.casefold() for name in allowed_tables} if allowed_tables is not None else set(catalog)
@@ -523,38 +575,30 @@ def validate_sql(
         table_aliases[table_node.alias_or_name.casefold()] = table_name.casefold()
         table_aliases[table_node.name.casefold()] = table_name.casefold()
 
-    projection_aliases = {
-        projection.alias.casefold()
-        for projection in parsed.expressions
-        if isinstance(projection, exp.Alias) and projection.alias
-    }
     validation_scopes = list(traverse_scope(parsed))
     validation_scope_by_expression = {
         id(scope.expression): scope for scope in validation_scopes
     }
-    validation_scope_by_column = {
-        id(column): scope
-        for scope in validation_scopes
-        for column in scope.columns
-    }
     for column_node in parsed.find_all(exp.Column):
-        if column_node.name == "*" or column_node.name.casefold() in projection_aliases:
+        if column_node.name == "*":
+            continue
+        scope = _scope_for_column(column_node, validation_scope_by_expression)
+        if _is_select_alias_reference(column_node, scope):
+            continue
+        scoped_key = _scope_column_key(
+            column_node,
+            scope,
+            metadata,
+            validation_scope_by_expression,
+            set(),
+        )
+        if scoped_key or _is_derived_column_reference(column_node, scope):
             continue
         resolved_table_name = None
         if column_node.table:
             resolved_table_name = table_aliases.get(column_node.table.casefold())
             if resolved_table_name is None and column_node.table.casefold() in cte_names:
                 continue
-            if resolved_table_name is None:
-                scoped_key = _scope_column_key(
-                    column_node,
-                    validation_scope_by_column.get(id(column_node)),
-                    metadata,
-                    validation_scope_by_expression,
-                    set(),
-                )
-                if scoped_key is not None:
-                    continue
             if resolved_table_name is None:
                 resolved_table_name = column_node.table.casefold()
             table = catalog.get(resolved_table_name)
@@ -578,6 +622,26 @@ def validate_sql(
             raise ValidationError(
                 f"column {column_node.name} is ambiguous; qualify it with a table name."
             )
+
+    schema = {
+        name: {column.name: column.data_type for column in table.columns}
+        for name, table in metadata.tables.items()
+    }
+    try:
+        parsed = qualify(
+            parsed,
+            dialect=dialect,
+            schema=schema,
+            validate_qualify_columns=True,
+            identify=False,
+        )
+    except sqlglot.errors.SqlglotError as error:
+        raise ValidationError(f"Invalid table or column reference: {error}") from error
+
+    validation_scopes = list(traverse_scope(parsed))
+    validation_scope_by_expression = {
+        id(scope.expression): scope for scope in validation_scopes
+    }
 
     # Blocked column check (data policy)
     _BLOCKED_MSG = "That information isn't available."
@@ -608,24 +672,19 @@ def validate_sql(
     for col_node in parsed.find_all(exp.Column):
         if col_node.name == "*":
             continue
-        # Resolve to qualified column key
-        col_table = col_node.table
-        col_name = col_node.name
-        table_key = None
-        if col_table:
-            table_key = table_aliases.get(col_table.casefold())
-        else:
-            # Unqualified - find in used tables
-            for tk, tobj in used_tables.items():
-                if col_name.casefold() in {c.name.casefold() for c in tobj.columns}:
-                    table_key = tk
-                    break
-        if table_key:
-            full_key = f"{table_key}.{col_name}"
-            if is_blocked(full_key, policy_overrides=policy_overrides):
-                raise ValidationError(_BLOCKED_MSG)
-            if is_masked(full_key, policy_overrides=policy_overrides):
-                raise ValidationError(_BLOCKED_MSG)
+        scope = _scope_for_column(col_node, validation_scope_by_expression)
+        column_key = _scope_column_key(
+            col_node,
+            scope,
+            metadata,
+            validation_scope_by_expression,
+            set(),
+        )
+        if column_key and (
+            is_blocked(column_key, policy_overrides=policy_overrides)
+            or is_masked(column_key, policy_overrides=policy_overrides)
+        ):
+            raise ValidationError(_BLOCKED_MSG)
 
     limit = parsed.args.get("limit")
     if limit is None:
@@ -685,9 +744,4 @@ def validate_sql(
         normalized = rewritten_sql
     else:
         normalized = parsed.sql(dialect=dialect)
-    if adapter is not None:
-        try:
-            adapter.explain(normalized)
-        except Exception as error:
-            raise ValidationError(f"The query failed its EXPLAIN dry-run: {error}") from error
     return normalized

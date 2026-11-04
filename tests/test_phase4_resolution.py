@@ -5,7 +5,6 @@ from pathlib import Path
 import numpy as np
 import pytest
 import sqlalchemy as sa
-import yaml
 
 from config import data_policy
 from core.startup import _namespace_policy_hash
@@ -220,51 +219,26 @@ def test_blocked_literal_is_rejected_with_namespace_policy():
         )
 
 
-def test_namespace_overrides_are_isolated_stale_checked_and_hashed(tmp_path):
-    engine, adapter, catalog, _ = _high_fixture(tmp_path, ["row"])
-    first = tmp_path / "namespace-one" / "overrides.yaml"
-    second = tmp_path / "namespace-two" / "overrides.yaml"
-    first.parent.mkdir()
-    second.parent.mkdir()
-    first.write_text(yaml.safe_dump({
-        "policy": {"force_value_low": ["synthetic_records.generic_label"]},
-        "value_resolution": {"synonyms": {"label": ["first-cue"]}},
-    }))
-    second.write_text(yaml.safe_dump({
-        "policy": {"force_value_high": ["synthetic_records.generic_label"]},
-        "value_resolution": {"synonyms": {"label": ["second-cue"]}},
-    }))
+def test_policy_is_code_defined_and_ignores_yaml_overrides(tmp_path):
+    override_path = tmp_path / "overrides.yaml"
+    override_path.write_text(
+        "policy:\n  force_allow:\n    - synthetic_records.secret_token\n"
+    )
+    old_hash = _namespace_policy_hash(10, override_path)
 
-    one, stale_one, warnings_one = data_policy.load_database_overrides(first, catalog)
-    two, stale_two, warnings_two = data_policy.load_database_overrides(second, catalog)
-    old_hash = _namespace_policy_hash(10, first)
-    first.write_text(first.read_text() + "# changed\n")
+    overrides, stale, warnings = data_policy.load_database_overrides(override_path)
 
-    assert one["value_resolution"]["synonyms"]["label"] == ["first-cue"]
-    assert two["value_resolution"]["synonyms"]["label"] == ["second-cue"]
-    assert not stale_one and not stale_two and not warnings_one and not warnings_two
-    assert _namespace_policy_hash(10, first) != old_hash
-
-    first.write_text(yaml.safe_dump({
-        "policy": {
-            "force_block": ["missing_table.missing_column"],
-            "force_allow": ["synthetic_records.generic_secret*"],
-        }
-    }))
-    _, stale, warnings = data_policy.load_database_overrides(first, catalog)
-    assert stale == ["missing_table.missing_column"]
-    assert warnings == ["Rejected credential-name force_allow: synthetic_records.generic_secret*"]
-    assert engine is not None
+    override_path.write_text("policy:\n  force_allow: []\n")
+    assert overrides == {}
+    assert not stale and not warnings
+    assert data_policy.is_blocked("synthetic_records.secret_token")
+    assert _namespace_policy_hash(10, override_path) == old_hash
 
 
-def test_global_yaml_contains_no_database_specific_override_or_column_names():
-    root = Path(__file__).resolve().parents[1]
-    policy = yaml.safe_load((root / "config/data_policy.yaml").read_text())
-    resolution = yaml.safe_load((root / "config/value_resolution.yaml").read_text())
-
-    assert not any("." in str(value) for values in policy.get("overrides", {}).values() for value in values)
-    assert set(resolution) <= {"thresholds", "metric_value_names", "cued_metric_terms", "excluded_terms"}
-    assert not {"cue_aliases", "value_column_allowlist", "status_filter_column_names", "activity_query_expansion"} & set(resolution)
+def test_sensitive_policy_patterns_are_defined_in_code():
+    assert "password" in data_policy.SENSITIVE_COLUMN_PATTERNS
+    assert "aadhaar" in data_policy.SENSITIVE_COLUMN_PATTERNS
+    assert data_policy.is_blocked("customers.cardNumber")
 
 
 def test_overrides_change_only_target_table_policy_fingerprint():

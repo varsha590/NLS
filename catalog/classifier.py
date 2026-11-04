@@ -24,40 +24,15 @@ from typing import Any, Callable
 import sqlalchemy as sa
 from sqlalchemy.engine import Connection, Engine
 
+from config.data_policy import SENSITIVE_COLUMN_PATTERNS
+
 LOGGER = logging.getLogger(__name__)
 
 DEFAULT_CARDINALITY_THRESHOLD = 500
 DEFAULT_MAX_AVG_TEXT_LENGTH = 100
 
 # Default auto-block word tokens (matched against snake_case / camelCase words)
-DEFAULT_BLOCK_PATTERNS = (
-    "password",
-    "passwd",
-    "pwd",
-    "token",
-    "secret",
-    "otp",
-    "email",
-    "phone",
-    "mobile",
-    "contact",
-    "address",
-    "ssn",
-    "aadhaar",
-    "aadhar",
-    "pan",
-    "card",
-    "account_no",
-    "ifsc",
-    "upi",
-    "api_key",
-    "session",
-    "ip_addr",
-    "dob",
-    "birth",
-    "lat",
-    "lng",
-)
+DEFAULT_BLOCK_PATTERNS = SENSITIVE_COLUMN_PATTERNS
 
 # Weak or ambiguous tokens for review reporting
 WEAK_BLOCK_TOKENS = frozenset({

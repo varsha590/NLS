@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from catalog.classifier import is_candidate_text_column, parse_enum_options
 from catalog.introspect import introspect_catalog
-from config.data_policy import get_policy_overrides, load_database_overrides
+from config.data_policy import SENSITIVE_COLUMN_PATTERNS, get_policy_overrides, load_database_overrides
 from config.settings import Settings
 from db.adapter import DatabaseAdapter
 from llm.generator import GroqGenerator
@@ -33,13 +33,13 @@ _runtime: dict[str, Any] = {}
 
 
 def _generic_policy_hash(threshold: int) -> str:
-    """Fingerprint generic policy/config inputs that affect every table."""
-    digest = hashlib.sha256()
-    root = Path(__file__).resolve().parents[1]
-    for relative_path in ("config/data_policy.yaml", "config/value_resolution.yaml"):
-        digest.update((root / relative_path).read_bytes())
-    digest.update(str(threshold).encode("ascii"))
-    return digest.hexdigest()
+    """Fingerprint code-defined sensitive patterns and cardinality settings."""
+    payload = json.dumps(
+        {"sensitive_patterns": SENSITIVE_COLUMN_PATTERNS, "threshold": threshold},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _config_policy_hash(threshold: int) -> str:
@@ -48,14 +48,9 @@ def _config_policy_hash(threshold: int) -> str:
 
 
 def _namespace_policy_hash(threshold: int, overrides_path: Path) -> str:
-    """Fingerprint generic policy plus the active namespace's overrides file."""
-    digest = hashlib.sha256()
-    digest.update(_config_policy_hash(threshold).encode("ascii"))
-    if overrides_path.is_file():
-        digest.update(overrides_path.read_bytes())
-    else:
-        digest.update(b"no-database-overrides")
-    return digest.hexdigest()
+    """Retain the old signature while using only code-defined policy inputs."""
+    del overrides_path
+    return _config_policy_hash(threshold)
 
 
 def _schema_records(metadata: Any) -> list[dict[str, Any]]:

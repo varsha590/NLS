@@ -161,8 +161,6 @@ def test_value_index_failure_does_not_log_value_text(tmp_path, caplog):
 
 
 def test_literal_validation_restricts_column_lookup_to_used_tables():
-    engine = sa.create_engine("sqlite:///:memory:")
-    adapter = DatabaseAdapter("sqlite:///:memory:", engine=engine)
     metadata = SchemaMetadata(
         tables={
             "synthetic_accounts": TableInfo(
@@ -191,7 +189,6 @@ def test_literal_validation_restricts_column_lookup_to_used_tables():
         metadata=metadata,
         dialect="sqlite",
         allowed_tables={"synthetic_accounts"},
-        adapter=adapter,
         value_index=value_index,
     )
     assert "synthetic_accounts" in validated

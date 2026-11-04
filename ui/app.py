@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import streamlit as st
 
 from core.startup import init_app
+from ingestion.datasets import DatasetRegistry, UploadError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -184,52 +186,89 @@ def _render_result(result: dict[str, Any], question: str, runtime: dict[str, Any
 
 
 def main() -> None:
-    """Render the question interface and process submitted queries."""
-    try:
-        force = st.session_state.pop("force_reindex", False)
-        with st.spinner("Setting up database connection, embedding model, and schema index..."):
-            runtime = load_runtime(force=force)
-    except Exception as error:
-        LOGGER.exception("Application startup failed")
-        st.error(f"Startup failed: {error}", title="Setup error")
-        if st.button("Retry setup", icon=":material/refresh:", key="retry-setup"):
-            load_runtime.clear()
-            st.rerun()
-        return
-
-    _render_sidebar(runtime)
+    """Register a dataset and inspect its stored schema without DB connections."""
     st.title("Natural Language to SQL")
-    st.caption("Ask a question about the connected database.")
+    st.subheader("Register a dataset")
+    st.caption(
+        "A .sql upload provides schema metadata and optional master values; it does not create a live database. "
+        "Execution will require a separate database connection."
+    )
 
-    with st.form("question-form"):
-        question = st.text_input(
-            "Question",
-            placeholder="Ask a question about your data...",
-            type="search",
-            key="question_input",
+    # Tenant IDs currently scope local data only; they are not user authentication.
+    st.session_state.setdefault("tenant_id", os.getenv("TENANT_ID", "default"))
+    tenant_id = st.text_input("Tenant ID", key="tenant_id")
+    registry = DatasetRegistry(os.getenv("DATASET_STORAGE_PATH", "datasets"))
+    max_upload_mb = int(os.getenv("MAX_UPLOAD_MB", "25"))
+
+    with st.form("dataset-upload"):
+        uploaded_file = st.file_uploader("SQL dump or SQLite database", type=["sql", "db"])
+        dialect_choice = st.selectbox(
+            "SQL dialect",
+            ["Auto-detect", "SQLite", "MySQL", "PostgreSQL"],
         )
-        submitted = st.form_submit_button("Search", type="primary")
+        submitted = st.form_submit_button("Register dataset", type="primary")
 
     if submitted:
-        normalized_question = question.strip()
-        if not normalized_question:
-            st.warning("Enter a question before searching.")
+        if uploaded_file is None:
+            st.warning("Choose a .sql or .db file first.")
+        elif not tenant_id.strip():
+            st.warning("Enter a tenant ID.")
         else:
-            # Clear skipped mentions if question changed
-            if st.session_state.get("last_question", "") != normalized_question:
-                st.session_state.skipped_mentions = set()
-            with st.spinner("Retrieving schema and running a read-only query..."):
-                confirmed = []
-                for sm in st.session_state.get("skipped_mentions", set()):
-                    confirmed.append({"mention": sm, "skip": True})
-                if confirmed:
-                    result = runtime["pipeline"].run(normalized_question, confirmed_values=confirmed).to_dict()
-                else:
-                    result = runtime["pipeline"].run(normalized_question).to_dict()
-            st.session_state.last_question = normalized_question
-            st.session_state.last_result = result
+            override = None if dialect_choice == "Auto-detect" else dialect_choice.casefold()
+            try:
+                result = registry.register(
+                    uploaded_file.name,
+                    uploaded_file.getvalue(),
+                    tenant_id=tenant_id.strip(),
+                    dialect_override=override,
+                )
+                st.session_state["selected_dataset_id"] = result["dataset_id"]
+                message = (
+                    "Dataset is unchanged; existing schema and values were kept."
+                    if result["status"] == "unchanged"
+                    else "Dataset schema registered."
+                )
+                st.success(message)
+                for warning in result.get("warnings", []):
+                    st.warning(warning)
+            except UploadError as error:
+                st.error(str(error), title="Upload rejected")
 
-    last_result = st.session_state.get("last_result")
-    last_question = st.session_state.get("last_question", "")
-    if last_result:
-        _render_result(last_result, last_question, runtime)
+    st.caption(f"Maximum upload size: {max_upload_mb} MB")
+    datasets = registry.list_datasets(tenant_id.strip()) if tenant_id.strip() else []
+    if not datasets:
+        st.info("No datasets are registered for this tenant yet.")
+        return
+
+    dataset_ids = [item["dataset_id"] for item in datasets]
+    selected_id = st.selectbox(
+        "Registered dataset",
+        dataset_ids,
+        index=(
+            dataset_ids.index(st.session_state["selected_dataset_id"])
+            if st.session_state.get("selected_dataset_id") in dataset_ids
+            else 0
+        ),
+        format_func=lambda value: next(
+            f"{item['filename']} ({item['dialect']})"
+            for item in datasets
+            if item["dataset_id"] == value
+        ),
+    )
+    selected = next(item for item in datasets if item["dataset_id"] == selected_id)
+    schema = registry.load_schema(tenant_id.strip(), selected_id)
+    st.write(
+        f"{selected['table_count']} tables | {selected['value_document_count']} master values | "
+        f"Dialect: {schema.dialect}"
+    )
+    st.dataframe(
+        [
+            {
+                "Table": table.name,
+                "Columns": len(table.columns),
+                "Relationships": len(table.foreign_keys),
+            }
+            for table in schema.tables.values()
+        ],
+        alt="Registered dataset schema summary",
+    )

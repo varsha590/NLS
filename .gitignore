@@ -1,4 +1,7 @@
 .env
+datasets/
+uploads/
+qdrant_data/
 .vector_store/
 *.faiss
 __pycache__/

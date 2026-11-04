@@ -145,9 +145,10 @@ class TableInfo:
 class SchemaMetadata:
     """Holds metadata for all tables in the database."""
 
-    def __init__(self, tables: Dict[str, TableInfo]):
+    def __init__(self, tables: Dict[str, TableInfo], dialect: str | None = None):
         self.tables = tables
         self.version = "1.0"
+        self.dialect = dialect
 
     def get_table(self, name: str) -> Optional[TableInfo]:
         return self.tables.get(name)
@@ -155,6 +156,7 @@ class SchemaMetadata:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "version": self.version,
+            "dialect": self.dialect,
             "tables": {
                 name: {
                     "name": t.name,
@@ -286,9 +288,11 @@ class SchemaMetadata:
                 foreign_keys=table_data.get("foreign_keys", []),
                 schema=table_data.get("schema"),
                 comment=table_data.get("comment"),
+                unique_constraints=table_data.get("unique_constraints", []),
             )
         result = cls(tables)
         result.version = data.get("version", "1.0")
+        result.dialect = data.get("dialect")
         return result
 
 

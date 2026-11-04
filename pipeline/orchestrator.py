@@ -296,7 +296,6 @@ class TextToSQLPipeline:
                         dialect=self.adapter.get_sqlglot_dialect(),
                         allowed_tables=set(result.tables_used),
                         max_rows=self.max_rows,
-                        adapter=self.adapter,
                         value_index=self.value_index,
                         resolved_values=result.resolved_values,
                         policy_overrides=getattr(self.value_index, "policy_overrides", None),
