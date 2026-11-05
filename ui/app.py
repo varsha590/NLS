@@ -247,7 +247,7 @@ def main() -> None:
     st.session_state.setdefault("tenant_id", os.getenv("TENANT_ID", "default"))
     tenant_id = st.session_state.tenant_id
     registry = DatasetRegistry(os.getenv("DATASET_STORAGE_PATH", "datasets"))
-    max_upload_mb = int(os.getenv("MAX_UPLOAD_MB", "25"))
+    max_upload_mb = int(os.getenv("MAX_UPLOAD_MB", "200"))
 
     with st.form("dataset-upload"):
         uploaded_file = st.file_uploader("SQL dump or SQLite database", type=["sql", "db"])
