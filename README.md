@@ -30,6 +30,8 @@ The sidebar shows index age and per-stage status; each query's **Run details** i
 
 **Credentials must be supplied at runtime** via the connection form. Startup and query execution use only metadata reads, `SELECT`, `EXPLAIN`, and supported read-only or timeout session settings. Database permissions remain the authoritative boundary; application validation is an additional layer. Credentials are excluded from local namespaces and masked in displayed URLs.
 
+The result set is held in memory for paging very large results use a lot of memory. Keep PAGE_SIZE small (default 50, max 500) to avoid excessive memory usage.
+
 The application no longer provisions or uses PostgreSQL vector tables. If an older PostgreSQL database still contains application-created `system_*` tables, review and drop them manually with an administrator after confirming they are no longer needed. The app does not drop them.
 
 ## Hints and examples
