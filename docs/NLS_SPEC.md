@@ -83,15 +83,14 @@ Simplify and restructure NLS around this flow:
 - Single pure SELECT only (CTEs and subqueries allowed). Reject data-modifying CTEs, SELECT INTO, FOR UPDATE, multiple statements.
 - Function denylist: pg_sleep, pg_read_file, load_extension, dblink, sleep, benchmark.
 - Sensitive-column rule in code (one extensible constant, whole-token matching, applied in projection, WHERE, JOIN, GROUP BY, ORDER BY); reject SELECT * on tables with sensitive columns.
-- Row limit enforced via the AST.
+- No row limit; paginate results in the UI; keep timeout and read-only session.
 - No EXPLAIN and no DB connection during validation (schema.json only).
 
 ## 6. Execution and credentials (Step 4)
-
 - Ask for host, port, database name, username, password in an `st.form` ONLY after validation passes. No widget `key=` for credential fields (keys store values in `st.session_state`).
 - Support sqlite (read-only file), mysql (pymysql), postgres (psycopg) via runtime-built URLs.
 - Never store credentials in `.env`, session state after submission, logs, Qdrant, or prompts. Mask them in exception messages. Close the connection after use.
-- Read-only transaction, query timeout, row limit where supported (Postgres `SET TRANSACTION READ ONLY` + `statement_timeout`; MySQL `max_execution_time`; SQLite `mode=ro` + `PRAGMA query_only`). README must tell users to connect with a SELECT-only DB role.
+- Read-only transaction and query timeout (Postgres `SET TRANSACTION READ ONLY` + `statement_timeout`; MySQL `max_execution_time`; SQLite `mode=ro` + `PRAGMA query_only`). Paginate results in the UI. README must tell users to connect with a SELECT-only DB role.
 - Show result rows in the UI. Never send rows to Groq. Any summary uses only column names and row count.
 - Log each executed query: tenant, dataset, SQL with literals replaced by placeholders, timestamp, row count, duration. Never log credentials or row data.
 - Show "no matching records found" for empty results.

@@ -207,7 +207,6 @@ def test_partial_local_index_surfaces_incomplete_state(tmp_path, monkeypatch):
         vector_store_path=str(tmp_path),
         schema_top_k=2,
         value_top_k=2,
-        max_rows=10,
         query_timeout_seconds=5,
         max_retries=0,
         allowed_schemas=(),

@@ -16,8 +16,7 @@ def _set_required_environment(monkeypatch):
         "SCHEMA_TOP_K": "4",
         "VALUE_TOP_K": "3",
         "VALUE_CARDINALITY_THRESHOLD": "12",
-        "MAX_ROWS": "30",
-        "QUERY_TIMEOUT_SECONDS": "6",
+"QUERY_TIMEOUT_SECONDS": "6",
         "MAX_RETRIES": "2",
     }
     for name, value in values.items():
@@ -35,7 +34,7 @@ def test_settings_uses_environment_values_without_hidden_defaults(monkeypatch):
     assert settings.llm_model == "configured-llm"
     assert settings.embedding_model == "configured-embedder"
     assert settings.schema_top_k == 4
-    assert settings.max_rows == 30
+    
 
 
 def test_legacy_groq_model_is_environment_only_migration_alias(monkeypatch):

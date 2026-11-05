@@ -535,7 +535,6 @@ def validate_sql(
     metadata: SchemaMetadata,
     dialect: str | None,
     allowed_tables: set[str] | None = None,
-    max_rows: int = 100,
     value_index: ValueIndex | None = None,
     resolved_values: list[dict[str, Any]] | None = None,
     policy_overrides: dict[str, Any] | None = None,
@@ -686,16 +685,6 @@ def validate_sql(
         ):
             raise ValidationError(_BLOCKED_MSG)
 
-    limit = parsed.args.get("limit")
-    if limit is None:
-        parsed = parsed.limit(max_rows)
-    else:
-        expression = limit.expression
-        if isinstance(expression, exp.Literal) and expression.is_int:
-            if int(expression.this) > max_rows:
-                limit.set("expression", exp.Literal.number(max_rows))
-        else:
-            limit.set("expression", exp.Literal.number(max_rows))
     # Literal safety net: check string literals against value index
     rewritten_sql, errors = _check_and_rewrite_literals(
         parsed,

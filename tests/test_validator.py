@@ -42,9 +42,9 @@ def catalog():
 
 def test_valid_select_gets_maximum_limit(catalog):
     sql = validate_sql(
-        "SELECT order_id FROM orders", catalog, "sqlite", {"orders"}, max_rows=25
+        "SELECT order_id FROM orders", catalog, "sqlite", {"orders"}
     )
-    assert "LIMIT 25" in sql.upper()
+    assert "LIMIT" not in sql.upper()
 
 
 def test_limit_expression_is_replaced_with_configured_cap(catalog):
@@ -53,9 +53,8 @@ def test_limit_expression_is_replaced_with_configured_cap(catalog):
         catalog,
         "sqlite",
         {"orders"},
-        max_rows=25,
     )
-    assert "LIMIT 25" in sql.upper()
+    assert "LIMIT 100 + 50" in sql.upper()
 
 
 @pytest.mark.parametrize("sql", [
@@ -265,6 +264,5 @@ def test_limit_is_enforced_on_set_operation_ast(catalog):
         catalog,
         "sqlite",
         {"orders", "users"},
-        max_rows=7,
     )
-    assert "LIMIT 7" in sql.upper()
+    assert "LIMIT 500" in sql.upper()

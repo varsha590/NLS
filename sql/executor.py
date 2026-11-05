@@ -14,7 +14,6 @@ class SQLError(Exception):
 def execute_sql(
     sql: str,
     engine: sa.Engine,
-    max_rows: int = 1000,
 ) -> Tuple[List[dict], List[str]]:
     """Execute a validated SQL statement through the configured dialect.
 
@@ -24,7 +23,6 @@ def execute_sql(
     Args:
         sql: The validated SQL statement to execute.
         engine: SQLAlchemy engine connected to the database (read-only user).
-        max_rows: Maximum number of rows to fetch.
 
     Returns:
         Tuple of (rows as list of dicts, column names list).
@@ -33,7 +31,7 @@ def execute_sql(
         SQLError: If execution fails.
     """
     try:
-        result = DatabaseAdapter(engine.url, engine=engine).run_readonly_query(sql, max_rows)
+        result = DatabaseAdapter(engine.url, engine=engine).run_readonly_query(sql)
         return result.rows, result.columns
     except DatabaseUnavailableError as error:
         raise SQLError(str(error)) from error

@@ -83,7 +83,6 @@ def validate_sql(
     allowed_tables: set[str],
     metadata: SchemaMetadata | None = None,
     allowed_column_pattern=None,
-    max_rows: int = 100,
     max_query_cost: int = 100000,
     dialect: str | None = None,
 ) -> ValidationResult:
@@ -93,7 +92,7 @@ def validate_sql(
             parsed = parse_one(sql, read=dialect)
             if not isinstance(parsed, exp.Select):
                 raise ValidationError("Only a single SELECT statement is allowed.")
-            normalized = parsed.limit(max_rows).sql(dialect=dialect)
+            normalized = parsed.sql(dialect=dialect)
             return ValidationResult(True, normalized)
         except Exception as error:
             return ValidationResult(False, sql, str(error))
@@ -103,7 +102,6 @@ def validate_sql(
             metadata=metadata,
             dialect=dialect,
             allowed_tables=allowed_tables,
-            max_rows=max_rows,
         )
         return ValidationResult(True, normalized)
     except ValidationError as error:

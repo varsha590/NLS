@@ -13,7 +13,7 @@ _TEST_DEFAULTS = {
     "SCHEMA_TOP_K": "8",
     "VALUE_TOP_K": "5",
     "VALUE_CARDINALITY_THRESHOLD": "50",
-    "MAX_ROWS": "100",
+    
     "QUERY_TIMEOUT_SECONDS": "15",
     "MAX_RETRIES": "0",
     "QDRANT_URL": "http://127.0.0.1:6333",

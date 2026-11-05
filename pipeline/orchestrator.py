@@ -89,7 +89,6 @@ class TextToSQLPipeline:
         generator: GroqGenerator,
         value_index: ValueIndex | None = None,
         examples: ExampleStore | None = None,
-        max_rows: int = 100,
         max_retries: int = 3,
         schema_top_k: int = 8,
         value_top_k: int = 5,
@@ -101,7 +100,6 @@ class TextToSQLPipeline:
         self.generator = generator
         self.value_index = value_index
         self.examples = examples
-        self.max_rows = max_rows
         self.max_retries = max_retries
         self.schema_top_k = schema_top_k
         self.value_top_k = value_top_k
@@ -295,7 +293,6 @@ class TextToSQLPipeline:
                         metadata=self.metadata,
                         dialect=self.adapter.get_sqlglot_dialect(),
                         allowed_tables=set(result.tables_used),
-                        max_rows=self.max_rows,
                         value_index=self.value_index,
                         resolved_values=result.resolved_values,
                         policy_overrides=getattr(self.value_index, "policy_overrides", None),
@@ -412,7 +409,7 @@ class TextToSQLPipeline:
 
                 execution_started = time.monotonic()
                 try:
-                    query_result = self.adapter.run_readonly_query(result.sql, self.max_rows)
+                    query_result = self.adapter.run_readonly_query(result.sql)
                     result.rows = query_result.rows
                     result.columns = query_result.columns
                     # Apply masking for 'mask' columns

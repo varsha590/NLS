@@ -137,8 +137,8 @@ class DatabaseAdapter:
                 sqlite_raw.execute("PRAGMA query_only=OFF")
             connection.close()
 
-    def run_readonly_query(self, sql: str, max_rows: int = 100) -> QueryResult:
-        """Execute pre-validated SQL using supported read-only settings and a row bound."""
+    def run_readonly_query(self, sql: str) -> QueryResult:
+        """Execute pre-validated SQL using supported read-only settings and no row bound."""
         self.call_counts["execution_db_calls"] += 1
         connection = self.connect()
         started = time.monotonic()
@@ -168,7 +168,7 @@ class DatabaseAdapter:
                 )
             result = connection.execute(sa.text(sql))
             columns = list(result.keys())
-            rows = [dict(row) for row in result.mappings().fetchmany(max(0, max_rows))]
+            rows = [dict(row) for row in result.mappings().fetchmany()]
             transaction.rollback()
             return QueryResult(rows=rows, columns=columns)
         except sa.exc.SQLAlchemyError:

@@ -414,7 +414,6 @@ def init_app(
         generator=generator,
         value_index=value_index,
         examples=examples,
-        max_rows=settings.max_rows,
         max_retries=settings.max_retries,
         schema_top_k=settings.schema_top_k,
         value_top_k=settings.value_top_k,

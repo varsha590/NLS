@@ -38,7 +38,6 @@ def _settings(vector_path, refresh_ttl_hours: float = 24) -> Settings:
         vector_store_path=str(vector_path),
         schema_top_k=4,
         value_top_k=3,
-        max_rows=20,
         query_timeout_seconds=5,
         max_retries=0,
         allowed_schemas=(),

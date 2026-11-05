@@ -39,11 +39,10 @@ def main() -> int:
             case["expected_sql"],
             metadata=runtime["metadata"],
             dialect=runtime["adapter"].get_sqlglot_dialect(),
-            max_rows=runtime["settings"].max_rows,
             adapter=runtime["adapter"],
         )
         expected = runtime["adapter"].run_readonly_query(
-            expected_sql, runtime["settings"].max_rows
+            expected_sql
         )
         passed = _result_set(result.rows) == _result_set(expected.rows)
         correct += int(passed)
