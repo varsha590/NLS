@@ -1,0 +1,8 @@
+{
+  "dataset_hash": "placeholder",
+  "embedding_model_name": "all-MiniLM-L6-v2",
+  "vector_dimension": 384,
+  "indexed": true,
+  "tenant_id": "default",
+  "dataset_id": "66793aca-d3cd-5832-bb37-f8449695106a"
+}

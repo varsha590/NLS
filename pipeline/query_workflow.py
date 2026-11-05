@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Protocol, Sequence, TypeAlias
 
 from llm.generator import GenerationError
+from llm.prompt_builder import build_query_prompt
 from llm.sql_generator import generate_sql
 from retrieval.qdrant_retriever import RetrievalResult, retrieve
 from retrieval.qdrant_store import QdrantStorageError, QdrantVectorStore, VECTOR_SIZE
@@ -62,7 +63,13 @@ class QueryDialectMissing:
     message: str = "The dataset needs re-indexing to determine the SQL dialect."
 
 
-GeneratedQueryOutcome: TypeAlias = ValidatedQuery | QueryGenerationFailed | QueryGenerationUnavailable | QueryDialectMissing
+@dataclass(frozen=True)
+class DatasetUnqueryable:
+    status: Literal["unqueryable"] = "unqueryable"
+    message: str = "This dataset can't be queried. Please re-upload it."
+
+
+GeneratedQueryOutcome: TypeAlias = ValidatedQuery | QueryGenerationFailed | QueryGenerationUnavailable | QueryDialectMissing | DatasetUnqueryable
 
 
 @dataclass(frozen=True)
@@ -184,12 +191,12 @@ def _sanitize_validator_feedback(error: ValidationError | ValueSafetyError) -> s
             return "A value in the query was not found."
         return "The query contains an invalid value."
     # ValidationError categories - match on message patterns
+    if "does not exist" in msg and "column" in msg.casefold():
+        return "The query referenced an unknown column."
     if "does not exist in the catalog" in msg:
         return "The query referenced an unknown table."
     if "was not included in the provided schema" in msg:
         return "The query referenced a table not in the schema."
-    if "does not exist" in msg and "column" in msg.casefold():
-        return "The query referenced an unknown column."
     if "is ambiguous" in msg and "column" in msg.casefold():
         return "The query referenced an ambiguous column."
     if "restricted column" in msg or "That information isn't available" in msg:
@@ -211,31 +218,47 @@ def _sanitize_validator_feedback(error: ValidationError | ValueSafetyError) -> s
     return "The query is invalid."
 
 
+def generate_sql_from_messages(
+    messages: list[dict[str, str]],
+    validation_error: str | None = None,
+) -> str:
+    """Generate SQL from pre-built prompt messages (single prompt build)."""
+    import os
+    from llm.generator import GroqGenerator, GenerationError
+    from llm.sql_generator import ClarificationRequiredError
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    model = os.environ.get("LLM_MODEL") or os.environ.get("GROQ_MODEL", "")
+    generator = GroqGenerator(api_key, model)
+    try:
+        sql = generator.generate(messages)
+    except Exception:
+        raise GenerationError("The language model is temporarily unavailable.") from None
+    if sql.startswith("ASK_FOR_CLARIFICATION:"):
+        raise ClarificationRequiredError("Please clarify the question before generating SQL.")
+    return sql
+
+
 def generate_and_validate_query(query: QueryReady) -> GeneratedQueryOutcome:
     """Generate SQL and validate it against the complete local schema catalog."""
-    # Empty dialect check - distinct typed outcome, generator not called
     dialect = query.metadata.dialect or ""
     if not dialect:
         return QueryDialectMissing()
 
     validation_error: str | None = None
     for attempt in range(2):
+        # Build prompt once per attempt - check for forbidden closing tag
+        messages = build_query_prompt(
+            query.context,
+            query.question,
+            dialect,
+            validation_error=validation_error,
+        )
+        if messages is None:
+            # Schema context contained forbidden closing tag
+            return DatasetUnqueryable()
+
         try:
-            messages = build_query_prompt(
-                query.context,
-                query.question,
-                dialect,
-                validation_error=validation_error,
-            )
-            if messages is None:
-                # Schema context contained forbidden closing tag
-                return QueryGenerationFailed(message="Schema context is malformed.")
-            sql = generate_sql(
-                query.context,
-                query.question,
-                dialect,
-                validation_error=validation_error,
-            )
+            sql = generate_sql_from_messages(messages)
             validated_sql = validate_sql(
                 sql,
                 metadata=query.metadata,

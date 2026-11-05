@@ -14,6 +14,7 @@ from ingestion.datasets import DatasetRegistry, UploadError
 from retrieval.dataset_indexer import index_registered_dataset
 from retrieval.embeddings import EmbeddingModel
 from retrieval.qdrant_store import QdrantStorageError, QdrantVectorStore
+from schema.metadata import SchemaMetadata, TableInfo, ColumnInfo
 
 LOGGER = logging.getLogger(__name__)
 
@@ -189,6 +190,44 @@ def _render_result(result: dict[str, Any], question: str, runtime: dict[str, Any
             st.json(index_metrics.get("stages", {}))
 
 
+def _get_value_documents(runtime: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract value documents from the runtime's value index."""
+    value_documents: list[dict[str, Any]] = []
+    try:
+        local_store = runtime.get("local_store")
+        if local_store is not None:
+            value_records = getattr(local_store, "value_records", [])
+            for vr in value_records:
+                value_documents.append({
+                    "table_name": vr.get("table_name", ""),
+                    "column_name": vr.get("column", ""),
+                    "value": vr.get("mention", ""),
+                    "content": vr.get("content", ""),
+                })
+    except Exception:
+        pass
+    return value_documents
+
+
+# ---- Question section ----
+
+@st.cache_resource
+def get_embedding_model(model_name: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")):
+    """Cache the embedding model (same one used for indexing)."""
+    from retrieval.embeddings import EmbeddingModel
+    return EmbeddingModel(model_name)
+
+
+def build_qdrant_store(runtime: dict[str, Any]) -> QdrantVectorStore:
+    """Build Qdrant store reusing the existing setup."""
+    from retrieval.qdrant_store import QdrantVectorStore
+    return QdrantVectorStore(
+        url=os.getenv("QDRANT_URL", "http://127.0.0.1:6333"),
+        api_key=os.getenv("QDRANT_API_KEY") or None,
+        collection_name=os.getenv("QDRANT_COLLECTION", "nls_documents"),
+    )
+
+
 def main() -> None:
     """Register a dataset and inspect its stored schema without DB connections."""
     load_dotenv(override=False)
@@ -199,13 +238,14 @@ def main() -> None:
         "Execution will require a separate database connection."
     )
     st.info(
-        "Dataset registration is available now. Question generation and execution are not active yet; "
-        "they are scheduled for Step 4."
+        "Dataset registration is available now. Question generation and execution are available."
     )
 
     # Tenant IDs currently scope local data only; they are not user authentication.
+    # tenant_id is an unauthenticated label; real authentication is a remaining limitation.
+    st.text_input("Tenant ID", key="tenant_id", help="Use the same ID each time to find your datasets.")
     st.session_state.setdefault("tenant_id", os.getenv("TENANT_ID", "default"))
-    tenant_id = st.text_input("Tenant ID", key="tenant_id")
+    tenant_id = st.session_state.tenant_id
     registry = DatasetRegistry(os.getenv("DATASET_STORAGE_PATH", "datasets"))
     max_upload_mb = int(os.getenv("MAX_UPLOAD_MB", "25"))
 
@@ -248,6 +288,7 @@ def main() -> None:
                             collection_name=os.getenv("QDRANT_COLLECTION", "nls_documents"),
                         )
                         try:
+                            from retrieval.dataset_indexer import index_registered_dataset
                             document_count = index_registered_dataset(
                                 registry,
                                 qdrant_store,
@@ -276,7 +317,7 @@ def main() -> None:
     datasets = registry.list_datasets(tenant_id.strip()) if tenant_id.strip() else []
     if not datasets:
         st.info("No datasets are registered for this tenant yet.")
-        return
+        st.stop()
 
     dataset_ids = [item["dataset_id"] for item in datasets]
     selected_id = st.selectbox(
@@ -310,3 +351,82 @@ def main() -> None:
         ],
         alt="Registered dataset schema summary",
     )
+
+    # ---- Question section ----
+    st.markdown("---")
+    st.subheader("Ask a question")
+    st.caption(f"Dataset: {selected['filename']} ({selected['dialect']})")
+
+    # Cache the embedding model (same one used for indexing)
+    embedder = get_embedding_model()
+
+    # Build Qdrant store reusing existing setup
+    qdrant_store = build_qdrant_store(st.session_state)
+
+    # Get value documents from the value index
+    value_documents = _get_value_documents(st.session_state)
+
+    # Tenant ID from session state
+    tenant_id = st.session_state.get("tenant_id", os.getenv("TENANT_ID", "default"))
+    dataset_id = selected["dataset_id"]
+
+    # Question form
+    with st.form("question-form"):
+        question = st.text_input("Enter your question")
+        submitted = st.form_submit_button("Ask", type="primary")
+
+        with st.expander("Advanced options"):
+            st.caption(f"Outcome: {st.session_state.get('last_outcome', '—')}")
+            st.caption(f"Dialect: {schema.dialect}")
+            st.caption(f"Tables: {len(schema.tables)}")
+            st.caption(f"Master values: {len(value_documents)}")
+            st.caption(f"Embedder: {embedder.model_name}")
+            st.caption(f"Dimension: {embedder.dim}")
+
+    if submitted and question.strip():
+        from ask import ask_question
+
+        with st.spinner("Processing question..."):
+            try:
+                outcome, message = ask_question(
+                    question,
+                    schema,
+                    value_documents,
+                    embedder,
+                    qdrant_store,
+                    tenant_id,
+                    dataset_id,
+                    str(st.session_state.get("vector_store_path", "datasets")),
+                )
+                # Render the outcome message
+                if outcome == "validated":
+                    st.success(message)
+                elif outcome == "unqueryable":
+                    st.error(message)
+                elif outcome == "retrieval_failed":
+                    st.warning(message)
+                elif outcome == "empty_question":
+                    st.info(message)
+                elif outcome == "too_long_question":
+                    st.error(message)
+                elif outcome == "re_index":
+                    st.warning(message)
+                elif outcome == "validator_failure":
+                    st.info(message)
+                elif outcome == "qdrant_failure":
+                    st.error(message)
+                elif outcome == "fallback":
+                    st.info(message)
+
+                # Show the outcome tag for debugging (moved to Advanced options in expander)
+                st.session_state["last_outcome"] = outcome
+
+            except Exception as error:
+                LOGGER.warning("Question processing failed: %s", type(error).__name__)
+                st.error("An unexpected error occurred. Please try again.")
+    elif submitted and not question.strip():
+        st.info("Please enter a question.")
+
+
+if __name__ == "__main__":
+    main()
