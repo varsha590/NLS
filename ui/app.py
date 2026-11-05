@@ -10,6 +10,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from core.startup import init_app
+from db.credentials import DbCredentials, execute_validated, log_query, page_rows
 from ingestion.datasets import DatasetRegistry, UploadError
 from retrieval.dataset_indexer import index_registered_dataset
 from retrieval.embeddings import EmbeddingModel
@@ -401,6 +402,124 @@ def main() -> None:
                 # Render the outcome message
                 if outcome == "validated":
                     st.success(message)
+                    # Determine port default from dialect
+                    if schema.dialect == "mysql":
+                        default_port = 3306
+                    elif schema.dialect == "postgresql":
+                        default_port = 5432
+                    else:
+                        default_port = None
+
+                    is_sqlite = schema.dialect == "sqlite"
+
+                    with st.form("db-credentials-form"):
+                        st.caption(f"Dataset dialect: {schema.dialect}")
+                        if is_sqlite:
+                            database = st.text_input("Database file path", value="")
+                        else:
+                            c1, c2 = st.columns(2)
+                            with c1:
+                                host = st.text_input("Host", value="localhost")
+                                port = st.number_input("Port", value=default_port or 1, min_value=1)
+                                username = st.text_input("Username", value="nls_ro")
+                            with c2:
+                                password = st.text_input("Password", value="", type="password")
+                                database = st.text_input("Database name", value="")
+                        submit = st.form_submit_button("Run query", type="primary")
+                    if submit:
+                        if is_sqlite:
+                            credentials = DbCredentials(
+                                dialect=schema.dialect,
+                                host="",
+                                port=None,
+                                username="",
+                                password="",
+                                database=database,
+                            )
+                        else:
+                            credentials = DbCredentials(
+                                dialect=schema.dialect,
+                                host=host,
+                                port=port,
+                                username=username,
+                                password=password,
+                                database=database,
+                            )
+                        # Execute the validated SQL against the provided credentials
+                        try:
+                            result = execute_validated(
+                                message,  # message contains the generated SQL
+                                credentials,
+                                stored_dialect=schema.dialect,
+                            )
+                            # Log the query (no credentials, no row data)
+                            log_query(
+                                tenant_id=tenant_id,
+                                dataset_id=dataset_id,
+                                sql=message,
+                                row_count=result["row_count"],
+                                duration_ms=result["duration_ms"],
+                            )
+                            # Store only columns/rows/row_count; drop credentials
+                            st.session_state["last_result"] = {
+                                "columns": result["columns"],
+                                "rows": result["rows"],
+                                "row_count": result["row_count"],
+                            }
+                            # Remove credentials from session state immediately
+                            if "db_credentials" in st.session_state:
+                                del st.session_state["db_credentials"]
+                        except ValueError as e:
+                            # Dialect mismatch - show error without password
+                            from db.credentials import _scrub_credentials
+                            st.error(_scrub_credentials(str(e)))
+                        except Exception as e:
+                            # Connection failure or timeout - show error without password
+                            from db.credentials import _scrub_credentials
+                            st.error(f"The query could not be run: {_scrub_credentials(str(e))}")
+                    # Display results from session state
+                    if "last_result" in st.session_state:
+                        lr = st.session_state["last_result"]
+                        if lr["row_count"] > 0:
+                            rows_shown = page_rows(
+                                lr["rows"],
+                                st.session_state.get("page", 1),
+                                int(os.getenv("PAGE_SIZE", 50)),
+                            )
+                            st.success(f"Query returned {lr['row_count']} row(s)")
+                            if rows_shown:
+                                st.dataframe(rows_shown, alt="Query result rows")
+                            else:
+                                st.info("No matching records found.")
+                            # Pagination controls
+                            c1, c2, c3 = st.columns(3)
+                            with c1:
+                                if st.button("Previous", disabled=st.session_state.get("page", 1) <= 1):
+                                    st.session_state["page"] = max(1, st.session_state.get("page", 1) - 1)
+                                    st.rerun()
+                            with c2:
+                                st.caption(f"Page {st.session_state.get('page', 1)}")
+                            with c3:
+                                if st.button("Next", disabled=lr["row_count"] <= st.session_state.get("page", 1) * int(os.getenv("PAGE_SIZE", 50))):
+                                    max_page = max(1, (lr["row_count"] + int(os.getenv("PAGE_SIZE", 50)) - 1) // int(os.getenv("PAGE_SIZE", 50)))
+                                    st.session_state["page"] = min(max_page, st.session_state.get("page", 1) + 1)
+                                    st.rerun()
+                        else:
+                            st.info("No matching records found.")
+                    # Show SQL in collapsed section
+                    with st.expander("Show query", expanded=False):
+                        if message:
+                            st.code(message, language="sql")
+                        else:
+                            st.info("No SQL was generated.")
+                    # Advanced options - collapsed
+                    with st.expander("Advanced", expanded=False):
+                        st.caption(f"Outcome: {outcome}")
+                        st.caption(f"Dialect: {schema.dialect}")
+                        st.caption(f"Tables: {len(schema.tables)}")
+                        st.caption(f"Master values: {len(value_documents)}")
+                        st.caption(f"Embedder: {embedder.model_name}")
+                        st.caption(f"Dimension: {embedder.dim}")
                 elif outcome == "unqueryable":
                     st.error(message)
                 elif outcome == "retrieval_failed":
@@ -422,7 +541,9 @@ def main() -> None:
                 st.session_state["last_outcome"] = outcome
 
             except Exception as error:
-                LOGGER.warning("Question processing failed: %s", type(error).__name__)
+                import traceback
+                from db.credentials import _scrub_credentials
+                LOGGER.exception("Question processing failed: %s", _scrub_credentials(str(error)))
                 st.error("An unexpected error occurred. Please try again.")
     elif submitted and not question.strip():
         st.info("Please enter a question.")

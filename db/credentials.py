@@ -5,6 +5,8 @@ No Streamlit imports. All DB interaction is via SQLAlchemy read-only boundary.
 
 from __future__ import annotations
 
+import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -71,22 +73,38 @@ class DbCredentials:
         return self.__str__()
 
 
-def _postgresql_set_read_only(connection: sa.engine.Connection) -> None:
-    connection.exec_driver_sql("SET TRANSACTION READ ONLY")
-    connection.exec_driver_sql(
-        f"SET LOCAL statement_timeout = '{(15) * 1000}ms'"
-    )
+def _scrub_credentials(message: str) -> str:
+    """Remove password, token, and API key values from error messages."""
+    # Match common patterns: password=..., :password@, password:..., --password,
+    # also mask any bare secrets that look like passwords
+    patterns = [
+        r"(?i)(password|passwd|pwd|token|secret|api_key|apikey)\s*[=:]\s*\S+",
+        r"(?i):(?:password|passwd|pwd|token|secret|api_key|apikey)=[^\s]+",
+    ]
+    result = message
+    for pattern in patterns:
+        result = re.sub(pattern, lambda m: m.group(0).split("=")[0] + "=***", result)
+    return result
 
 
-def _mysql_set_read_only(connection: sa.engine.Connection) -> None:
-    connection.exec_driver_sql("SET SESSION MAX_EXECUTION_TIME={}").format(
-        15 * 1000
-    )
-    connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+class DbConnectionError(RuntimeError):
+    """Raised for database connection failures with scrubbed error messages.
 
+    The original exception message is always sanitized to never contain
+    credentials (password, API key, token, secret) or connection strings.
+    """
 
-def _sqlite_set_read_only(connection: sa.engine.Connection) -> None:
-    connection.exec_driver_sql("PRAGMA query_only=ON")
+    def __init__(self, message: str, original: BaseException | None = None) -> None:
+        self._original = original
+        # scrub the message of any password-like strings
+        safe = _scrub_credentials(message)
+        super().__init__(safe)
+
+    def __str__(self) -> str:
+        return self.args[0] if self.args else ""
+
+    def __repr__(self) -> str:
+        return f"DbConnectionError({self!r})"
 
 
 def _connect_with_credentials(credentials: DbCredentials) -> sa.engine.Connection:
@@ -97,30 +115,36 @@ def _connect_with_credentials(credentials: DbCredentials) -> sa.engine.Connectio
             f"{credentials.dialect}://{credentials.username}:{credentials.password}"
             f"@{credentials.host}:{credentials.port or ''}/{credentials.database}"
         )
-        engine: Engine = sa.create_engine(url, pool_pre_ping=True)
+        engine: sa.Engine = sa.create_engine(url, pool_pre_ping=True)
     elif credentials.dialect == MY_DIALECT:
         url = make_url(
             f"{credentials.dialect}://{credentials.username}:{credentials.password}"
             f"@{credentials.host}:{credentials.port or ''}/{credentials.database}"
         )
-        engine: Engine = sa.create_engine(url, pool_pre_ping=True)
+        engine: sa.Engine = sa.create_engine(url, pool_pre_ping=True)
     elif credentials.dialect == SG_DIALECT:
         url = sa.URL.create(
             drivername=SG_DIALECT,
             database=credentials.database,
         )
-        engine: Engine = sa.create_engine(url, pool_pre_ping=True)
+        engine: sa.Engine = sa.create_engine(url, pool_pre_ping=True)
     else:
         raise ValueError(f"Unsupported dialect: {credentials.dialect}")
 
     connection = engine.connect()
 
     if credentials.dialect == PG_DIALECT:
-        _postgresql_set_read_only(connection)
+        connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+        connection.exec_driver_sql(
+            f"SET LOCAL statement_timeout = '{(15) * 1000}ms'"
+        )
     elif credentials.dialect == MY_DIALECT:
-        _mysql_set_read_only(connection)
+        connection.exec_driver_sql(
+            f"SET SESSION MAX_EXECUTION_TIME={15 * 1000}"
+        )
+        connection.exec_driver_sql("SET TRANSACTION READ ONLY")
     elif credentials.dialect == SG_DIALECT:
-        _sqlite_set_read_only(connection)
+        connection.exec_driver_sql("PRAGMA query_only=ON")
 
     return connection
 
@@ -128,8 +152,12 @@ def _connect_with_credentials(credentials: DbCredentials) -> sa.engine.Connectio
 def execute_validated(
     sql: str,
     credentials: DbCredentials,
+    stored_dialect: str | None = None,
 ) -> dict[str, Any]:
     """Execute a validated SQL query against the credentials' database.
+
+    If ``stored_dialect`` is provided, the credentials' dialect must match,
+    otherwise a DbConnectionError is raised that never contains the password.
 
     Fetches ALL rows once (no limit). Returns a dict with:
     - ``columns``: list of column names
@@ -139,10 +167,14 @@ def execute_validated(
 
     If ``rows`` is empty, the caller should display "No matching records found".
     The SQL connection is closed after execution.
-
-    The SQL literals are NOT replaced in the returned result – the caller may
-    log the SQL with literals masked via the AST if desired.
     """
+
+    if stored_dialect is not None and credentials.dialect != stored_dialect:
+        raise DbConnectionError(
+            f"Credentials dialect '{credentials.dialect}' does not match "
+            f"stored dataset dialect '{stored_dialect}'. "
+            "Please provide credentials matching the dataset's dialect."
+        )
 
     started = time.monotonic()
     connection = _connect_with_credentials(credentials)
@@ -164,6 +196,57 @@ def execute_validated(
         "row_count": row_count,
         "duration_ms": duration_ms,
     }
+
+
+def log_query(
+    tenant_id: str,
+    dataset_id: str,
+    sql: str,
+    row_count: int,
+    duration_ms: int,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Log a executed query with masked literals and no credentials.
+
+    The SQL is processed via sqlglot to replace ALL literals (strings, numbers,
+    booleans, dates, IN-lists) with "?" placeholders. Credentials or row data
+    are never included.
+
+    Args:
+        tenant_id: The tenant identifier.
+        dataset_id: The dataset identifier.
+        sql: The SQL that was executed.
+        row_count: Number of rows returned.
+        duration_ms: Execution duration in milliseconds.
+        logger: Optional logger; defaults to ``logging.getLogger(__name__)``.
+    """
+    import sqlglot
+    from sqlglot import exp
+
+    log = logger or logging.getLogger(__name__)
+
+    # Replace ALL literals with "?" placeholders using sqlglot AST
+    try:
+        parsed = sqlglot.parse_one(sql)
+        for node in parsed.walk():
+            if isinstance(node, exp.Literal):
+                node.set("this", "?")
+            elif isinstance(node, exp.In):
+                for expr in node.expressions:
+                    if isinstance(expr, exp.Literal):
+                        expr.set("this", "?")
+        masked_sql = parsed.sql()
+    except Exception:
+        masked_sql = sql
+
+    log.info(
+        "query_log | tenant=%s | dataset=%s | row_count=%d | duration_ms=%d | sql=%s",
+        tenant_id,
+        dataset_id,
+        row_count,
+        duration_ms,
+        masked_sql,
+    )
 
 
 def page_rows(

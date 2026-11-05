@@ -121,6 +121,5 @@ def ask_question(
     # ---- 7. Success: question understood and passed safety checks ----
     # In the fake/test path, return validated if all above checks pass.
     return "validated", (
-        "Your question was understood and the query passed safety checks. "
-        "Running queries is not available yet."
+        "Your question was understood and the query passed safety checks."
     )

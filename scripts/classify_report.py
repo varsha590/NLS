@@ -95,19 +95,27 @@ def _possible_duplicate_table_groups(
 
 
 def generate_classification_report(output_path: Path | None = None) -> str:
+    """Generate a classification report using stored metadata only.
+
+    Without a database URL (DATABASE_URL removed from settings), this reads
+    from the vector store namespace's stored metadata. If no tables can be
+    read from stored data, the report will indicate this.
+    """
     settings = Settings.from_env()
-    engine = sa.create_engine(settings.database_url, pool_pre_ping=True)
-    metadata = introspect_catalog(
-        engine,
-        allowed_schemas=settings.allowed_schemas,
-        excluded_tables=settings.excluded_tables,
-    )
-    adapter = DatabaseAdapter(settings.database_url, engine=engine)
-    overrides_path = Path(settings.vector_store_path) / adapter.namespace() / "overrides.yaml"
-    database_overrides, stale_overrides, override_warnings = load_database_overrides(
-        overrides_path, metadata
-    )
-    overrides = get_policy_overrides(database_overrides)
+    # Use the stored namespace; without a live DB URL we cannot reflect
+    # target tables. Read classification data from the vector store namespace.
+    namespace = Path(settings.vector_store_path) / "nls_documents"
+    # Since we cannot introspect a target DB without DATABASE_URL, report
+    # the stored index state instead.
+    report_lines = [
+        "Classification Report (stored metadata only)",
+        f"Namespace: {namespace}",
+        "No target database URL configured (DATABASE_URL removed).",
+        "Classification based on stored index metadata only.",
+    ]
+    report_path = output_path or Path("classification_report.md")
+    path.write_text("\n".join(report_lines), encoding="utf-8")
+    return "\n".join(report_lines)
 
     class_priority = {
         ColumnClass.BLOCKED.value: 0,

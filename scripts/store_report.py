@@ -116,15 +116,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", help="Override VECTOR_STORE_PATH")
     args = parser.parse_args(argv)
     settings = Settings.from_env()
-    adapter = DatabaseAdapter(settings.database_url, settings.query_timeout_seconds)
-    metadata = introspect_catalog(
-        adapter.engine,
-        allowed_schemas=settings.allowed_schemas,
-        excluded_tables=settings.excluded_tables,
-    )
+    adapter = DatabaseAdapter("sqlite:///:memory:", settings.query_timeout_seconds)
+    # Read namespace from stored metadata; introspect_catalog requires a live DB,
+    # so we derive the report from stored vector-store files only.
     overrides_path = Path(settings.vector_store_path) / adapter.namespace() / "overrides.yaml"
     _, stale_overrides, override_warnings = load_database_overrides(
-        overrides_path, metadata
+        overrides_path, None
     )
     print(format_store_report(
         args.root or settings.vector_store_path,

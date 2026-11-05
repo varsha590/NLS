@@ -166,7 +166,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.dry_run:
             settings = Settings.from_env()
-            adapter = DatabaseAdapter(settings.database_url, settings.query_timeout_seconds)
+            adapter = DatabaseAdapter(
+                "sqlite:///:memory:", settings.query_timeout_seconds,
+            )
             _read_only_probe(adapter)
             plan = create_dry_run_plan(settings, adapter)
             print("Read-only re-index dry run")

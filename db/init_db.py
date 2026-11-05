@@ -9,7 +9,7 @@ import sqlalchemy as sa
 from config.settings import Settings
 
 LOGGER = logging.getLogger(__name__)
-engine = sa.create_engine(Settings.from_env().database_url, pool_pre_ping=True)
+engine = None
 metadata = sa.MetaData()
 
 

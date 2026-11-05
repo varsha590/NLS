@@ -116,6 +116,7 @@ def test_cue_followed_by_unknown_value_reports_one_not_found():
         "column": "categories.category_name",
         "candidates": [],
         "confidence": 0.0,
+        "high_cardinality": False,
     }]
 
 
