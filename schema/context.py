@@ -4,7 +4,7 @@ Builds compact, exact schema context from SchemaMetadata for the LLM.
 No column truncation - includes all columns with PK/FK annotations.
 """
 
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from .metadata import (
     EXCLUDED_SCHEMA_OBJECTS,
@@ -13,11 +13,7 @@ from .metadata import (
     ColumnInfo,
 )
 
-try:
-    from config.data_policy import is_blocked
-except Exception:
-    def is_blocked(key: str) -> bool:
-        return False
+from config.data_policy import is_blocked, is_masked
 
 
 def build_column_line(col: ColumnInfo) -> str:
@@ -154,3 +150,92 @@ def build_full_context(
     expanded = get_expanded_table_names(metadata, retrieved_table_names)
     context = build_schema_context(metadata, expanded, value_hints=value_hints)
     return context, expanded
+
+
+def build_query_context(
+    metadata: SchemaMetadata,
+    table_names: list[str],
+    value_matches: list[dict[str, Any]],
+    policy_overrides: dict[str, Any] | None = None,
+) -> str:
+    """Build compact query context from selected schema and matcher results only."""
+    selected_tables = set(table_names)
+    parts = ["=== SCHEMA ==="]
+    for table_name in dict.fromkeys(table_names):
+        table = metadata.get_table(table_name)
+        if table is None or table_name in EXCLUDED_SCHEMA_OBJECTS:
+            continue
+
+        visible_columns = [
+            column
+            for column in table.columns
+            if not is_blocked(
+                f"{table.name}.{column.name}", policy_overrides=policy_overrides
+            )
+            and not is_masked(
+                f"{table.name}.{column.name}", policy_overrides=policy_overrides
+            )
+        ]
+        if not visible_columns:
+            continue
+        parts.append(f"{table.name}:")
+        parts.extend(
+            f"- {column.name}: {column.data_type}" for column in visible_columns
+        )
+
+        for relation in table.foreign_keys:
+            local_columns = relation.get("local_cols") or []
+            remote_table_name = relation.get("remote_table") or ""
+            remote_columns = relation.get("remote_cols") or []
+            if (
+                not local_columns
+                or not remote_table_name
+                or remote_table_name not in selected_tables
+                or not remote_columns
+            ):
+                continue
+            if any(
+                is_blocked(
+                    f"{table.name}.{column_name}", policy_overrides=policy_overrides
+                )
+                or is_masked(
+                    f"{table.name}.{column_name}", policy_overrides=policy_overrides
+                )
+                for column_name in local_columns
+            ):
+                continue
+            if any(
+                is_blocked(
+                    f"{remote_table_name}.{column_name}", policy_overrides=policy_overrides
+                )
+                or is_masked(
+                    f"{remote_table_name}.{column_name}", policy_overrides=policy_overrides
+                )
+                for column_name in remote_columns
+            ):
+                continue
+            local = ", ".join(str(name) for name in local_columns)
+            remote = ", ".join(str(name) for name in remote_columns)
+            parts.append(f"- relationship: {table.name}.{local} -> {remote_table_name}.{remote}")
+
+    if value_matches:
+        parts.extend(("", "=== VALUE MATCHES ==="))
+        for match in value_matches:
+            table = match.get("table", "")
+            column = match.get("column", "")
+            value = match.get("value", "")
+            if not table or not column or not value:
+                continue
+            column_key = f"{table}.{column}"
+            if is_blocked(column_key, policy_overrides=policy_overrides) or is_masked(
+                column_key, policy_overrides=policy_overrides
+            ):
+                continue
+            if match.get("match_type") == "fuzzy_text":
+                parts.append(
+                    f"- possible match, unconfirmed: {value!r} in {column_key}"
+                )
+            else:
+                parts.append(f"- exact match: {value!r} in {column_key}")
+
+    return "\n".join(parts)

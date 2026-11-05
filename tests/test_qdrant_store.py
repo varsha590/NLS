@@ -325,6 +325,7 @@ def test_retrieve_propagates_real_store_metadata_mismatch_before_search(
             qdrant_embedding_model_name="model-384",
             qdrant_embedding_dimension=384,
             qdrant_dataset_metadata_path=str(metadata_path),
+            query_vector=VECTOR,
         )
     assert client.search_calls == []
     client.close()

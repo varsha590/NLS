@@ -497,16 +497,22 @@ def test_retrieve_uses_all_qdrant_search_results(monkeypatch, tmp_path):
             return self.results[kind]
 
         def search_table(self, *args):
+            self.received_vectors.append(args[0])
             return self._search("table")
 
         def search_column(self, *args):
+            self.received_vectors.append(args[0])
             return self._search("column")
 
         def search_relationship(self, *args):
+            self.received_vectors.append(args[0])
             return self._search("relationship")
 
         def search_master_value(self, *args):
+            self.received_vectors.append(args[0])
             return self._search("master_value")
+
+        received_vectors = []
 
     store = FakeStore()
     selected_scores = []
@@ -532,6 +538,7 @@ def test_retrieve_uses_all_qdrant_search_results(monkeypatch, tmp_path):
     monkeypatch.setattr(retriever_module, "expand_fk_neighbors", capture_expand)
     monkeypatch.setattr(retriever_module, "_compute_ambiguity_flag", capture_ambiguity)
 
+    query_vector = [0.25] + [0.0] * 383
     result = retrieve(
         metadata,
         "show id",
@@ -541,15 +548,42 @@ def test_retrieve_uses_all_qdrant_search_results(monkeypatch, tmp_path):
         qdrant_dataset_id="dataset",
         qdrant_embedding_model_name="model",
         qdrant_dataset_metadata_path=str(tmp_path / "dataset.json"),
+        query_vector=query_vector,
     )
 
     assert store.calls == ["table", "column", "relationship", "master_value"]
+    assert store.received_vectors == [query_vector] * 4
     assert selected_scores[0] == ("orders", pytest.approx(1.72))
     assert selected_scores[1] == ("customers", pytest.approx(1.08))
     assert expanded_inputs == ["orders", "customers"]
     assert ambiguity_inputs == ["orders", "customers"]
     assert result.tables == ["orders", "customers"]
     assert result.ambiguity_flag is True
+    assert result.typed_hits == store.results
+    assert result.used_qdrant is True
+
+
+def test_retrieve_without_query_vector_uses_lexical_fallback_only():
+    metadata = SchemaMetadata({
+        "orders": TableInfo("orders", "", [ColumnInfo("order_id", "INTEGER")], [], []),
+    })
+
+    class StoreThatMustNotBeCalled:
+        def __getattr__(self, name):
+            raise AssertionError(f"Qdrant search unexpectedly called: {name}")
+
+    result = retrieve(
+        metadata,
+        "orders",
+        qdrant_store=StoreThatMustNotBeCalled(),
+        qdrant_tenant_id="tenant",
+        qdrant_dataset_id="dataset",
+        qdrant_dataset_metadata_path="dataset.json",
+    )
+
+    assert result.tables == ["orders"]
+    assert result.typed_hits == {}
+    assert result.used_qdrant is False
 
 
 def test_non_mismatch_qdrant_error_falls_back_to_lexical_scoring(caplog, tmp_path):
@@ -566,6 +600,7 @@ def test_non_mismatch_qdrant_error_falls_back_to_lexical_scoring(caplog, tmp_pat
         result = retrieve(
             metadata,
             "orders",
+            query_vector=[0.0] * 384,
             qdrant_store=FailingStore(),
             qdrant_tenant_id="tenant",
             qdrant_dataset_id="dataset",
@@ -599,8 +634,12 @@ def test_qdrant_hits_rank_above_lexical_only_tables_but_exact_values_still_force
         "qdrant_store": FakeStore(),
         "qdrant_tenant_id": "tenant",
         "qdrant_dataset_id": "dataset",
+        "qdrant_dataset_metadata_path": "dataset.json",
     }
-    result = retrieve(metadata, "orders", selected_k=1, max_tables=1, **common)
+    result = retrieve(
+        metadata, "orders", selected_k=1, max_tables=1,
+        query_vector=[0.1] * 384, **common
+    )
     assert result.tables == ["archive"]
 
     exact_result = retrieve(
@@ -609,6 +648,7 @@ def test_qdrant_hits_rank_above_lexical_only_tables_but_exact_values_still_force
         selected_k=1,
         max_tables=1,
         exact_value_tables={"orders"},
+        query_vector=[0.1] * 384,
         **common,
     )
     assert exact_result.tables == ["orders"]
@@ -640,6 +680,7 @@ def test_retrieve_passes_document_specific_limits_to_real_store(tmp_path):
     schema = SchemaMetadata({
         "records": TableInfo("records", "", [ColumnInfo("id", "INTEGER")], [], []),
     })
+    query_vector = [1.0] + [0.0] * 383
 
     try:
         for top_k in (2, 30):
@@ -648,6 +689,7 @@ def test_retrieve_passes_document_specific_limits_to_real_store(tmp_path):
                 schema,
                 "records",
                 selected_k=top_k,
+                    query_vector=query_vector,
                 qdrant_store=store,
                 qdrant_tenant_id="tenant",
                 qdrant_dataset_id="dataset",

@@ -8,7 +8,7 @@ from __future__ import annotations
 import logging
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo
 
@@ -33,7 +33,8 @@ class RetrievalResult:
     """Result of schema retrieval with roll-up scoring and FK expansion."""
 
     tables: List[str]
-    value_matches: List[dict[str, Any]]
+    typed_hits: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    used_qdrant: bool = False
     truncated: bool = False
     ambiguity_flag: bool = False
 
@@ -287,36 +288,39 @@ def retrieve(
     qdrant_embedding_model_name: str = "",
     qdrant_embedding_dimension: int = VECTOR_SIZE,
     qdrant_dataset_metadata_path: str | None = None,
+    query_vector: Sequence[float] | None = None,
 ) -> RetrievalResult:
     """Pure-logic schema retrieval with roll-up scoring and FK expansion.
 
-    Optionally uses Qdrant vector search for table/column/relationship/master_value
-    results, which are then scored, selected, and expanded using pure-logic logic.
-    No Qdrant, no FAISS, no embeddings when qdrant_store is None. Uses only
-    SchemaMetadata.
+    Uses the supplied question embedding for typed Qdrant searches. Without a
+    query vector, retrieval stays on the lexical-only path. Results are scored,
+    selected, and expanded using the local schema metadata.
     """
     if exact_value_tables is None:
         exact_value_tables = set()
 
-    # Optional: perform four typed Qdrant searches if a store and scope are provided
+    # A missing embedding deliberately selects lexical fallback; never query with a zero vector.
     qdrant_results: dict[str, list[dict[str, Any]]] = {}
     qdrant_search_succeeded = False
-    if qdrant_store is not None and qdrant_tenant_id and qdrant_dataset_id:
+    if (
+        qdrant_store is not None
+        and qdrant_tenant_id
+        and qdrant_dataset_id
+        and qdrant_dataset_metadata_path
+        and query_vector is not None
+    ):
         try:
-            # Table search
-            if qdrant_dataset_metadata_path:
-                table_search = qdrant_store.search_table(
-                    [0.0] * qdrant_embedding_dimension,
-                    qdrant_tenant_id,
-                    qdrant_dataset_id,
-                    selected_k,
-                    qdrant_dataset_metadata_path,
-                    qdrant_embedding_model_name,
-                    qdrant_embedding_dimension,
-                )
-                qdrant_results["table"] = table_search
+            qdrant_results["table"] = qdrant_store.search_table(
+                query_vector,
+                qdrant_tenant_id,
+                qdrant_dataset_id,
+                selected_k,
+                qdrant_dataset_metadata_path,
+                qdrant_embedding_model_name,
+                qdrant_embedding_dimension,
+            )
             column_search = qdrant_store.search_column(
-                [0.0] * qdrant_embedding_dimension,
+                query_vector,
                 qdrant_tenant_id,
                 qdrant_dataset_id,
                 selected_k,
@@ -327,7 +331,7 @@ def retrieve(
             qdrant_results["column"] = column_search
             # Relationship search (limit: selected_k * 2)
             rel_search = qdrant_store.search_relationship(
-                [0.0] * qdrant_embedding_dimension,
+                query_vector,
                 qdrant_tenant_id,
                 qdrant_dataset_id,
                 selected_k,
@@ -337,7 +341,7 @@ def retrieve(
             )
             qdrant_results["relationship"] = rel_search
             master_search = qdrant_store.search_master_value(
-                [0.0] * qdrant_embedding_dimension,
+                query_vector,
                 qdrant_tenant_id,
                 qdrant_dataset_id,
                 selected_k,
@@ -420,19 +424,10 @@ def retrieve(
     # "show order id" ranks orders first (ambiguity_flag=False because "order" token disambiguates)
     ambiguity_flag = _compute_ambiguity_flag(query, metadata, expanded)
 
-    # Step 5: Build value matches (simplified)
-    value_matches: List[dict[str, Any]] = []
-    for table_name in expanded:
-        table = metadata.get_table(table_name)
-        if table is not None:
-            for column in table.columns:
-                value_matches.append(
-                    {"table": table_name, "column": column.name, "value": f"{table_name}.{column.name}"}
-                )
-
     return RetrievalResult(
         tables=expanded,
-        value_matches=value_matches,
+        typed_hits=qdrant_results,
+        used_qdrant=qdrant_search_succeeded,
         truncated=truncated,
         ambiguity_flag=ambiguity_flag,
     )
