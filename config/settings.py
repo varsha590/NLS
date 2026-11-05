@@ -5,9 +5,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from dotenv import load_dotenv
-
-
 class SettingsError(ValueError):
     """Raised when required environment-backed configuration is missing."""
 
@@ -18,7 +15,7 @@ def _csv_setting(name: str) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class Settings:
-    """Validated runtime settings loaded from the process environment and .env."""
+    """Validated runtime settings loaded from the process environment."""
 
     groq_api_key: str
     llm_model: str
@@ -46,9 +43,8 @@ class Settings:
     qdrant_collection: str = "nls_documents"
 
     @classmethod
-    def from_env(cls, dotenv_path: str | None = None) -> "Settings":
-        """Load settings without falling back to in-code connection or model values."""
-        load_dotenv(dotenv_path=dotenv_path, override=False)
+    def from_env(cls) -> "Settings":
+        """Load settings without reading files or using in-code model defaults."""
         llm_model = os.getenv("LLM_MODEL") or os.getenv("GROQ_MODEL") or ""
         required = {
             "LLM_MODEL (or legacy GROQ_MODEL)": llm_model,
@@ -63,7 +59,7 @@ class Settings:
         missing = [name for name, value in required.items() if not value]
         if missing:
             raise SettingsError(
-                "Missing required .env settings: " + ", ".join(missing)
+                "Missing required environment settings: " + ", ".join(missing)
             )
         return cls(
             groq_api_key=os.getenv("GROQ_API_KEY", ""),

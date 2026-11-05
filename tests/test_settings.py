@@ -2,7 +2,6 @@
 
 import pytest
 
-from config import settings as settings_module
 from config.settings import Settings, SettingsError
 
 
@@ -21,7 +20,6 @@ def _set_required_environment(monkeypatch):
     for name, value in values.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("GROQ_MODEL", raising=False)
-    monkeypatch.setattr(settings_module, "load_dotenv", lambda **kwargs: None)
 
 
 def test_settings_uses_environment_values_without_hidden_defaults(monkeypatch):

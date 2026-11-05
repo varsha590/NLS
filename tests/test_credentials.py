@@ -11,7 +11,17 @@ from sqlglot import exp
 
 import pytest
 
-from db.credentials import DbCredentials, DbConnectionError, _credentials_url, _scrub_credentials, execute_validated, log_query, page_rows
+from db.credentials import (
+    DbCredentials,
+    DbConnectionError,
+    _connect_with_credentials,
+    _credentials_url,
+    _scrub_credentials,
+    execute_validated,
+    log_query,
+    page_rows,
+    test_connection as verify_connection,
+)
 
 
 # --- DbCredentials repr/str masking ---
@@ -112,6 +122,33 @@ def test_execute_validated_empty_result():
     assert "cnt" in result["columns"]
     assert result["row_count"] == 0
     assert result["rows"] == []
+
+
+def test_file_backed_sqlite_connection_is_read_only(tmp_path):
+    database_path = tmp_path / "readonly.db"
+    with sa.create_engine(f"sqlite:///{database_path}").begin() as connection:
+        connection.exec_driver_sql("CREATE TABLE records (record_id INTEGER)")
+        connection.exec_driver_sql("INSERT INTO records VALUES (1)")
+    credentials = DbCredentials(
+        dialect="sqlite",
+        host="",
+        port=None,
+        username="",
+        password="",
+        database=str(database_path),
+    )
+
+    verify_connection(credentials, timeout_seconds=2)
+    result = execute_validated("SELECT record_id FROM records", credentials)
+    assert result["rows"] == [{"record_id": 1}]
+
+    connection = _connect_with_credentials(credentials)
+    try:
+        connection.exec_driver_sql("PRAGMA query_only=OFF")
+        with pytest.raises(sa.exc.OperationalError):
+            connection.exec_driver_sql("INSERT INTO records VALUES (2)")
+    finally:
+        connection.close()
 
 
 # --- log_query: literals masked, no credentials ---

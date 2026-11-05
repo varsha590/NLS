@@ -5,10 +5,10 @@ from __future__ import annotations
 import os
 import sqlite3
 import tempfile
+import time
 
 import pytest
 
-from ask import AskResult
 from ui.state import (
     ASK_VALIDATED,
     ASK_OTHER,
@@ -183,7 +183,7 @@ def _find_secret(obj, needles=("pw", "secret", "password")):
 
 @pytest.mark.skipif(not HAS_APPTEST, reason="AppTest not available")
 def test_apptest_validated_rerun_flow(monkeypatch):
-    """Ask -> validated -> sqlite form -> submit -> rows shown -> rerun -> rows still shown; no password in session_state."""
+    """Validated SQL precedes connection; rows persist and page without re-execution."""
     db_fd, db_path = tempfile.mkstemp(suffix=".db")
     os.close(db_fd)
     conn = sqlite3.connect(db_path)
@@ -193,18 +193,52 @@ def test_apptest_validated_rerun_flow(monkeypatch):
     conn.commit()
     conn.close()
 
-    def fake_ask_question(question, metadata, value_documents, embedder, qdrant_store,
-                          tenant_id, dataset_id, dataset_metadata_path):
-        return AskResult(
-            outcome="validated", message="Validated.",
-            sql="SELECT id, name, price FROM items", dialect="sqlite",
+    dataset_root = os.path.join(os.path.dirname(db_path), "datasets")
+    monkeypatch.setenv("DATASET_STORAGE_PATH", dataset_root)
+    monkeypatch.setenv("PAGE_SIZE", "1")
+    from ingestion.datasets import DatasetRegistry
+    from pipeline.query_workflow import QueryReady, ValidatedQuery
+    from retrieval.qdrant_retriever import RetrievalResult
+
+    registry = DatasetRegistry(dataset_root)
+    registry.register(
+        "items.sql",
+        b"CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL);",
+        tenant_id="default",
+        dialect_override="sqlite",
+        embedding_model_name="test-embedding-model",
+    )
+
+    def fake_prepare_query(**kwargs):
+        return QueryReady(
+            status="ok",
+            context="",
+            retrieval=RetrievalResult(tables=["items"], used_qdrant=True),
+            value_matches=[],
+            question=kwargs["question"],
+            metadata=kwargs["metadata"],
         )
 
-    import ask
-    monkeypatch.setattr(ask, "ask_question", fake_ask_question)
+    monkeypatch.setattr("ui.app.prepare_query", fake_prepare_query)
+    monkeypatch.setattr(
+        "ui.app.generate_and_validate_query",
+        lambda query: ValidatedQuery(sql="SELECT id, name, price FROM items"),
+    )
 
-    def fake_execute_validated(sql, credentials, stored_dialect=None):
-        c = sqlite3.connect(credentials.database)
+    calls = []
+
+    def fake_test_connection(credentials, timeout_seconds):
+        calls.append(("connect", credentials.database))
+        if credentials.database == "bad":
+            from db.credentials import DbConnectionError
+
+            raise DbConnectionError("connection rejected")
+
+    def fake_execute_validated(
+        sql, credentials, stored_dialect=None, timeout_seconds=15
+    ):
+        calls.append(("execute", sql))
+        c = sqlite3.connect(credentials.database, uri=True)
         try:
             cur = c.execute(sql)
             columns = [d[0] for d in cur.description]
@@ -213,70 +247,52 @@ def test_apptest_validated_rerun_flow(monkeypatch):
             c.close()
         return {"columns": columns, "rows": rows, "row_count": len(rows), "duration_ms": 5}
 
-    # Patch db.credentials BEFORE importing ui.app so ui/app's module-level
-    # `from db.credentials import execute_validated` gets the fake.
-    from db import credentials as credsmod
-    monkeypatch.setattr(credsmod, "execute_validated", fake_execute_validated)
-    monkeypatch.setattr(credsmod, "log_query", lambda *a, **k: None)
-
     import ui.app as appmod
-
-    class FakeEmbedder:
-        model_name = "test"
-        dim = 384
 
     class FakeQdrantStore:
         client = object()
 
-    monkeypatch.setattr(appmod, "get_embedding_model", lambda *a, **k: FakeEmbedder())
+        def close(self):
+            pass
+
+    monkeypatch.setattr(appmod, "test_connection", fake_test_connection)
+    monkeypatch.setattr(appmod, "execute_validated", fake_execute_validated)
+    monkeypatch.setattr(appmod, "log_query", lambda *a, **k: None)
+    monkeypatch.setattr(appmod, "get_embedding_model", lambda *a, **k: object())
     monkeypatch.setattr(appmod, "build_qdrant_store", lambda *a, **k: FakeQdrantStore())
 
-    at = AppTest.from_file(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py")).run()
-
-    # Tenant ID
-    at.text_input(key="tenant_id").set_value("default").run()
-
-    # Register temp sqlite dataset
-    from ingestion.datasets import DatasetRegistry
-    reg = DatasetRegistry("datasets")
-    with open(db_path, "rb") as f:
-        data = f.read()
-    try:
-        reg.register("temp_test.db", data, tenant_id="default",
-                     dialect_override="sqlite", embedding_model_name="test-embedding-model")
-    except Exception:
-        pass
-    at.run()
-
-    # Select a dataset
-    try:
-        sb = at.selectbox[0]
-        sb.set_value(sb.options[0])
-    except Exception:
-        pass
-    at.run()
-
-    # Ask: set question (keyed input), then click Ask (button index 1; [0] is Register dataset)
+    entrypoint = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py"
+    )
+    at = AppTest.from_file(entrypoint).run()
     at.text_input(key="question_input").set_value("show me items")
-    ask_btn = [b for b in at.form_submit_button if b.label == "Ask"][0]
-    ask_btn.click().run()
+    [button for button in at.form_submit_button if button.label == "Search"][0].click().run()
 
-    # Form should appear; fill sqlite file path and submit
-    at.text_input(key="db_file_path").set_value(db_path)
-    run_btn = [b for b in at.form_submit_button if b.label == "Run query"][0]
-    run_btn.click().run()
+    assert any("SELECT id, name, price FROM items" in str(code.value) for code in at.code)
+    assert any(button.label == "Connect" for button in at.form_submit_button)
+    assert not any(element.value == "Connected" for element in at.success)
 
-    # Rows shown after submit
+    [field for field in at.text_input if field.label == "Database"][0].set_value(db_path)
+    [button for button in at.form_submit_button if button.label == "Connect"][0].click().run()
+
+    assert calls == [("connect", db_path), ("execute", "SELECT id, name, price FROM items")]
+    assert any(element.value == "Connected" for element in at.success)
+    assert "widget" in str(at.dataframe[0].value)
+
     at.run()
-    found = any("widget" in str(d.value) for d in at.dataframe) or \
-            any("widget" in str(t.value) for t in at.table)
-    assert found, "Expected rows in output after submit"
+    assert len(calls) == 2
+    assert "widget" in str(at.dataframe[0].value)
+    assert at.session_state["db_creds"]["credentials"].database == db_path
+    assert at.session_state["ui_state"]["result"]["rows"]
 
-    # Second rerun: rows still shown
+    monkeypatch.setenv("DB_IDLE_TIMEOUT_SECONDS", "60")
+    at.session_state["db_creds"]["last_used"] = time.time() - 61
     at.run()
-    found2 = any("widget" in str(d.value) for d in at.dataframe) or \
-             any("widget" in str(t.value) for t in at.table)
-    assert found2, "Expected rows to persist after second rerun"
+    assert "db_creds" not in at.session_state
+    assert any(button.label == "Connect" for button in at.form_submit_button)
 
-    # No password/secret anywhere in session_state
-    assert not _find_secret(dict(at.session_state)), "Secret found in session_state"
+    [field for field in at.text_input if field.label == "Database"][0].set_value("bad")
+    [button for button in at.form_submit_button if button.label == "Connect"][0].click().run()
+    assert "db_creds" not in at.session_state
+    assert "could not be verified" in at.warning[0].value
+    assert any(button.label == "Connect" for button in at.form_submit_button)
