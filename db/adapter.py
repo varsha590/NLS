@@ -168,7 +168,7 @@ class DatabaseAdapter:
                 )
             result = connection.execute(sa.text(sql))
             columns = list(result.keys())
-            rows = [dict(row) for row in result.mappings().fetchmany()]
+            rows = [dict(row) for row in result.mappings().fetchall()]
             transaction.rollback()
             return QueryResult(rows=rows, columns=columns)
         except sa.exc.SQLAlchemyError:

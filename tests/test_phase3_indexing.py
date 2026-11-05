@@ -31,7 +31,6 @@ class CountingEmbeddingModel:
 
 def _settings(vector_path, refresh_ttl_hours: float = 24) -> Settings:
     return Settings(
-        database_url="sqlite:///:memory:",
         groq_api_key="",
         llm_model="phase3-test-model",
         embedding_model=CountingEmbeddingModel.model_name,
@@ -56,7 +55,7 @@ def _configure_startup(tmp_path, monkeypatch, engine, refresh_ttl_hours: float =
     monkeypatch.setattr(
         startup,
         "DatabaseAdapter",
-        lambda database_url, timeout: DatabaseAdapter(database_url, timeout, engine=engine),
+        lambda database_url, timeout: DatabaseAdapter("sqlite:///:memory:", timeout, engine=engine),
     )
     monkeypatch.setattr(startup, "EmbeddingModel", CountingEmbeddingModel)
     CountingEmbeddingModel.batches.clear()
@@ -539,7 +538,7 @@ def test_reindex_dry_run_prints_counts_and_no_fixture_values(
 ):
     engine, _ = _create_value_catalog()
     settings = _settings(tmp_path)
-    adapter = DatabaseAdapter(settings.database_url, settings.query_timeout_seconds, engine=engine)
+    adapter = DatabaseAdapter("sqlite:///:memory:", settings.query_timeout_seconds, engine=engine)
 
     import reindex
 

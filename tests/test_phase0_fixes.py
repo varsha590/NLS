@@ -200,7 +200,6 @@ def test_partial_local_index_surfaces_incomplete_state(tmp_path, monkeypatch):
     sa.Table("synthetic_records", metadata, sa.Column("generic_key", sa.Integer, primary_key=True))
     metadata.create_all(engine)
     settings = Settings(
-        database_url="sqlite:///:memory:",
         groq_api_key="",
         llm_model="synthetic-model",
         embedding_model="synthetic-model",

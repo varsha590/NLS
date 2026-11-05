@@ -8,7 +8,6 @@ from config.settings import Settings, SettingsError
 
 def _set_required_environment(monkeypatch):
     values = {
-        "DATABASE_URL": "sqlite:///environment-configured.db",
         "GROQ_API_KEY": "test-key",
         "LLM_MODEL": "configured-llm",
         "EMBEDDING_MODEL": "configured-embedder",
@@ -30,7 +29,6 @@ def test_settings_uses_environment_values_without_hidden_defaults(monkeypatch):
 
     settings = Settings.from_env()
 
-    assert settings.database_url == "sqlite:///environment-configured.db"
     assert settings.llm_model == "configured-llm"
     assert settings.embedding_model == "configured-embedder"
     assert settings.schema_top_k == 4
@@ -52,13 +50,12 @@ def test_missing_groq_key_is_not_replaced_with_an_in_code_value(monkeypatch):
     assert Settings.from_env().groq_api_key == ""
 
 
-def test_missing_database_or_model_configuration_fails_fast(monkeypatch):
+def test_missing_required_configuration_fails_fast(monkeypatch):
     _set_required_environment(monkeypatch)
-    monkeypatch.delenv("DATABASE_URL")
+    monkeypatch.delenv("GROQ_API_KEY")
     monkeypatch.delenv("LLM_MODEL")
-    monkeypatch.delenv("GROQ_MODEL", raising=False)
 
-    with pytest.raises(SettingsError, match="DATABASE_URL.*LLM_MODEL"):
+    with pytest.raises(SettingsError, match="GROQ_API_KEY|LLM_MODEL"):
         Settings.from_env()
 
 

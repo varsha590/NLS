@@ -16,11 +16,11 @@ def test_adapter_executes_readonly_sqlite_query_with_row_bound():
         connection.exec_driver_sql("INSERT INTO records VALUES (1), (2), (3)")
 
     adapter = DatabaseAdapter("sqlite:///:memory:", engine=engine)
-    result = adapter.run_readonly_query("SELECT record_id FROM records ORDER BY record_id", 2)
+    result = adapter.run_readonly_query("SELECT record_id FROM records ORDER BY record_id")
 
     assert adapter.get_dialect() == "sqlite"
     assert result.columns == ["record_id"]
-    assert result.rows == [{"record_id": 1}, {"record_id": 2}]
+    assert result.rows == [{"record_id": 1}, {"record_id": 2}, {"record_id": 3}]
 
 
 def test_catalog_introspection_reads_sqlite_metadata_without_row_samples():

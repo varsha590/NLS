@@ -177,7 +177,6 @@ def test_pipeline_retries_unverified_metric_word_as_measure():
 
     result = pipeline.run("show inventory status for sold out items")
 
-    # Without max_rows LIMIT enforcement, value-index validation takes priority.
     # The pipeline handles unverified values per the spec; result rows depend on
     # value-index resolution, which may result in no rows for unresolvable mentions.
     assert "ambiguous" in str(result.answer).lower() or "not found" in str(result.answer).lower() or result.rows == []

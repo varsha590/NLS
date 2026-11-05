@@ -38,9 +38,8 @@ class CountGenerator:
         return self.sql
 
 
-def _settings(database_url: str, vector_path) -> Settings:
+def _settings(vector_path) -> Settings:
     return Settings(
-        database_url=database_url,
         groq_api_key="",
         llm_model="contract-model",
         embedding_model="contract-embedder",
@@ -56,8 +55,8 @@ def _settings(database_url: str, vector_path) -> Settings:
     )
 
 
-def _install_startup_fakes(monkeypatch, database_url, vector_path, engine):
-    monkeypatch.setattr(startup.Settings, "from_env", lambda: _settings(database_url, vector_path))
+def _install_startup_fakes(monkeypatch, vector_path, engine):
+    monkeypatch.setattr(startup.Settings, "from_env", lambda: _settings(vector_path))
     monkeypatch.setattr(
         startup,
         "DatabaseAdapter",
@@ -131,7 +130,7 @@ def test_sqlite_startup_and_full_question_use_readonly_target_statements(
 
     statements: list[str] = []
     sa.event.listen(engine, "before_cursor_execute", lambda conn, cursor, statement, params, context, many: statements.append(statement))
-    _install_startup_fakes(monkeypatch, "sqlite:///:memory:", tmp_path, engine)
+    _install_startup_fakes(monkeypatch, tmp_path, engine)
     runtime = startup.init_app(force=True)
     _capture_question(engine, runtime)
 

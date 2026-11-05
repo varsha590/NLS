@@ -169,7 +169,7 @@ def init_app(
 ) -> dict[str, Any]:
     """Load a current local index or incrementally rebuild it from read-only metadata."""
     settings = Settings.from_env()
-    adapter = DatabaseAdapter(settings.database_url, settings.query_timeout_seconds)
+    adapter = DatabaseAdapter("sqlite:///:memory:", settings.query_timeout_seconds)
     connection = adapter.connect()
     try:
         connection.exec_driver_sql("SELECT 1")

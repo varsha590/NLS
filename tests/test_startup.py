@@ -24,7 +24,6 @@ class FakeEmbeddingModel:
 
 def _settings(tmp_path):
     return Settings(
-        database_url="sqlite:///:memory:",
         groq_api_key="",
         llm_model="mock-model",
         embedding_model="fake-model",

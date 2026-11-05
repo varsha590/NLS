@@ -20,7 +20,6 @@ def _csv_setting(name: str) -> tuple[str, ...]:
 class Settings:
     """Validated runtime settings loaded from the process environment and .env."""
 
-    database_url: str
     groq_api_key: str
     llm_model: str
     embedding_model: str
@@ -52,7 +51,6 @@ class Settings:
         load_dotenv(dotenv_path=dotenv_path, override=False)
         llm_model = os.getenv("LLM_MODEL") or os.getenv("GROQ_MODEL") or ""
         required = {
-            "DATABASE_URL": os.getenv("DATABASE_URL"),
             "LLM_MODEL (or legacy GROQ_MODEL)": llm_model,
             "EMBEDDING_MODEL": os.getenv("EMBEDDING_MODEL"),
             "VECTOR_STORE_PATH": os.getenv("VECTOR_STORE_PATH"),
@@ -68,7 +66,6 @@ class Settings:
                 "Missing required .env settings: " + ", ".join(missing)
             )
         return cls(
-            database_url=os.environ["DATABASE_URL"],
             groq_api_key=os.getenv("GROQ_API_KEY", ""),
             llm_model=llm_model,
             embedding_model=os.environ["EMBEDDING_MODEL"],
