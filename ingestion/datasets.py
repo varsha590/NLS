@@ -26,7 +26,7 @@ from retrieval.qdrant_store import make_dataset_hash
 from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo
 
 DATASET_NAMESPACE = uuid.UUID("ec8f4bc1-0661-4f34-9b91-dffb31759b7b")
-DEFAULT_MAX_UPLOAD_MB = 25
+DEFAULT_MAX_UPLOAD_MB = 200
 DEFAULT_PARSE_TIMEOUT_SECONDS = 10
 DEFAULT_LOW_CARDINALITY_MAX = 50
 _EMAIL_PATTERN = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
