@@ -149,10 +149,22 @@ def _credentials_url(credentials: DbCredentials) -> sa.URL:
     raise ValueError(f"Unsupported dialect: {credentials.dialect}")
 
 
-def _connect_with_credentials(credentials: DbCredentials) -> sa.engine.Connection:
+def _connect_with_credentials(
+    credentials: DbCredentials, timeout_seconds: int = 15
+) -> sa.engine.Connection:
     """Build a SQLAlchemy engine and return a read-only connection."""
 
-    url = _credentials_url(credentials)
+    if credentials.dialect == SG_DIALECT and credentials.database != ":memory:":
+        database = credentials.database
+        if not database.startswith("file:"):
+            database = f"file:{database}"
+        url = sa.URL.create(
+            drivername=SG_DIALECT,
+            database=database,
+            query={"mode": "ro", "uri": "true"},
+        )
+    else:
+        url = _credentials_url(credentials)
     engine: sa.Engine = sa.create_engine(url, pool_pre_ping=True)
 
     connection = engine.connect()
@@ -160,23 +172,46 @@ def _connect_with_credentials(credentials: DbCredentials) -> sa.engine.Connectio
     if credentials.dialect == PG_DIALECT:
         connection.exec_driver_sql("SET TRANSACTION READ ONLY")
         connection.exec_driver_sql(
-            f"SET LOCAL statement_timeout = '{(15) * 1000}ms'"
+            f"SET LOCAL statement_timeout = '{max(1, timeout_seconds) * 1000}ms'"
         )
     elif credentials.dialect == MY_DIALECT:
         connection.exec_driver_sql(
-            f"SET SESSION MAX_EXECUTION_TIME={15 * 1000}"
+            f"SET SESSION MAX_EXECUTION_TIME={max(1, timeout_seconds) * 1000}"
         )
         connection.exec_driver_sql("SET TRANSACTION READ ONLY")
     elif credentials.dialect == SG_DIALECT:
         connection.exec_driver_sql("PRAGMA query_only=ON")
+        raw_connection = connection.connection.driver_connection
+        deadline = time.monotonic() + max(1, timeout_seconds)
+        raw_connection.set_progress_handler(
+            lambda: int(time.monotonic() >= deadline), 1000
+        )
 
     return connection
+
+
+def test_connection(
+    credentials: DbCredentials, timeout_seconds: int = 15
+) -> None:
+    """Verify a read-only database connection without retaining its resources."""
+    connection: sa.engine.Connection | None = None
+    try:
+        connection = _connect_with_credentials(credentials, timeout_seconds)
+        connection.exec_driver_sql("SELECT 1")
+    except Exception as error:
+        raise DbConnectionError(
+            "The connection could not be verified. Check the connection details."
+        ) from error
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def execute_validated(
     sql: str,
     credentials: DbCredentials,
     stored_dialect: str | None = None,
+    timeout_seconds: int = 15,
 ) -> dict[str, Any]:
     """Execute a validated SQL query against the credentials' database.
 
@@ -201,7 +236,7 @@ def execute_validated(
         )
 
     started = time.monotonic()
-    connection = _connect_with_credentials(credentials)
+    connection = _connect_with_credentials(credentials, timeout_seconds)
     try:
         result = connection.execute(sa.text(sql))
         columns = list(result.keys())
@@ -261,7 +296,7 @@ def log_query(
                         expr.set("this", "?")
         masked_sql = parsed.sql()
     except Exception:
-        masked_sql = sql
+        masked_sql = "[omitted: unable to safely mask SQL literals]"
 
     log.info(
         "query_log | tenant=%s | dataset=%s | row_count=%d | duration_ms=%d | sql=%s",
