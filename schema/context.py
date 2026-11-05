@@ -4,6 +4,7 @@ Builds compact, exact schema context from SchemaMetadata for the LLM.
 No column truncation - includes all columns with PK/FK annotations.
 """
 
+import json
 from typing import Any, List, Optional
 
 from .metadata import (
@@ -220,6 +221,7 @@ def build_query_context(
 
     if value_matches:
         parts.extend(("", "=== VALUE MATCHES ==="))
+        formatted_matches = []
         for match in value_matches:
             table = match.get("table", "")
             column = match.get("column", "")
@@ -231,11 +233,15 @@ def build_query_context(
                 column_key, policy_overrides=policy_overrides
             ):
                 continue
-            if match.get("match_type") == "fuzzy_text":
-                parts.append(
-                    f"- possible match, unconfirmed: {value!r} in {column_key}"
-                )
-            else:
-                parts.append(f"- exact match: {value!r} in {column_key}")
+            formatted_matches.append({
+                "label": (
+                    "possible match, unconfirmed"
+                    if match.get("match_type") == "fuzzy_text"
+                    else "exact match"
+                ),
+                "value": value,
+                "column": column_key,
+            })
+        parts.append(json.dumps(formatted_matches, ensure_ascii=True))
 
     return "\n".join(parts)
