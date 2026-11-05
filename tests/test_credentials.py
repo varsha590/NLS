@@ -11,7 +11,7 @@ from sqlglot import exp
 
 import pytest
 
-from db.credentials import DbCredentials, DbConnectionError, _scrub_credentials, execute_validated, log_query, page_rows
+from db.credentials import DbCredentials, DbConnectionError, _credentials_url, _scrub_credentials, execute_validated, log_query, page_rows
 
 
 # --- DbCredentials repr/str masking ---
@@ -246,3 +246,48 @@ def test_log_query_no_password(caplog):
         log_query("t", "d", "SELECT 1", 1, 10, logger=logging.getLogger("db.credentials"))
     assert "supersecret" not in caplog.text
 
+
+# --- Driver URL scheme for mysql/postgres (explicit driver) ---
+
+def test_mysql_credentials_url_uses_pymysql_driver():
+    creds = DbCredentials(
+        dialect="mysql", host="localhost", port=3306, username="user", password="pw", database="mydb",
+    )
+    url = _credentials_url(creds)
+    assert str(url).startswith("mysql+pymysql://")
+    assert url.get_dialect() is not None
+
+
+def test_postgres_credentials_url_uses_psycopg_driver():
+    creds = DbCredentials(
+        dialect="postgresql", host="localhost", port=5432, username="user", password="pw", database="mydb",
+    )
+    url = _credentials_url(creds)
+    assert str(url).startswith("postgresql+psycopg://")
+
+
+def test_postgres_mariadb_mariadb_dialect_url_unknown_raises():
+    creds = DbCredentials(dialect="mariadb", host="localhost", port=3306, username="u", password="p", database="d")
+    try:
+        _credentials_url(creds)
+        raise AssertionError("expected ValueError for unsupported dialect")
+    except ValueError:
+        pass
+
+
+def test_password_special_chars_url_not_in_credentials_or_scrubbed_error():
+    pw = "p@ss:w/rd#1"
+    creds = DbCredentials(
+        dialect="mysql", host="localhost", port=3306, username="user", password=pw, database="mydb",
+    )
+    url = _credentials_url(creds)
+    # Carried correctly in the URL object (userinfo holds the password).
+    assert url.username == "user"
+    assert url.password == pw
+    # Never appears in str()/repr() of the credentials.
+    assert pw not in str(creds)
+    assert pw not in repr(creds)
+    # Never appears in the scrubbed error text.
+    err = f"Connection failed for mysql://user:{pw}@host:3306/db: Access denied"
+    scrubbed = _scrub_credentials(err)
+    assert pw not in scrubbed

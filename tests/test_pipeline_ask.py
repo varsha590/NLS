@@ -77,11 +77,11 @@ class FakeQdrantStore:
 # ---- Tests ----
 
 class TestAskQuestionOutcomes:
-    """Every outcome maps to its message; no Streamlit/Groq/DB calls."""
+    """Every result.outcome maps to its result.message; no Streamlit/Groq/DB calls."""
 
     def test_empty_question(self):
-        """empty question -> plain message."""
-        outcome, message = ask_question(
+        """empty question -> plain result.message."""
+        result = ask_question(
             "",
             _schema(),
             _value_documents(),
@@ -91,14 +91,14 @@ class TestAskQuestionOutcomes:
             "dataset",
             "dataset.json",
         )
-        assert outcome == "empty_question"
-        assert message == "Please enter a question."
+        assert result.outcome == "empty_question"
+        assert result.message == "Please enter a question."
 
     def test_too_long_question(self):
-        """too-long question -> plain message."""
+        """too-long question -> plain result.message."""
         from ask import ask_question
         long_q = "x" * (501)
-        outcome, message = ask_question(
+        result = ask_question(
             long_q,
             _schema(),
             _value_documents(),
@@ -108,12 +108,12 @@ class TestAskQuestionOutcomes:
             "dataset",
             "dataset.json",
         )
-        assert outcome == "too_long_question"
-        assert "500" in message
+        assert result.outcome == "too_long_question"
+        assert "500" in result.message
 
     def test_question_with_untrusted_question_proceeds_normally(self):
         """question with `</untrusted_question>` proceeds normally."""
-        outcome, message = ask_question(
+        result = ask_question(
             "show me records",
             _schema(),
             _value_documents(),
@@ -124,15 +124,15 @@ class TestAskQuestionOutcomes:
             "dataset.json",
         )
         # Should not be DatasetUnqueryable just because of the marker in question text
-        assert outcome != "unqueryable" or message != "This dataset can't be queried. Please re-upload it."
+        assert result.outcome != "unqueryable" or result.message != "This dataset can't be queried. Please re-upload it."
 
     def test_schema_with_filtered_schema_returns_dataset_unqueryable(self):
-        """schema with `</filtered_schema>` -> DatasetUnqueryable message."""
+        """schema with `</filtered_schema>` -> DatasetUnqueryable result.message."""
         from ask import ask_question
 
         metadata = _schema()
 
-        outcome, message = ask_question(
+        result = ask_question(
             "show me records",
             metadata,
             _value_documents(),
@@ -142,12 +142,12 @@ class TestAskQuestionOutcomes:
             "dataset",
             "dataset.json",
         )
-        # In the fake setup without the tag in context, outcome is "validated".
-        # The test accepts validated as a valid outcome.
-        assert outcome in ("validated", "unqueryable", "re_index")
+        # In the fake setup without the tag in context, result.outcome is "validated".
+        # The test accepts validated as a valid result.outcome.
+        assert result.outcome in ("validated", "unqueryable", "re_index")
 
     def test_empty_dialect_returns_re_index(self):
-        """empty dialect -> re-index message."""
+        """empty dialect -> re-index result.message."""
         from ask import ask_question
         # Create metadata with empty dialect
         metadata = SchemaMetadata(
@@ -164,7 +164,7 @@ class TestAskQuestionOutcomes:
             },
             dialect="",
         )
-        outcome, message = ask_question(
+        result = ask_question(
             "show me records",
             metadata,
             _value_documents(),
@@ -174,8 +174,8 @@ class TestAskQuestionOutcomes:
             "dataset",
             "dataset.json",
         )
-        assert outcome == "re_index"
-        assert "re-index" in message.lower() or "re_index" in message.lower()
+        assert result.outcome == "re_index"
+        assert "re-index" in result.message.lower() or "re_index" in result.message.lower()
 
     def test_embedder_mismatch_returns_retrieval_failed(self):
         """embedder mismatch -> retrieval_failed or re_index (requires dataset metadata file)."""
@@ -184,7 +184,7 @@ class TestAskQuestionOutcomes:
         # The embedder mismatch detection reads dataset_metadata_path.
         # Without a properly structured metadata file, the mismatch isn't detected
         # and the function proceeds normally. This is expected behavior.
-        outcome, message = ask_question(
+        result = ask_question(
             "show me records",
             _schema(),
             _value_documents(),
@@ -196,13 +196,13 @@ class TestAskQuestionOutcomes:
         )
         # Accept both "validated" (no metadata file to compare against)
         # and "retrieval_failed"/"re_index" (metadata file present with mismatch)
-        assert outcome in ("validated", "retrieval_failed", "re_index")
+        assert result.outcome in ("validated", "retrieval_failed", "re_index")
 
     def test_validator_failure_returns_generic_message(self):
         """validator failure -> generic message without table/column names."""
         from ask import ask_question
 
-        outcome, message = ask_question(
+        result = ask_question(
             "show me records",
             _schema(),
             _value_documents(),
@@ -212,7 +212,7 @@ class TestAskQuestionOutcomes:
             "dataset",
             "dataset.json",
         )
-        assert outcome in ("validated", "validator_failure")
+        assert result.outcome in ("validated", "validator_failure")
 
     def test_qdrant_failure_returns_generic_message_and_log(self, caplog):
         """Qdrant failure -> generic message and log has only the exception type."""
@@ -222,7 +222,7 @@ class TestAskQuestionOutcomes:
         bad_qdrant.client = None
 
         with caplog.at_level(logging.WARNING):
-            outcome, message = ask_question(
+            result = ask_question(
                 "show me records",
                 _schema(),
                 _value_documents(),
@@ -238,13 +238,13 @@ class TestAskQuestionOutcomes:
         assert "Qdrant" in log_text or "StorageError" in log_text, (
             f"Expected 'Qdrant' or 'StorageError' in log messages: {log_messages}"
         )
-        assert outcome in ("qdrant_failure", "retrieval_failed")
+        assert result.outcome in ("qdrant_failure", "retrieval_failed")
 
     def test_unknown_outcome_fallback(self):
         """unknown outcome -> fallback."""
         from ask import ask_question
 
-        outcome, message = ask_question(
+        result = ask_question(
             "weird question medleburg",
             _schema(),
             _value_documents(),
@@ -254,5 +254,5 @@ class TestAskQuestionOutcomes:
             "dataset",
             "dataset.json",
         )
-        assert outcome is not None
-        assert message is not None
+        assert result.outcome is not None
+        assert result.message is not None

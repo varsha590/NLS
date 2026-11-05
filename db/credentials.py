@@ -84,6 +84,14 @@ def _scrub_credentials(message: str) -> str:
     result = message
     for pattern in patterns:
         result = re.sub(pattern, lambda m: m.group(0).split("=")[0] + "=***", result)
+
+    # Scrub raw URL userinfo passwords (e.g. mysql://user:pass@host:3306/db).
+    # Mask the password portion while preserving the host/suffix tail.
+    url_userinfo = re.compile(r"(?i)([a-z0-9_.\-]+):(.+)@")
+    result = url_userinfo.sub(
+        lambda m: m.group(1) + ":***@" + m.group(0)[m.end(2) + 1:],
+        result,
+    )
     return result
 
 
@@ -107,29 +115,45 @@ class DbConnectionError(RuntimeError):
         return f"DbConnectionError({self!r})"
 
 
-def _connect_with_credentials(credentials: DbCredentials) -> sa.engine.Connection:
-    """Build a SQLAlchemy engine and return a read-only connection."""
+def _credentials_url(credentials: DbCredentials) -> sa.URL:
+    """Build a dialect-specific SQLAlchemy URL with an explicit driver.
 
+    mysql -> ``mysql+pymysql://`` (PyMySQL, handles MySQL 8 caching_sha2_password
+    via the ``cryptography`` package), postgresql -> ``postgresql+psycopg://``
+    (psycopg v3), sqlite -> ``sqlite://``. ``URL.create`` handles special
+    characters in credentials safely.
+    """
+    if credentials.dialect == MY_DIALECT:
+        return sa.URL.create(
+            drivername="mysql+pymysql",
+            username=credentials.username,
+            password=credentials.password,
+            host=credentials.host,
+            port=credentials.port,
+            database=credentials.database,
+        )
     if credentials.dialect == PG_DIALECT:
-        url = make_url(
-            f"{credentials.dialect}://{credentials.username}:{credentials.password}"
-            f"@{credentials.host}:{credentials.port or ''}/{credentials.database}"
+        return sa.URL.create(
+            drivername="postgresql+psycopg",
+            username=credentials.username,
+            password=credentials.password,
+            host=credentials.host,
+            port=credentials.port,
+            database=credentials.database,
         )
-        engine: sa.Engine = sa.create_engine(url, pool_pre_ping=True)
-    elif credentials.dialect == MY_DIALECT:
-        url = make_url(
-            f"{credentials.dialect}://{credentials.username}:{credentials.password}"
-            f"@{credentials.host}:{credentials.port or ''}/{credentials.database}"
-        )
-        engine: sa.Engine = sa.create_engine(url, pool_pre_ping=True)
-    elif credentials.dialect == SG_DIALECT:
-        url = sa.URL.create(
+    if credentials.dialect == SG_DIALECT:
+        return sa.URL.create(
             drivername=SG_DIALECT,
             database=credentials.database,
         )
-        engine: sa.Engine = sa.create_engine(url, pool_pre_ping=True)
-    else:
-        raise ValueError(f"Unsupported dialect: {credentials.dialect}")
+    raise ValueError(f"Unsupported dialect: {credentials.dialect}")
+
+
+def _connect_with_credentials(credentials: DbCredentials) -> sa.engine.Connection:
+    """Build a SQLAlchemy engine and return a read-only connection."""
+
+    url = _credentials_url(credentials)
+    engine: sa.Engine = sa.create_engine(url, pool_pre_ping=True)
 
     connection = engine.connect()
 

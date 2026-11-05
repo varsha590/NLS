@@ -42,7 +42,7 @@ def test_ask_mysql_dataset_validated():
 
     qdrant_store = MockQdrant()
 
-    outcome, message = ask_question(
+    result = ask_question(
         "Show me all cities",
         schema,
         value_documents,
@@ -53,5 +53,5 @@ def test_ask_mysql_dataset_validated():
         "datasets",
     )
 
-    assert outcome == "validated", f"Expected 'validated', got '{outcome}': {message}"
-    assert "Running queries is not available yet" not in message
+    assert result.outcome == "validated", f"Expected 'validated', got '{result.outcome}': {result.message}"
+    assert "Running queries is not available yet" not in result.message
