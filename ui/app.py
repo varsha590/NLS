@@ -332,6 +332,7 @@ def _run_client_flow() -> None:
                         registry.dataset_directory(tenant_id.strip(), selected_id)
                         / "dataset.json"
                     ),
+                    settings=Settings.from_env(),
                 )
                 if not isinstance(retrieval, QueryReady):
                     st.session_state["last_outcome"] = retrieval.status

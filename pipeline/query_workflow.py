@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, Sequence, TypeAlias
 
+from config.settings import Settings
 from llm.generator import GenerationError
 from llm.prompt_builder import build_query_prompt
 from llm.sql_generator import generate_sql
@@ -111,6 +112,7 @@ def prepare_query(
     selected_k: int = 3,
     max_tables: int = 8,
     sensitive_filter: dict[str, Any] | None = None,
+    settings: Settings | None = None,
 ) -> QueryWorkflowOutcome:
     """Embed once, retrieve with Qdrant, then build context from local matches."""
     try:
@@ -138,6 +140,7 @@ def prepare_query(
             qdrant_embedding_dimension=embedder.dim,
             qdrant_dataset_metadata_path=dataset_metadata_path,
             query_vector=query_vector,
+            settings=settings,
         )
     except (QdrantStorageError, ValueError, RuntimeError) as error:
         LOGGER.warning("Query retrieval failed: %s", type(error).__name__)

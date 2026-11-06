@@ -46,6 +46,10 @@ class Settings:
     qdrant_url: str = field(default="http://127.0.0.1:6333", repr=False)
     qdrant_api_key: str = field(default="", repr=False)
     qdrant_collection: str = "nls_documents"
+    dominance_ratio: float = 2.0
+    ubiquitous_column_ratio: float = 0.5
+    ignored_columns: tuple[str, ...] = ()
+    context_top_tables: int = 3
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -114,4 +118,11 @@ class Settings:
             qdrant_url=os.getenv("QDRANT_URL", "http://127.0.0.1:6333"),
             qdrant_api_key=os.getenv("QDRANT_API_KEY", ""),
             qdrant_collection=os.getenv("QDRANT_COLLECTION", "nls_documents"),
+            dominance_ratio=max(0.0, float(os.getenv("DOMINANCE_RATIO", "2.0"))),
+            ubiquitous_column_ratio=min(
+                1.0,
+                max(0.0, float(os.getenv("UBIQUITOUS_COLUMN_RATIO", "0.5"))),
+            ),
+            ignored_columns=_csv_setting("IGNORED_COLUMNS"),
+            context_top_tables=max(1, int(os.getenv("CONTEXT_TOP_TABLES", "3"))),
         )

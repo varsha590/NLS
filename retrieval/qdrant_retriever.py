@@ -20,6 +20,7 @@ from retrieval.qdrant_store import (
     VECTOR_SIZE,
 )
 from config.data_policy import is_blocked, is_masked
+from config.settings import Settings
 
 LOGGER = logging.getLogger(__name__)
 
@@ -27,6 +28,9 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_SELECTED_COUNT = 3
 MAX_SELECTED_COUNT = 5
 MAX_TABLES_GROQ = 8
+DEFAULT_DOMINANCE_RATIO = 2.0
+DEFAULT_UBIQUITOUS_COLUMN_RATIO = 0.5
+DEFAULT_CONTEXT_TOP_TABLES = 3
 
 
 @dataclass
@@ -290,6 +294,7 @@ def retrieve(
     qdrant_embedding_dimension: int = VECTOR_SIZE,
     qdrant_dataset_metadata_path: str | None = None,
     query_vector: Sequence[float] | None = None,
+    settings: Settings | None = None,
 ) -> RetrievalResult:
     """Pure-logic schema retrieval with roll-up scoring and FK expansion.
 
@@ -299,6 +304,22 @@ def retrieve(
     """
     if exact_value_tables is None:
         exact_value_tables = set()
+    dominance_ratio = (
+        settings.dominance_ratio if settings is not None else DEFAULT_DOMINANCE_RATIO
+    )
+    ubiquitous_ratio = (
+        settings.ubiquitous_column_ratio
+        if settings is not None
+        else DEFAULT_UBIQUITOUS_COLUMN_RATIO
+    )
+    ignored_columns = (
+        settings.ignored_columns if settings is not None else ()
+    )
+    context_top_tables = (
+        settings.context_top_tables
+        if settings is not None
+        else DEFAULT_CONTEXT_TOP_TABLES
+    )
 
     # A missing embedding deliberately selects lexical fallback; never query with a zero vector.
     qdrant_results: dict[str, list[dict[str, Any]]] = {}
@@ -411,24 +432,43 @@ def retrieve(
     # Sort by score descending, then by name for tie-breaking
     scored_tables.sort(key=lambda x: (-x[1], x[0]))
 
-    # Step 2: Select tables
+    # Step 2: Select only the tables that will fit the LLM context.
+    selection_cap = max(1, min(int(max_tables), int(context_top_tables)))
     selected = select_tables(
         scored_tables,
         exact_matches=exact_value_tables,
         default_k=selected_k,
-        max_k=max_tables,
+        max_k=selection_cap,
     )
 
     # Step 3: Expand with FK neighbors
     expanded, truncated = expand_fk_neighbors(metadata, selected, max_tables=max_tables)
 
-    # Step 4: Build ambiguity flag
-    # "show id" with users.id, orders.order_id, products.id returns all three with ambiguity_flag=True
-    # "show order id" ranks orders first (ambiguity_flag=False because "order" token disambiguates)
-    ambiguity_flag = _compute_ambiguity_flag(query, metadata, expanded)
+    # Step 4: Limit the LLM context to the top-scored tables.
+    context_tables = expanded[: max(1, int(context_top_tables))]
+
+    # Step 5: Build ambiguity flag over the tables actually sent to the LLM.
+    ubiquitous_columns = None
+    if qdrant_search_succeeded:
+        ubiquitous_columns = _dataset_ubiquitous_columns(
+            qdrant_store,
+            qdrant_tenant_id,
+            qdrant_dataset_id,
+            metadata,
+            ubiquitous_ratio,
+        )
+    ambiguity_flag = _compute_ambiguity_flag(
+        query,
+        metadata,
+        context_tables,
+        scored_tables=scored_tables,
+        ubiquitous_columns=ubiquitous_columns,
+        dominance_ratio=dominance_ratio,
+        ignored_columns=ignored_columns,
+    )
 
     return RetrievalResult(
-        tables=expanded,
+        tables=context_tables,
         typed_hits=qdrant_results,
         used_qdrant=qdrant_search_succeeded,
         truncated=truncated,
@@ -452,77 +492,176 @@ def _split_into_tokens(name: str) -> list[str]:
     return tokens
 
 
+def _singularize(token: str) -> str:
+    """Reduce a generic English plural token to its singular form."""
+    if token.endswith("ies") and len(token) > 3:
+        return token[:-3] + "y"
+    if token.endswith("sses") and len(token) > 4:
+        return token[:-2]
+    if token.endswith(("ches", "shes", "xes", "zes")):
+        return token[:-2]
+    if token.endswith("ses") and len(token) > 3:
+        return token[:-2]
+    if token.endswith("us") and len(token) > 3:
+        return token
+    if token.endswith("s") and not token.endswith("ss") and len(token) > 1:
+        return token[:-1]
+    return token
+
+
+def _normalize_tokens(value: str) -> list[str]:
+    """Split and normalize a table/column/query token consistently.
+
+    Handles snake_case/camelCase, drops one-letter type prefixes (vDisplayName,
+    iRecordId, e_status), and singularizes generic English plurals.
+    """
+    tokens = [_singularize(token) for token in _split_into_tokens(value)]
+    if len(tokens) > 1:
+        tokens = [token for token in tokens if len(token) > 1 or token.isdigit()]
+    return tokens
+
+
+def _dataset_ubiquitous_columns(
+    qdrant_store: Any,
+    tenant_id: str,
+    dataset_id: str,
+    metadata: SchemaMetadata,
+    threshold: float,
+) -> Optional[Set[str]]:
+    """Return column names present in more than *threshold* of schema tables.
+
+    Reads column/table payloads from Qdrant for the explicit tenant/dataset
+    scope and caches the result per dataset on the store instance. Returns
+    None when schema points are unavailable so callers can skip the rule.
+    """
+    if qdrant_store is None or not tenant_id or not dataset_id:
+        return None
+    cache = getattr(qdrant_store, "_ubiquitous_column_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        try:
+            setattr(qdrant_store, "_ubiquitous_column_cache", cache)
+        except Exception:
+            pass
+    cache_key = (tenant_id, dataset_id, float(threshold))
+    if cache_key in cache:
+        return cache[cache_key]
+
+    scroll = getattr(qdrant_store, "_scroll_metadata", None)
+    if not callable(scroll):
+        return None
+    try:
+        payloads = scroll(None, tenant_id=tenant_id, dataset_id=dataset_id)
+    except TypeError:
+        try:
+            payloads = scroll(None)
+        except Exception:
+            return None
+    except Exception:
+        return None
+    if not isinstance(payloads, list):
+        return None
+
+    table_names: Set[str] = set()
+    column_tables: dict[str, Set[str]] = {}
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        document_type = payload.get("document_type")
+        table_name = payload.get("table_name")
+        column_name = payload.get("column_name")
+        if document_type in {"table", "table_ddl"} and table_name:
+            table_names.add(str(table_name))
+        elif document_type in {"column", "column_description"} and table_name and column_name:
+            column_tables.setdefault(str(column_name), set()).add(str(table_name))
+
+    total_tables = len(table_names) or len(metadata.tables)
+    if total_tables <= 0:
+        ubiquitous: Set[str] = set()
+    else:
+        ubiquitous = {
+            column_name
+            for column_name, tables in column_tables.items()
+            if len(tables) / total_tables > threshold
+        }
+    cache[cache_key] = ubiquitous
+    return ubiquitous
+
+
 def _compute_ambiguity_flag(
     query: str,
     metadata: SchemaMetadata,
     table_names: List[str],
+    scored_tables: Optional[List[Tuple[str, float]]] = None,
+    ubiquitous_columns: Optional[Set[str]] = None,
+    dominance_ratio: float = DEFAULT_DOMINANCE_RATIO,
+    ignored_columns: Sequence[str] = (),
 ) -> bool:
     """Determine if the query has ambiguous column references across tables.
 
-    Fires only when the question tokens match a column present in several candidate
-    tables and no value hit or more specific column separates them.
-
-    "show id" with users.id, orders.order_id, products.id returns all three with
-    ambiguity_flag=True (no disambiguating token).
-
-    "show order id" ranks orders first (ambiguity_flag=False because "order" token
-    matches order_id in orders table specifically, via snake_case splitting).
-
-    Returns True if ambiguous, False otherwise.
+    A clearly dominant top table never needs clarification. Columns shared by
+    most of the schema (ubiquitous, derived from data) and explicitly ignored
+    columns are excluded from ambiguity. Query and schema tokens are normalized
+    the same way, including generic plural handling.
     """
-    if len(table_names) <= 1:
+    unique_tables = list(dict.fromkeys(table_names))
+    if len(unique_tables) <= 1:
         return False
 
-    # Tokenize the query using lexical tokenization
-    query_tokens = set(_lexical_tokens(query))
+    if scored_tables:
+        ordered = sorted(scored_tables, key=lambda item: (-float(item[1]), item[0]))
+        top_score = float(ordered[0][1])
+        second_score = float(ordered[1][1]) if len(ordered) > 1 else 0.0
+        if top_score > 0 and (
+            second_score == 0 or top_score >= dominance_ratio * second_score
+        ):
+            return False
 
-    # Find column names that appear in multiple tables
-    # Use snake_case splitting to normalize column names
-    name_to_tables: dict[str, List[str]] = {}
-    for table_name in table_names:
+    query_tokens = {
+        token
+        for raw_token in _lexical_tokens(query)
+        for token in _normalize_tokens(raw_token)
+    }
+    ignored_norm = {" ".join(_normalize_tokens(name)) for name in ignored_columns}
+    ubiquitous_norm = {
+        " ".join(_normalize_tokens(name)) for name in (ubiquitous_columns or ())
+    }
+
+    name_to_tables: dict[str, Set[str]] = {}
+    for table_name in unique_tables:
         table = metadata.get_table(table_name)
         if table is None:
             continue
         for column in table.columns:
-            # Normalize column name by splitting snake_case
-            norm_name = " ".join(_split_into_tokens(column.name))
-            if norm_name not in name_to_tables:
-                name_to_tables[norm_name] = []
-            name_to_tables[norm_name].append(table_name)
+            norm_name = " ".join(_normalize_tokens(column.name))
+            if not norm_name:
+                continue
+            if norm_name in ignored_norm or norm_name in ubiquitous_norm:
+                continue
+            name_to_tables.setdefault(norm_name, set()).add(table_name)
 
-    # Check for ambiguous column names (appear in >1 table after normalization)
     ambiguous_cols = {
-        name: tables
+        name: sorted(tables)
         for name, tables in name_to_tables.items()
-        if len(tables) > 1 and name  # skip empty names
+        if len(tables) > 1
     }
-
     if not ambiguous_cols:
         return False
 
-    # For each ambiguous column, check if a query token disambiguates
-    for col_name, tables in ambiguous_cols.items():
-        # Check if any query token disambiguates
+    for tables in ambiguous_cols.values():
         for token in query_tokens:
-            # Count how many of the ambiguous tables have a column whose
-            # split tokens include this query token
             matching_tables: List[str] = []
             for table_name in tables:
                 table = metadata.get_table(table_name)
                 if table is None:
                     continue
-                for column in table.columns:
-                    # Normalize this column's name
-                    norm_col_name = " ".join(_split_into_tokens(column.name))
-                    if token in _split_into_tokens(norm_col_name):
-                        matching_tables.append(table_name)
-                        break  # Only need one matching column per table
-
-            # If the token matches columns in exactly one of the ambiguous tables, it disambiguates
+                if token in _normalize_tokens(table_name) or any(
+                    token in _normalize_tokens(column.name) for column in table.columns
+                ):
+                    matching_tables.append(table_name)
             if len(matching_tables) == 1:
-                return False  # Disambiguated by query token
+                return False
 
-    # No query token disambiguates - ambiguous
     return True
 
 

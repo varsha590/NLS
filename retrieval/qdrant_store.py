@@ -802,8 +802,13 @@ class QdrantVectorStore:
     def count_values(self) -> int:
         return self.count_points(document_type="master_value")
 
-    def _scroll_metadata(self, document_type: str | None) -> list[dict[str, Any]]:
-        tenant_id, dataset_id, _ = self._bound_scope(None, None, None)
+    def _scroll_metadata(
+        self,
+        document_type: str | None,
+        tenant_id: str | None = None,
+        dataset_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        tenant_id, dataset_id, _ = self._bound_scope(tenant_id, dataset_id, None)
         conditions = _scope_conditions(tenant_id, dataset_id)
         if document_type is not None:
             conditions.append(models.FieldCondition(key="document_type", match=models.MatchValue(value=document_type)))

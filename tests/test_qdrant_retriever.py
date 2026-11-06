@@ -534,9 +534,9 @@ def test_retrieve_uses_all_qdrant_search_results(monkeypatch, tmp_path):
         expanded_inputs.extend(selected)
         return original_expand(schema, selected, **kwargs)
 
-    def capture_ambiguity(query, schema, table_names):
+    def capture_ambiguity(query, schema, table_names, **kwargs):
         ambiguity_inputs.extend(table_names)
-        return original_ambiguity(query, schema, table_names)
+        return original_ambiguity(query, schema, table_names, **kwargs)
 
     monkeypatch.setattr(retriever_module, "select_tables", capture_select)
     monkeypatch.setattr(retriever_module, "expand_fk_neighbors", capture_expand)
