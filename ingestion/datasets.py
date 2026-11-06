@@ -675,6 +675,18 @@ class DatasetRegistry:
         _validate_tenant_dataset_id(dataset_id, "dataset_id")
         return self._tenant_root(tenant_id) / dataset_id
 
+    def mark_not_indexed(self, tenant_id: str, dataset_id: str) -> None:
+        """Persist an unindexed state before attempting any index work."""
+        metadata_path = self.dataset_directory(tenant_id, dataset_id) / "dataset.json"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise UploadError("Could not load dataset metadata for indexing.") from error
+        if metadata.get("tenant_id") != tenant_id or metadata.get("dataset_id") != dataset_id:
+            raise UploadError("Dataset metadata scope does not match the indexing request.")
+        metadata["indexed"] = False
+        self._write_json(metadata_path, metadata)
+
     def load_value_documents(self, tenant_id: str, dataset_id: str) -> list[dict[str, Any]]:
         """Load persisted low-cardinality master values for vector indexing."""
         path = self.dataset_directory(tenant_id, dataset_id) / "value_documents.json"
@@ -736,14 +748,24 @@ class DatasetRegistry:
             except (OSError, json.JSONDecodeError):
                 previous = {}
             if (
-                previous.get("indexed") is True
-                and previous.get("dataset_hash") == dataset_hash
-                and previous.get("embedding_model_name") == model_name
+                previous.get("file_sha256") == digest
+                and previous.get("dialect_override") == dialect_override
             ):
+                unchanged = (
+                    previous.get("indexed") is True
+                    and previous.get("dataset_hash") == dataset_hash
+                    and previous.get("embedding_model_name") == model_name
+                )
+                previous.update({
+                    "dataset_hash": dataset_hash,
+                    "embedding_model_name": model_name,
+                    "indexed": unchanged,
+                })
+                if not unchanged:
+                    self._write_json(metadata_path, previous)
                 return {
                     **previous,
-                    "dataset_hash": dataset_hash,
-                    "status": "unchanged",
+                    "status": "unchanged" if unchanged else "needs_index",
                     "warnings": [],
                 }
 
@@ -810,6 +832,8 @@ class DatasetRegistry:
             "created_at": timestamp,
             "table_count": len(schema.tables),
             "value_document_count": len(value_documents),
+            "dataset_hash": dataset_hash,
+            "embedding_model_name": model_name,
             "indexed": False,
         }
         self._write_json(dataset_dir / "schema.json", schema.to_dict())

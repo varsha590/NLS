@@ -1,24 +1,56 @@
-"""Regression tests for the Phase 0 safety guarantees after local-store migration."""
+"""Regression tests for the Phase 0 safety guarantees after Qdrant migration."""
 
 from __future__ import annotations
 
+import json
 import logging
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import sqlalchemy as sa
+from qdrant_client import QdrantClient
 
 from config.settings import Settings
 from core import startup
 from db.adapter import DatabaseAdapter, DatabaseUnavailableError
 from pipeline.orchestrator import TextToSQLPipeline
+from retrieval import qdrant_store as qdrant_store_module
 from retrieval.examples import ExampleStore
-from retrieval.local_store import LocalVectorStore
+from retrieval.qdrant_store import QdrantVectorStore
 from retrieval.schema_retriever import HybridSchemaRetriever, retrieve_schema
 from retrieval.value_index import ValueIndex
 from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo
 from validation.validator import validate_sql
+
+
+def _qdrant_store(
+    tmp_path,
+    dataset: str = "synthetic",
+    tenant: str = "synthetic",
+    dim: int = 4,
+) -> QdrantVectorStore:
+    metadata_path = tmp_path / "dataset.json"
+    store = QdrantVectorStore(
+        settings=Settings.from_env(),
+        client=QdrantClient(location=":memory:"),
+        vector_size=dim,
+        tenant_id=tenant,
+        dataset_id=dataset,
+        dataset_metadata_path=metadata_path,
+    )
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "tenant_id": tenant,
+                "dataset_id": dataset,
+                "indexed": True,
+                "embedding_model_name": store.model_name,
+                "vector_dimension": dim,
+            }
+        )
+    )
+    return store
 
 
 class FakeEmbedder:
@@ -46,7 +78,31 @@ class FakeGenerator:
 
 def test_local_store_reuses_cached_vectors_without_null_overwrite(tmp_path):
     embedder = FakeEmbedder()
-    store = LocalVectorStore(tmp_path, "synthetic", embedder.model_name, embedder.dim, "policy")
+    client = QdrantClient(location=":memory:")
+    metadata_path = tmp_path / "dataset.json"
+
+    def make_store() -> QdrantVectorStore:
+        return QdrantVectorStore(
+            settings=Settings.from_env(),
+            client=client,
+            vector_size=embedder.dim,
+            tenant_id="synthetic",
+            dataset_id="synthetic",
+            dataset_metadata_path=metadata_path,
+        )
+
+    store = make_store()
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "tenant_id": "synthetic",
+                "dataset_id": "synthetic",
+                "indexed": True,
+                "embedding_model_name": store.model_name,
+                "vector_dimension": embedder.dim,
+            }
+        )
+    )
     records = [{
         "table_name": "schema_one.generic_table",
         "column_name": None,
@@ -55,7 +111,7 @@ def test_local_store_reuses_cached_vectors_without_null_overwrite(tmp_path):
     }]
     assert store.build_schema(records, embedder)
     vector_before = store.search_schema(embedder.embed(["generic table"])[0], 1)
-    reloaded = LocalVectorStore(tmp_path, "synthetic", embedder.model_name, embedder.dim, "policy")
+    reloaded = make_store()
     assert reloaded.build_schema(records, embedder)
     assert reloaded.search_schema(embedder.embed(["generic table"])[0], 1) == vector_before
 
@@ -72,7 +128,7 @@ def test_value_index_does_not_store_high_cardinality_values(tmp_path):
         engine
     )
     embedder = FakeEmbedder()
-    store = LocalVectorStore(tmp_path, adapter.namespace(), embedder.model_name, embedder.dim, "policy")
+    store = _qdrant_store(tmp_path, dataset=adapter.namespace(), dim=embedder.dim)
     index = ValueIndex(adapter, catalog, cardinality_threshold=2, embedder=embedder, local_store=store)
 
     index.build()
@@ -101,7 +157,7 @@ def test_schema_retriever_searches_local_vectors_with_schema_qualified_keys(tmp_
         }
     )
     embedder = FakeEmbedder()
-    store = LocalVectorStore(tmp_path, "synthetic", embedder.model_name, embedder.dim, "policy")
+    store = _qdrant_store(tmp_path, dim=embedder.dim)
     assert store.build_schema([
         {
             "table_name": table.name,
@@ -137,9 +193,7 @@ def test_retrieve_schema_compatibility_wrapper_stays_operational():
 def test_example_store_save_failure_returns_false(tmp_path):
     engine = sa.create_engine("sqlite:///:memory:")
     adapter = DatabaseAdapter("sqlite:///:memory:", engine=engine)
-    store = LocalVectorStore(tmp_path, "synthetic", "synthetic-model", 4, "policy")
-    store.save_example = MagicMock(return_value=False)
-    assert not ExampleStore(None, adapter, local_store=store).save("generic question", "SELECT 1")
+    assert not ExampleStore(None, adapter).save("generic question", "SELECT 1")
 
 
 def test_value_index_failure_does_not_log_value_text(tmp_path, caplog):
@@ -148,7 +202,7 @@ def test_value_index_failure_does_not_log_value_text(tmp_path, caplog):
             raise RuntimeError("synthetic embed failure")
 
     embedder = FailingEmbedder()
-    store = LocalVectorStore(tmp_path, "synthetic", embedder.model_name, embedder.dim, "policy")
+    store = _qdrant_store(tmp_path, dim=embedder.dim)
     with caplog.at_level(logging.ERROR):
         assert not store.build_values([{
             "table_name": "synthetic_table",
@@ -220,9 +274,14 @@ def test_partial_local_index_surfaces_incomplete_state(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(startup, "EmbeddingModel", FakeEmbedder)
     monkeypatch.setattr(startup, "GroqGenerator", lambda *args: FakeGenerator())
+    monkeypatch.setattr(
+        qdrant_store_module,
+        "create_qdrant_client",
+        lambda settings=None: QdrantClient(location=":memory:"),
+    )
     startup._runtime.clear()
 
-    with patch.object(LocalVectorStore, "build_schema", return_value=False):
+    with patch.object(QdrantVectorStore, "build_schema", return_value=False):
         runtime = startup.init_app(force=True)
     assert runtime["catalog_status"] == "incomplete"
     assert runtime["index_complete"] is False

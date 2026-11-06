@@ -59,7 +59,7 @@ def test_submit_ok_stores_result_and_no_credentials():
         "row_count": 1,
         "duration_ms": 42,
     })
-    assert new["pending"] is None
+    assert new["pending"] == {"sql": "SELECT 1"}
     assert new["error"] is None
     assert new["result"] == {
         "columns": ["a", "b"],

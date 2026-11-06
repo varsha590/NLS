@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
+import traceback
+from dataclasses import replace
 from typing import Any
 
 import streamlit as st
@@ -21,6 +24,7 @@ from ingestion.datasets import DatasetRegistry, UploadError
 from retrieval.dataset_indexer import index_registered_dataset
 from retrieval.embeddings import EmbeddingModel
 from retrieval.qdrant_store import QdrantVectorStore
+from config.settings import Settings
 from pipeline.query_workflow import (
     QueryReady,
     ValidatedQuery,
@@ -37,6 +41,7 @@ from ui.state import (
     SUBMIT_OK,
     next_ui_state,
 )
+from db.credentials import _scrub_credentials
 
 LOGGER = logging.getLogger(__name__)
 
@@ -47,6 +52,43 @@ st.set_page_config(
 )
 
 
+def _safe_exception_chain(error: BaseException) -> str:
+    api_key = os.getenv("QDRANT_API_KEY", "")
+
+    def scrub_exception(current: BaseException | None, seen: set[int]) -> None:
+        if current is None or id(current) in seen:
+            return
+        seen.add(id(current))
+        message = _scrub_credentials(str(current))
+        if api_key:
+            message = message.replace(api_key, "***")
+        message = re.sub(
+            r"(?i)(?:['\"]?api[-_]key['\"]?\s*[:=]\s*)(?:'[^']*'|\"[^\"]*\"|[^,}\]\s]+)",
+            "[redacted header]",
+            message,
+        )
+        message = re.sub(r"(?i)api[-_]key", "[redacted header]", message)
+        current.args = (message,)
+        scrub_exception(current.__cause__, seen)
+        scrub_exception(current.__context__, seen)
+
+    scrub_exception(error, set())
+    chain = "".join(
+        traceback.format_exception(
+            type(error), error, error.__traceback__, chain=True
+        )
+    )
+    safe = _scrub_credentials(chain)
+    if api_key:
+        safe = safe.replace(api_key, "***")
+    safe = re.sub(
+        r"(?i)(?:['\"]?api[-_]key['\"]?\s*[:=]\s*)(?:'[^']*'|\"[^\"]*\"|[^,}\]\s]+)",
+        "[redacted header]",
+        safe,
+    )
+    return re.sub(r"(?i)api[-_]key", "[redacted header]", safe)
+
+
 @st.cache_resource
 def get_embedding_model(model_name: str = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")):
     """Cache the embedding model (same one used for indexing)."""
@@ -54,12 +96,36 @@ def get_embedding_model(model_name: str = os.getenv("EMBEDDING_MODEL", "all-Mini
 
 
 @st.cache_resource
+def _cached_qdrant_store(url: str, collection_name: str) -> QdrantVectorStore:
+    settings = replace(
+        Settings.from_env(),
+        qdrant_url=url,
+        qdrant_collection=collection_name,
+    )
+    return QdrantVectorStore(settings=settings)
+
+
 def build_qdrant_store() -> QdrantVectorStore:
-    """Build a dataset-scoped Qdrant store from process environment settings."""
-    return QdrantVectorStore(
-        url=os.getenv("QDRANT_URL", "http://127.0.0.1:6333"),
-        api_key=os.getenv("QDRANT_API_KEY") or None,
-        collection_name=os.getenv("QDRANT_COLLECTION", "nls_documents"),
+    """Build a cached Qdrant store keyed only by URL and collection."""
+    settings = Settings.from_env()
+    return _cached_qdrant_store(settings.qdrant_url, settings.qdrant_collection)
+
+
+def _index_dataset(
+    registry: DatasetRegistry,
+    tenant_id: str,
+    dataset: dict[str, Any],
+) -> int:
+    dataset_hash = dataset.get("dataset_hash") or dataset.get("file_sha256")
+    if not isinstance(dataset_hash, str) or not dataset_hash:
+        raise UploadError("Dataset metadata is missing its content hash.")
+    return index_registered_dataset(
+        registry,
+        build_qdrant_store(),
+        tenant_id,
+        str(dataset["dataset_id"]),
+        dataset_hash,
+        get_embedding_model(),
     )
 
 
@@ -170,24 +236,18 @@ def _run_client_flow() -> None:
                     embedding_model_name=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
                 )
                 st.session_state["selected_dataset_id"] = result["dataset_id"]
-                try:
-                    embedding_model = EmbeddingModel(
-                        os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-                    )
-                    qdrant_store = build_qdrant_store()
-                    index_registered_dataset(
-                        registry,
-                        qdrant_store,
-                        tenant_id.strip(),
-                        result["dataset_id"],
-                        result["dataset_hash"],
-                        embedding_model,
-                    )
-                except Exception as error:
-                    LOGGER.warning("Dataset indexing failed: %s", type(error).__name__)
-                    st.warning("The dataset was saved but could not be made searchable yet.")
+                if result.get("indexed") is not True:
+                    try:
+                        _index_dataset(registry, tenant_id.strip(), result)
+                    except Exception as error:
+                        LOGGER.exception(
+                            "Dataset indexing failed:\n%s", _safe_exception_chain(error)
+                        )
+                        st.warning("Indexing failed, please retry")
+                    else:
+                        st.success("Dataset registered.")
                 else:
-                    st.success("Dataset registered.")
+                    st.success("Dataset is already searchable.")
             except UploadError:
                 st.error("The file could not be registered. Check the file and try again.")
             except Exception as error:
@@ -222,6 +282,20 @@ def _run_client_flow() -> None:
         st.session_state.pop("last_sql", None)
     st.session_state["active_dataset_id"] = selected_id
     st.session_state["selected_dataset_id"] = selected_id
+    selected = next(item for item in datasets if item["dataset_id"] == selected_id)
+    if selected.get("indexed") is not True:
+        st.info("This dataset is still being prepared. Click Re-index.")
+        if st.button("Re-index dataset", key="reindex-selected-dataset"):
+            try:
+                _index_dataset(registry, tenant_id.strip(), selected)
+            except Exception as error:
+                LOGGER.exception(
+                    "Dataset re-indexing failed:\n%s", _safe_exception_chain(error)
+                )
+                st.warning("Indexing failed, please retry")
+            else:
+                st.rerun()
+        return
 
     try:
         metadata = registry.load_schema(tenant_id.strip(), selected_id)
@@ -229,7 +303,6 @@ def _run_client_flow() -> None:
     except UploadError:
         st.error("The selected dataset could not be loaded. Please select another dataset.")
         return
-    selected = next(item for item in datasets if item["dataset_id"] == selected_id)
     with st.form("question-form"):
         question = st.text_input(
             "Search", placeholder="Ask a question about your data", key="question_input"
@@ -281,16 +354,24 @@ def _run_client_flow() -> None:
                             },
                         )
             except Exception as error:
-                LOGGER.warning("Question processing failed: %s", type(error).__name__)
+                LOGGER.exception(
+                    "Question processing failed:\n%s", _safe_exception_chain(error)
+                )
                 st.session_state["last_outcome"] = "unavailable"
                 st.info("I could not process that question right now. Please try again.")
 
     ui_state = st.session_state.get("ui_state") or _initial_ui_state()
     pending = ui_state.get("pending")
-    sql_to_show = (pending or {}).get("sql") or st.session_state.get("last_sql")
-    if sql_to_show:
-        with st.expander("Show query", expanded=False):
-            st.code(sql_to_show, language="sql")
+    if pending is not None and pending.get("sql"):
+        st.info("Your query is ready.")
+        st.code(pending["sql"], language="sql")
+        st.download_button(
+            "Download SQL",
+            data=pending["sql"],
+            file_name="query.sql",
+            mime="text/plain",
+            key="download-query-sql",
+        )
 
     if ui_state.get("error"):
         st.warning(ui_state["error"])
@@ -302,28 +383,33 @@ def _run_client_flow() -> None:
             st.session_state.pop("db_creds", None)
             st.session_state["connection_notice"] = "Disconnected. Connect again to run a query."
             st.rerun()
-    elif pending is not None or st.session_state.get("last_sql"):
+    elif pending is not None:
         notice = st.session_state.pop("connection_notice", None)
         if notice:
             st.info(notice)
-        with st.form("db-credentials-form"):
-            host = st.text_input("Host", value="localhost")
-            port = st.number_input(
-                "Port",
-                min_value=1,
-                value=(
-                    3306 if metadata.dialect == "mysql"
-                    else 5432 if metadata.dialect in {"postgres", "postgresql"}
-                    else 1
-                ),
-            )
-            username = st.text_input("Username")
-            password = st.text_input("Password", type="password")
-            database = st.text_input(
-                "Database",
-                help="For SQLite, enter the path to the read-only database file.",
-            )
-            connect = st.form_submit_button("Connect", type="primary")
+        with st.expander(
+            "Run this query on your database (optional)",
+            expanded=False,
+            key="query-execution-expander",
+        ):
+            with st.form("db-credentials-form"):
+                host = st.text_input("Host", value="localhost")
+                port = st.number_input(
+                    "Port",
+                    min_value=1,
+                    value=(
+                        3306 if metadata.dialect == "mysql"
+                        else 5432 if metadata.dialect in {"postgres", "postgresql"}
+                        else 1
+                    ),
+                )
+                username = st.text_input("Username")
+                password = st.text_input("Password", type="password")
+                database = st.text_input(
+                    "Database",
+                    help="For SQLite, enter the path to the read-only database file.",
+                )
+                connect = st.form_submit_button("Connect", type="primary")
         if connect:
             dialect = _execution_dialect(metadata.dialect)
             credentials = DbCredentials(
@@ -359,7 +445,7 @@ def _run_client_flow() -> None:
                 )
             st.rerun()
 
-    if stored and pending is not None:
+    if stored and pending is not None and ui_state.get("result") is None:
         with st.spinner("Running your query..."):
             _execute_pending_query(timeout_seconds)
         st.rerun()

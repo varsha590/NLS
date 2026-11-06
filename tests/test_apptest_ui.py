@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import sqlite3
 import tempfile
 import time
@@ -58,7 +59,7 @@ def test_submit_ok_stores_result_no_credentials():
         "columns": ["a", "b"], "rows": [{"a": 1, "b": 2}],
         "row_count": 1, "duration_ms": 42,
     })
-    assert new["pending"] is None
+    assert new["pending"] == {"sql": "SELECT 1"}
     assert new["error"] is None
     assert new["result"] == {
         "columns": ["a", "b"], "rows": [{"a": 1, "b": 2}],
@@ -170,6 +171,51 @@ except Exception:  # pragma: no cover
     HAS_APPTEST = False
 
 
+def test_qdrant_store_cache_retries_failures_and_ignores_api_key(monkeypatch):
+    import ui.app as appmod
+
+    for name, value in {
+        "LLM_MODEL": "test-llm",
+        "EMBEDDING_MODEL": "test-embedder",
+        "VECTOR_STORE_PATH": ".test-vector-store",
+        "SCHEMA_TOP_K": "4",
+        "VALUE_TOP_K": "3",
+        "VALUE_CARDINALITY_THRESHOLD": "12",
+        "QUERY_TIMEOUT_SECONDS": "6",
+        "MAX_RETRIES": "2",
+        "QDRANT_URL": "http://qdrant.test:6333",
+        "QDRANT_COLLECTION": "cache-test",
+        "QDRANT_API_KEY": "first-key",
+    }.items():
+        monkeypatch.setenv(name, value)
+
+    builds = []
+
+    def fake_store(*, settings):
+        builds.append((settings.qdrant_url, settings.qdrant_collection))
+        if len(builds) == 1:
+            raise RuntimeError("temporary failure")
+        return object()
+
+    qdrant_cache = getattr(appmod, "_cached_qdrant_store")
+    qdrant_cache.clear()
+    monkeypatch.setattr(appmod, "QdrantVectorStore", fake_store)
+    try:
+        with pytest.raises(RuntimeError, match="temporary failure"):
+            appmod.build_qdrant_store()
+        cached_store = appmod.build_qdrant_store()
+
+        monkeypatch.setenv("QDRANT_API_KEY", "second-key")
+        assert appmod.build_qdrant_store() is cached_store
+        assert len(builds) == 2
+
+        monkeypatch.setenv("QDRANT_COLLECTION", "another-collection")
+        appmod.build_qdrant_store()
+        assert len(builds) == 3
+    finally:
+        qdrant_cache.clear()
+
+
 def _find_secret(obj, needles=("pw", "secret", "password")):
     """Recursively search obj for any needle string."""
     if isinstance(obj, str):
@@ -179,6 +225,45 @@ def _find_secret(obj, needles=("pw", "secret", "password")):
     if isinstance(obj, (list, tuple, set)):
         return any(_find_secret(v, needles) for v in obj)
     return False
+
+
+@pytest.mark.skipif(not HAS_APPTEST, reason="AppTest not available")
+def test_unindexed_dataset_shows_reindex_prompt(tmp_path, monkeypatch):
+    from ingestion.datasets import DatasetRegistry
+    import ui.app as appmod
+
+    dataset_root = tmp_path / "datasets"
+    monkeypatch.setenv("DATASET_STORAGE_PATH", str(dataset_root))
+    monkeypatch.setenv("TENANT_ID", "default")
+    DatasetRegistry(dataset_root).register(
+        "pending.sql",
+        b"CREATE TABLE pending (id INTEGER PRIMARY KEY, name TEXT);",
+        tenant_id="default",
+        embedding_model_name="test-embedding-model",
+    )
+    repairs = []
+
+    def fail_repair(registry, tenant_id, dataset):
+        del registry
+        repairs.append((tenant_id, dataset["dataset_id"]))
+        raise RuntimeError("indexing failed")
+
+    monkeypatch.setattr(appmod, "_index_dataset", fail_repair)
+    entrypoint = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py"
+    )
+
+    at = AppTest.from_file(entrypoint).run()
+
+    assert any(
+        element.value == "This dataset is still being prepared. Click Re-index."
+        for element in at.info
+    )
+    assert any(button.label == "Re-index dataset" for button in at.button)
+    assert not any(button.label == "Search" for button in at.form_submit_button)
+    [button for button in at.button if button.label == "Re-index dataset"][0].click().run()
+    assert len(repairs) == 1
+    assert any(element.value == "Indexing failed, please retry" for element in at.warning)
 
 
 @pytest.mark.skipif(not HAS_APPTEST, reason="AppTest not available")
@@ -201,13 +286,21 @@ def test_apptest_validated_rerun_flow(monkeypatch):
     from retrieval.qdrant_retriever import RetrievalResult
 
     registry = DatasetRegistry(dataset_root)
-    registry.register(
+    registered = registry.register(
         "items.sql",
         b"CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL);",
         tenant_id="default",
-        dialect_override="sqlite",
+        dialect_override="mysql",
         embedding_model_name="test-embedding-model",
     )
+    metadata_path = registry.dataset_directory("default", registered["dataset_id"]) / "dataset.json"
+    dataset_metadata = json.loads(metadata_path.read_text())
+    dataset_metadata.update({
+        "indexed": True,
+        "embedding_model_name": "test-embedding-model",
+        "vector_dimension": 384,
+    })
+    metadata_path.write_text(json.dumps(dataset_metadata))
 
     def fake_prepare_query(**kwargs):
         return QueryReady(
@@ -226,6 +319,7 @@ def test_apptest_validated_rerun_flow(monkeypatch):
     )
 
     calls = []
+    logged_sql = []
 
     def fake_test_connection(credentials, timeout_seconds):
         calls.append(("connect", credentials.database))
@@ -238,6 +332,7 @@ def test_apptest_validated_rerun_flow(monkeypatch):
         sql, credentials, stored_dialect=None, timeout_seconds=15
     ):
         calls.append(("execute", sql))
+        assert "test-secret" not in repr(credentials)
         c = sqlite3.connect(credentials.database, uri=True)
         try:
             cur = c.execute(sql)
@@ -257,7 +352,9 @@ def test_apptest_validated_rerun_flow(monkeypatch):
 
     monkeypatch.setattr(appmod, "test_connection", fake_test_connection)
     monkeypatch.setattr(appmod, "execute_validated", fake_execute_validated)
-    monkeypatch.setattr(appmod, "log_query", lambda *a, **k: None)
+    monkeypatch.setattr(
+        appmod, "log_query", lambda *args, **kwargs: logged_sql.append(kwargs["sql"])
+    )
     monkeypatch.setattr(appmod, "get_embedding_model", lambda *a, **k: object())
     monkeypatch.setattr(appmod, "build_qdrant_store", lambda *a, **k: FakeQdrantStore())
 
@@ -268,20 +365,36 @@ def test_apptest_validated_rerun_flow(monkeypatch):
     at.text_input(key="question_input").set_value("show me items")
     [button for button in at.form_submit_button if button.label == "Search"][0].click().run()
 
-    assert any("SELECT id, name, price FROM items" in str(code.value) for code in at.code)
+    query = at.session_state["ui_state"]["pending"]["sql"]
+    assert [code.value for code in at.code] == [query]
+    assert query == "SELECT id, name, price FROM items"
     assert any(button.label == "Connect" for button in at.form_submit_button)
     assert not any(element.value == "Connected" for element in at.success)
+    assert at.expander(key="query-execution-expander").proto.expanded is False
+    assert at.download_button[0].label == "Download SQL"
+    at.download_button[0].click().run()
+    assert at.session_state["ui_state"]["pending"]["sql"] == query
+    assert at.session_state["ui_state"]["result"] is None
+    assert [code.value for code in at.code] == [query]
 
+    [field for field in at.text_input if field.label == "Password"][0].set_value("test-secret")
     [field for field in at.text_input if field.label == "Database"][0].set_value(db_path)
     [button for button in at.form_submit_button if button.label == "Connect"][0].click().run()
 
     assert calls == [("connect", db_path), ("execute", "SELECT id, name, price FROM items")]
+    assert logged_sql == [query]
     assert any(element.value == "Connected" for element in at.success)
     assert "widget" in str(at.dataframe[0].value)
+    assert [code.value for code in at.code] == [query]
+    assert at.session_state["ui_state"]["pending"]["sql"] == query
+    [button for button in at.button if button.label == "Next"][0].click().run()
+    assert at.session_state["ui_state"]["pending"]["sql"] == query
+    assert [code.value for code in at.code] == [query]
+    assert len(calls) == 2
 
     at.run()
     assert len(calls) == 2
-    assert "widget" in str(at.dataframe[0].value)
+    assert "gadget" in str(at.dataframe[0].value)
     assert at.session_state["db_creds"]["credentials"].database == db_path
     assert at.session_state["ui_state"]["result"]["rows"]
 

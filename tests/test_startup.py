@@ -1,10 +1,12 @@
 """Startup tests for database-independent local indexing."""
 
 import sqlalchemy as sa
+from qdrant_client import QdrantClient
 
 from config.settings import Settings
 from core import startup
 from db.adapter import DatabaseAdapter
+from retrieval import qdrant_store as qdrant_store_module
 
 
 class FakeEmbeddingModel:
@@ -46,6 +48,12 @@ def _configure_startup(tmp_path, monkeypatch, engine):
         lambda database_url, timeout: DatabaseAdapter(database_url, timeout, engine=engine),
     )
     monkeypatch.setattr(startup, "EmbeddingModel", FakeEmbeddingModel)
+    shared_client = QdrantClient(location=":memory:")
+    monkeypatch.setattr(
+        qdrant_store_module,
+        "create_qdrant_client",
+        lambda settings=None: shared_client,
+    )
     startup._runtime.clear()
 
 

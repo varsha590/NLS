@@ -9,7 +9,6 @@ import sqlalchemy as sa
 from config import data_policy
 from core.startup import _namespace_policy_hash
 from db.adapter import DatabaseAdapter
-from retrieval.local_store import LocalVectorStore
 from retrieval.value_index import ValueIndex
 from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo
 from validation.validator import ValidationError, validate_sql
@@ -33,10 +32,16 @@ class CountingEmbedder:
 
 
 class CountingStore:
+    tenant_id = "default"
+    dataset_id = "default"
+    dataset_metadata_path = None
+    model_name = "phase4-test"
+    vector_size = 4
+
     def __init__(self):
         self.searches = 0
 
-    def search_values(self, query, top_k, table=None, column=None):
+    def search_values(self, query, top_k, table=None, column=None, **kwargs):
         self.searches += 1
         return [
             {"table_name": "synthetic_records", "column_name": "generic_state", "value": "North", "similarity": 0.9},
@@ -86,7 +91,7 @@ def _high_fixture(tmp_path: Path, values: list[str], cap: int = 20000):
     return engine, adapter, catalog, index
 
 
-def test_many_phrase_spans_use_one_embedding_batch_and_bounded_faiss_searches():
+def test_many_phrase_spans_use_one_embedding_batch_and_bounded_vector_searches():
     engine = sa.create_engine("sqlite:///:memory:")
     metadata = SchemaMetadata({
         "synthetic_records": TableInfo(
@@ -111,7 +116,7 @@ def test_many_phrase_spans_use_one_embedding_batch_and_bounded_faiss_searches():
     assert embedder.calls == 1
     assert index.call_counts["embedding_calls"] == 1
     assert store.searches <= 40
-    assert index.call_counts["faiss_searches"] <= 40
+    assert index.call_counts["vector_searches"] <= 40
     assert index.call_counts.get("value_lookup_db_calls", 0) == 0
 
 

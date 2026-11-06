@@ -86,6 +86,7 @@ def index_registered_dataset(
     embedding_model: Embedder,
 ) -> int:
     """Embed and re-index one dataset, committing indexed metadata only on success."""
+    registry.mark_not_indexed(tenant_id, dataset_id)
     if embedding_model.dim != store.vector_size:
         raise QdrantStorageError(
             f"Embedding model dimension must be {store.vector_size}; received {embedding_model.dim}."

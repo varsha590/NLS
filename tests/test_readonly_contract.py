@@ -8,11 +8,13 @@ import re
 import numpy as np
 import pytest
 import sqlalchemy as sa
+from qdrant_client import QdrantClient
 from sqlalchemy.engine import make_url
 
 from config.settings import Settings
 from core import startup
 from db.adapter import DatabaseAdapter
+from retrieval import qdrant_store as qdrant_store_module
 
 
 class ContractEmbedder:
@@ -64,6 +66,12 @@ def _install_startup_fakes(monkeypatch, vector_path, engine):
     )
     monkeypatch.setattr(startup, "EmbeddingModel", ContractEmbedder)
     monkeypatch.setattr(startup, "GroqGenerator", lambda *args: CountGenerator())
+    shared_client = QdrantClient(location=":memory:")
+    monkeypatch.setattr(
+        qdrant_store_module,
+        "create_qdrant_client",
+        lambda settings=None: shared_client,
+    )
     startup._runtime.clear()
 
 

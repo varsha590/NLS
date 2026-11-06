@@ -1,14 +1,18 @@
 """SQLite end-to-end proof that the pipeline needs no hosted database or LLM."""
 
+import json
+
 import numpy as np
 import sqlalchemy as sa
 from unittest.mock import MagicMock
+from qdrant_client import QdrantClient
 
 from catalog.introspect import introspect_catalog
+from config.settings import Settings
 from db.adapter import DatabaseAdapter
 from pipeline.orchestrator import TextToSQLPipeline
+from retrieval.qdrant_store import QdrantVectorStore
 from retrieval.schema_retriever import HybridSchemaRetriever
-from retrieval.local_store import LocalVectorStore
 from retrieval.value_index import ValueIndex
 
 
@@ -62,9 +66,22 @@ def test_pipeline_runs_against_sqlite_with_mocked_llm_and_vector_schema_search(t
     adapter = DatabaseAdapter("sqlite:///:memory:", engine=engine)
     catalog = introspect_catalog(engine)
     embedder = FakeEmbedder()
-    local_store = LocalVectorStore(
-        tmp_path, adapter.namespace(), embedder.model_name, embedder.dim, "test-policy"
+    metadata_path = tmp_path / "dataset.json"
+    local_store = QdrantVectorStore(
+        settings=Settings.from_env(),
+        client=QdrantClient(location=":memory:"),
+        vector_size=embedder.dim,
+        tenant_id="default",
+        dataset_id=adapter.namespace(),
+        dataset_metadata_path=metadata_path,
     )
+    metadata_path.write_text(json.dumps({
+        "tenant_id": "default",
+        "dataset_id": adapter.namespace(),
+        "indexed": True,
+        "embedding_model_name": local_store.model_name,
+        "vector_dimension": embedder.dim,
+    }))
     table_document = "inventory item_name quantity"
     assert local_store.build_schema([{
         "table_name": "inventory",

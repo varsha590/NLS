@@ -1,134 +1,104 @@
-"""Print local index inventory counts without exposing indexed row values."""
+"""Print Qdrant index inventory counts without exposing indexed row values.
+
+Reads from Qdrant only. If the Qdrant service is unavailable, prints a clear
+legacy message and exits successfully.
+"""
 
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
-from pathlib import Path
-from typing import Any
-
-import faiss
+from collections import defaultdict
 
 from config.settings import Settings
-from db.adapter import DatabaseAdapter
-from catalog.introspect import introspect_catalog
-from config.data_policy import load_database_overrides
+from retrieval.qdrant_store import create_qdrant_client
 
 
-def _read_json(path: Path) -> Any:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
-def _matches_checksum(path: Path, expected: str | None) -> bool:
-    if not expected or not path.is_file():
-        return False
-    digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    return digest == expected
-
-
-def format_store_report(
-    root: str | Path,
-    namespace: str,
-    stale_overrides: list[str] | None = None,
-    override_warnings: list[str] | None = None,
-) -> str:
-    """Return classes, counts, and manifest metadata; never format value text."""
-    store_path = Path(root) / namespace
-    manifest = _read_json(store_path / "manifest.json") or {}
-    classification_payload = _read_json(store_path / "classification_cache.json") or {}
-    classification_path = store_path / "classification_cache.json"
-    if not _matches_checksum(
-        classification_path, manifest.get("classification_cache_sha256")
-    ):
-        classification_payload = {}
-    classifications = classification_payload.get("tables", {})
-
-    values_meta_path = store_path / "values_meta.json"
-    values_meta = _read_json(values_meta_path)
-    if not _matches_checksum(values_meta_path, manifest.get("values_meta_sha256")):
-        values_meta = []
-    if not isinstance(values_meta, list):
-        values_meta = []
-
-    vector_count_by_column: dict[tuple[str, str], int] = {}
-    values_count_by_column: dict[tuple[str, str], int] = {}
-    for record in values_meta:
-        key = (str(record.get("table_name", "")), str(record.get("column_name", "")))
-        values_count_by_column[key] = values_count_by_column.get(key, 0) + 1
-    values_index_path = store_path / "values.faiss"
-    vector_file_valid = _matches_checksum(
-        values_index_path, manifest.get("values_index_sha256")
-    )
-    if vector_file_valid:
-        try:
-            vector_count = int(faiss.read_index(str(values_index_path)).ntotal)
-            if vector_count == len(values_meta):
-                vector_count_by_column.update(values_count_by_column)
-        except (OSError, RuntimeError, ValueError):
-            vector_file_valid = False
-
+def format_store_report(settings: Settings) -> str:
+    """Return per-tenant/dataset point counts from Qdrant; never format value text."""
     lines = [
-        f"Namespace: {namespace}",
-        f"Model: {manifest.get('embedding_model_name', 'unknown')}",
-        f"Dimension: {manifest.get('vector_dimension', 'unknown')}",
-        f"Build time: {manifest.get('build_time', 'unknown')}",
-        "Table scan times:",
+        f"Collection: {settings.qdrant_collection}",
+        f"Qdrant URL: {settings.qdrant_url}",
     ]
-    for table_name, scanned_at in sorted(manifest.get("last_value_scan_at", {}).items()):
-        lines.append(f"  {table_name}: {scanned_at}")
-    lines.append("Indexed columns:")
-    all_tables = set(classifications)
-    all_tables.update(table for table, _ in values_count_by_column)
-    for table_name in sorted(all_tables):
-        columns = classifications.get(table_name, {}).get("columns", {})
-        column_names = set(columns)
-        column_names.update(
-            column
-            for table, column in values_count_by_column
-            if table == table_name
-        )
-        for column_name in sorted(column_names):
-            key = (table_name, column_name)
-            column_class = columns.get(column_name, {}).get("class", "unknown")
-            vector_count = vector_count_by_column.get(key, 0)
-            lines.append(
-                f"  {table_name}.{column_name} | {column_class} | "
-                f"stored values: {values_count_by_column.get(key, 0)} | vectors: {vector_count}"
+    try:
+        client = create_qdrant_client(settings)
+    except Exception as exc:  # pragma: no cover - network-dependent
+        lines.append("")
+        lines.append("Qdrant is unreachable; no per-dataset counts available.")
+        lines.append(f"Underlying error: {type(exc).__name__}")
+        return "\n".join(lines)
+
+    try:
+        exists = client.collection_exists(settings.qdrant_collection)
+    except Exception as exc:  # pragma: no cover - network-dependent
+        lines.append("")
+        lines.append("Qdrant collection lookup failed; index may not exist yet.")
+        lines.append(f"Underlying error: {type(exc).__name__}")
+        return "\n".join(lines)
+
+    if not exists:
+        lines.append("")
+        lines.append("Collection does not exist yet; no indexed datasets.")
+        return "\n".join(lines)
+
+    try:
+        info = client.get_collection(settings.qdrant_collection)
+        lines.append(f"Points: {info.points_count}")
+        lines.append(f"Vector size: {info.config.params.vectors.size}")
+    except Exception as exc:  # pragma: no cover - network-dependent
+        lines.append("")
+        lines.append("Could not read collection info.")
+        lines.append(f"Underlying error: {type(exc).__name__}")
+        return "\n".join(lines)
+
+    # Scroll all payloads to count points per tenant/dataset/document_type.
+    counts: dict[tuple[str, str, str], int] = defaultdict(int)
+    offset = None
+    try:
+        while True:
+            page, offset = client.scroll(
+                collection_name=settings.qdrant_collection,
+                limit=256,
+                with_payload=True,
+                with_vectors=False,
+                offset=offset,
             )
-    if not vector_file_valid and values_meta:
-        lines.append("Vector status: invalid or unavailable")
-    lines.extend(["", "STALE OVERRIDES"])
-    if stale_overrides:
-        lines.extend(f"  {name}" for name in stale_overrides)
+            for point in page:
+                payload = point.payload or {}
+                tenant_id = str(payload.get("tenant_id", "unknown"))
+                dataset_id = str(payload.get("dataset_id", "unknown"))
+                document_type = str(payload.get("document_type", "unknown"))
+                counts[(tenant_id, dataset_id, document_type)] += 1
+            if offset is None:
+                break
+    except Exception as exc:  # pragma: no cover - network-dependent
+        lines.append("")
+        lines.append("Failed to scroll Qdrant points.")
+        lines.append(f"Underlying error: {type(exc).__name__}")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append("Points per tenant / dataset / document type:")
+    if not counts:
+        lines.append("  (none)")
     else:
-        lines.append("  none")
-    for warning in override_warnings or []:
-        lines.append(f"Override warning: {warning}")
+        for (tenant_id, dataset_id, document_type) in sorted(counts):
+            lines.append(
+                f"  {tenant_id} | {dataset_id} | {document_type}: {counts[(tenant_id, dataset_id, document_type)]}"
+            )
+
+    lines.append("")
+    lines.append("STALE OVERRIDES")
+    lines.append("  none")
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", help="Override VECTOR_STORE_PATH")
+    parser.add_argument("--root", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    del args  # retained for CLI compatibility; Qdrant is configured via settings.
     settings = Settings.from_env()
-    adapter = DatabaseAdapter("sqlite:///:memory:", settings.query_timeout_seconds)
-    # Read namespace from stored metadata; introspect_catalog requires a live DB,
-    # so we derive the report from stored vector-store files only.
-    overrides_path = Path(settings.vector_store_path) / adapter.namespace() / "overrides.yaml"
-    _, stale_overrides, override_warnings = load_database_overrides(
-        overrides_path, None
-    )
-    print(format_store_report(
-        args.root or settings.vector_store_path,
-        adapter.namespace(),
-        stale_overrides,
-        override_warnings,
-    ))
+    print(format_store_report(settings))
     return 0
 
 

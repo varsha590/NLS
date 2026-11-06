@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo
 
 from retrieval.qdrant_store import (
+    QdrantIndexNotReadyError,
     QdrantMetadataMismatchError,
     QdrantStorageError,
     QdrantVectorStore,
@@ -351,6 +352,8 @@ def retrieve(
             )
             qdrant_results["master_value"] = master_search
             qdrant_search_succeeded = True
+        except QdrantIndexNotReadyError:
+            raise
         except QdrantMetadataMismatchError:
             raise
         except QdrantStorageError as error:

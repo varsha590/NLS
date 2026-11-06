@@ -1,11 +1,15 @@
 """Focused portability checks for the SQLAlchemy adapter."""
 
+import json
+
 import sqlalchemy as sa
 import numpy as np
+from qdrant_client import QdrantClient
 
+from config.settings import Settings
 from db.adapter import DatabaseAdapter
 from catalog.introspect import introspect_catalog
-from retrieval.local_store import LocalVectorStore
+from retrieval.qdrant_store import QdrantVectorStore
 from retrieval.value_index import ValueIndex
 
 
@@ -84,9 +88,22 @@ def test_value_index_stores_distinct_text_values_locally(tmp_path):
             return np.asarray([[len(text), sum(text.encode())] for text in texts], dtype=float)
 
     embedder = TinyEmbedder()
-    local_store = LocalVectorStore(
-        tmp_path, adapter.namespace(), embedder.model_name, embedder.dim, "test-policy"
+    metadata_path = tmp_path / "dataset.json"
+    local_store = QdrantVectorStore(
+        settings=Settings.from_env(),
+        client=QdrantClient(location=":memory:"),
+        vector_size=embedder.dim,
+        tenant_id="default",
+        dataset_id=adapter.namespace(),
+        dataset_metadata_path=metadata_path,
     )
+    metadata_path.write_text(json.dumps({
+        "tenant_id": "default",
+        "dataset_id": adapter.namespace(),
+        "indexed": True,
+        "embedding_model_name": local_store.model_name,
+        "vector_dimension": embedder.dim,
+    }))
     value_index = ValueIndex(
         adapter, catalog, embedder=embedder, local_store=local_store
     )

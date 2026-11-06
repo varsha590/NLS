@@ -7,11 +7,13 @@ import time
 import numpy as np
 import pytest
 import sqlalchemy as sa
+from qdrant_client import QdrantClient
 
 from config.settings import Settings
 from core import startup
 from db.adapter import DatabaseAdapter
-from retrieval.local_store import LocalVectorStore
+from retrieval import qdrant_store as qdrant_store_module
+from retrieval.qdrant_store import QdrantVectorStore
 from retrieval.value_index import ValueIndex
 
 
@@ -58,6 +60,12 @@ def _configure_startup(tmp_path, monkeypatch, engine, refresh_ttl_hours: float =
         lambda database_url, timeout: DatabaseAdapter("sqlite:///:memory:", timeout, engine=engine),
     )
     monkeypatch.setattr(startup, "EmbeddingModel", CountingEmbeddingModel)
+    shared_client = QdrantClient(location=":memory:")
+    monkeypatch.setattr(
+        qdrant_store_module,
+        "create_qdrant_client",
+        lambda settings=None: shared_client,
+    )
     CountingEmbeddingModel.batches.clear()
 
 
@@ -259,12 +267,12 @@ def test_enum_option_changes_prune_removed_values_without_row_scans(tmp_path):
     metadata.create_all(engine)
     adapter = DatabaseAdapter("sqlite:///:memory:", engine=engine)
     embedder = CountingEmbeddingModel("phase3-synthetic-model")
-    store = LocalVectorStore(
-        tmp_path,
-        "enum-namespace",
-        embedder.model_name,
-        embedder.dim,
-        "policy",
+    store = QdrantVectorStore(
+        settings=_settings(tmp_path),
+        client=QdrantClient(location=":memory:"),
+        vector_size=embedder.dim,
+        tenant_id="default",
+        dataset_id="enum-namespace",
     )
     statements: list[str] = []
     sa.event.listen(
@@ -400,6 +408,11 @@ def test_failed_table_scan_keeps_prior_index_and_updates_other_tables(
         for record in first_runtime["local_store"].values_meta
         if record["table_name"] == first_table.name
     }
+    old_second_hashes = {
+        record["value_hash"]
+        for record in first_runtime["local_store"].values_meta
+        if record["table_name"] == second_table.name
+    }
 
     with engine.begin() as connection:
         connection.execute(first_table.update().values(generic_label="primary-new"))
@@ -429,11 +442,7 @@ def test_failed_table_scan_keeps_prior_index_and_updates_other_tables(
         first_table.name: "unexpected_error"
     }
     assert old_first_hashes.issubset(first_table_hashes)
-    assert second_table_hashes != {
-        record["value_hash"]
-        for record in first_runtime["local_store"].values_meta
-        if record["table_name"] == second_table.name
-    }
+    assert second_table_hashes != old_second_hashes
 
 
 def test_failed_value_embedding_surfaces_incomplete_and_preserves_resolver_values(
@@ -485,13 +494,15 @@ def test_failed_value_embedding_surfaces_incomplete_and_preserves_resolver_value
     assert values_by_table[second_table.name] == "secondary-new"
 
 
-def test_store_report_shows_counts_without_value_text(tmp_path):
-    store = LocalVectorStore(
-        tmp_path,
-        "generic-namespace",
-        CountingEmbeddingModel.model_name,
-        CountingEmbeddingModel.dim,
-        "policy",
+def test_store_report_shows_counts_without_value_text(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    client = QdrantClient(location=":memory:")
+    store = QdrantVectorStore(
+        settings=settings,
+        client=client,
+        vector_size=CountingEmbeddingModel.dim,
+        tenant_id="tenant-report",
+        dataset_id="dataset-report",
     )
     value_text = "report-private-sentinel"
     value_record = {
@@ -502,34 +513,17 @@ def test_store_report_shows_counts_without_value_text(tmp_path):
         "value": value_text,
     }
     assert store.build_values([value_record], CountingEmbeddingModel("test"))
-    store.save_index_state(
-        global_schema_fingerprint="global",
-        table_fingerprints={"generic_table": "table"},
-        last_value_scan_at={"generic_table": 1000.0},
-        classification_cache={
-            "generic_table": {
-                "fingerprint": "table",
-                "columns": {
-                    "generic_field": {
-                        "class": "VALUE_LOW",
-                        "reason": "text column with distinct count 1 <= threshold 10",
-                        "distinct_count": 1,
-                        "non_null_count": 1,
-                        "avg_text_length": 1.0,
-                    }
-                },
-            }
-        },
+
+    from scripts import store_report
+
+    monkeypatch.setattr(
+        store_report, "create_qdrant_client", lambda settings=None: client
     )
+    report = store_report.format_store_report(settings)
 
-    from scripts.store_report import format_store_report
-
-    report = format_store_report(tmp_path, "generic-namespace")
-
-    assert "generic_table.generic_field" in report
-    assert "VALUE_LOW" in report
-    assert "stored values: 1" in report
-    assert "vectors: 1" in report
+    assert "tenant-report" in report
+    assert "dataset-report" in report
+    assert "master_value: 1" in report
     assert value_text not in report
 
 

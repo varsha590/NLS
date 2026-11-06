@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import uuid
+from dataclasses import replace
 import warnings
 from pathlib import Path
 from typing import Any
@@ -17,8 +18,10 @@ from config.settings import Settings
 from ingestion.datasets import DatasetRegistry
 from retrieval.dataset_indexer import index_registered_dataset
 from retrieval import embeddings as embeddings_module
+from retrieval import qdrant_store as qdrant_store_module
 from retrieval.qdrant_store import (
     DEFAULT_COLLECTION,
+    QdrantIndexNotReadyError,
     QdrantMetadataMismatchError,
     QdrantStorageError,
     QdrantVectorStore,
@@ -81,7 +84,8 @@ def _typed_documents(label: str) -> list[dict[str, Any]]:
 def _make_store(client: QdrantClient) -> QdrantVectorStore:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        return QdrantVectorStore(client=client)
+        settings = replace(Settings.from_env(), qdrant_collection=DEFAULT_COLLECTION)
+        return QdrantVectorStore(settings=settings, client=client)
 
 
 def test_collection_creation_is_idempotent_and_rejects_vector_mismatch():
@@ -126,7 +130,7 @@ def test_point_ids_are_stable_and_separate_values():
     assert first != deterministic_point_id("tenant-b", "dataset-a", "master_value", "regions", "name", "North")
 
 
-def test_reindex_upserts_then_removes_only_stale_points_in_dataset_scope(tmp_path):
+def test_reindex_removes_scoped_points_before_upserting_replacements(tmp_path):
     store = _make_store(_client())
     metadata_a1 = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
     metadata_a2 = _dataset_metadata(tmp_path, "tenant-a", "dataset-b")
@@ -170,7 +174,7 @@ def test_reindex_upserts_then_removes_only_stale_points_in_dataset_scope(tmp_pat
         "model-384",
         384,
     )
-    assert calls == ["upsert", "delete"]
+    assert calls == ["delete", "upsert"]
     assert {item["value"] for item in store.search(
         VECTOR, "tenant-a", "dataset-a", 10,
         dataset_metadata_path=metadata_a1, embedding_model_name="model-384", dimension=384,
@@ -232,6 +236,41 @@ def test_failed_upsert_or_stale_delete_never_commits_index_metadata(tmp_path):
         assert "embedding_model_name" not in persisted
         assert "vector_dimension" not in persisted
     store.client = client
+
+
+def test_upsert_error_preserves_safe_cause_without_api_key_or_header(tmp_path, monkeypatch):
+    api_key = "qdrant-test-secret"
+    monkeypatch.setenv("QDRANT_API_KEY", api_key)
+    store = _make_store(_client())
+    metadata_path = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
+    real_client = store.client
+
+    class FailingUpsertClient:
+        def __getattr__(self, name):
+            return getattr(real_client, name)
+
+        def upsert(self, *args, **kwargs):
+            raise RuntimeError(
+                f"UnexpectedResponse: Wrong input; api-key: {api_key}"
+            )
+
+    store.client = FailingUpsertClient()
+    with pytest.raises(QdrantStorageError) as caught:
+        store.reindex_dataset(
+            "tenant-a",
+            "dataset-a",
+            [_document("records", "content")],
+            [VECTOR],
+            metadata_path,
+            "dataset-hash",
+            "model-384",
+            384,
+        )
+
+    assert "upsert failed: RuntimeError: UnexpectedResponse: Wrong input" in str(caught.value)
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert api_key not in str(caught.value)
+    assert "api-key" not in str(caught.value).casefold()
 
 
 def test_search_requires_both_scope_values_and_filters_results(tmp_path):
@@ -351,7 +390,7 @@ def test_search_metadata_failures_share_one_message_and_log_safe_reasons(tmp_pat
     }))
 
     cases = [
-        (tmp_path / "missing.json", "tenant-a", "model-384", QdrantStorageError),
+        (tmp_path / "missing.json", "tenant-a", "model-384", QdrantIndexNotReadyError),
         (wrong_tenant_metadata, "tenant-a", "model-384", QdrantStorageError),
         (valid_metadata, "tenant-a", "different-model", QdrantMetadataMismatchError),
     ]
@@ -364,10 +403,9 @@ def test_search_metadata_failures_share_one_message_and_log_safe_reasons(tmp_pat
                 )
             messages.append(str(error.value))
 
-    assert messages[0] == messages[1] == messages[2]
-    assert messages[0] == (
-        "Dataset index is unavailable or incompatible; search was refused."
-    )
+    assert messages[0] == "Dataset index is unavailable or incompatible; search was refused."
+    assert "search metadata validation failed: ValueError" in messages[1]
+    assert "search metadata validation failed: ValueError" in messages[2]
     warning_text = caplog.text
     assert "metadata is missing or unreadable" in warning_text
     assert "index scope is invalid" in warning_text
@@ -426,6 +464,120 @@ def test_dataset_indexer_embeds_tables_columns_relationships_and_values(tmp_path
     }
 
 
+def test_reupload_repairs_half_indexed_dataset_without_duplicate_points(tmp_path, monkeypatch):
+    import ingestion.datasets as datasets
+
+    content = b"CREATE TABLE regions (id INTEGER PRIMARY KEY, name TEXT);"
+    registry = DatasetRegistry(tmp_path / "datasets")
+    registered = registry.register(
+        "regions.sql",
+        content,
+        tenant_id="tenant-repair",
+        embedding_model_name="fake-384",
+    )
+    store = _make_store(_client())
+    dataset_id = registered["dataset_id"]
+    metadata_path = registry.dataset_directory("tenant-repair", dataset_id) / "dataset.json"
+    stale_point = [models.PointStruct(
+        id=str(uuid.uuid4()),
+        vector=VECTOR,
+        payload={
+            "tenant_id": "tenant-repair",
+            "dataset_id": dataset_id,
+            "document_type": "table",
+            "table_name": "regions",
+            "content": "partial old point",
+        },
+    )]
+    store.client.upsert(
+        collection_name=store.collection_name,
+        points=stale_point,
+        wait=True,
+    )
+    monkeypatch.setattr(
+        datasets,
+        "parse_sql_dump",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("same content was reparsed")),
+    )
+
+    repaired_registration = registry.register(
+        "regions.sql",
+        content,
+        tenant_id="tenant-repair",
+        embedding_model_name="fake-384",
+    )
+    assert repaired_registration["status"] == "needs_index"
+    assert repaired_registration["indexed"] is False
+
+    class FakeEmbedder:
+        model_name = "fake-384"
+        dim = 384
+
+        def embed(self, texts):
+            return np.tile(np.asarray([[1.0] + [0.0] * 383]), (len(texts), 1))
+
+    count = index_registered_dataset(
+        registry, store, "tenant-repair", dataset_id,
+        repaired_registration["dataset_hash"], FakeEmbedder(),
+    )
+    scope_filter = models.Filter(must=[
+        models.FieldCondition(key="tenant_id", match=models.MatchValue(value="tenant-repair")),
+        models.FieldCondition(key="dataset_id", match=models.MatchValue(value=dataset_id)),
+    ])
+    scoped_count = store.client.count(
+        collection_name=store.collection_name,
+        count_filter=scope_filter,
+        exact=True,
+    ).count
+    assert scoped_count == count
+    assert json.loads(metadata_path.read_text())["indexed"] is True
+
+    registry.mark_not_indexed("tenant-repair", dataset_id)
+    second_count = index_registered_dataset(
+        registry, store, "tenant-repair", dataset_id,
+        repaired_registration["dataset_hash"], FakeEmbedder(),
+    )
+    assert second_count == count
+    assert store.client.count(
+        collection_name=store.collection_name,
+        count_filter=scope_filter,
+        exact=True,
+    ).count == count
+
+
+def test_embedding_failure_leaves_existing_dataset_unindexed(tmp_path):
+    registry = DatasetRegistry(tmp_path / "datasets")
+    registered = registry.register(
+        "failure.sql",
+        b"CREATE TABLE regions (id INTEGER PRIMARY KEY, name TEXT);",
+        tenant_id="tenant-failure",
+        embedding_model_name="fake-384",
+    )
+    dataset_id = registered["dataset_id"]
+    metadata_path = registry.dataset_directory("tenant-failure", dataset_id) / "dataset.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["indexed"] = True
+    metadata_path.write_text(json.dumps(metadata))
+
+    class FailingEmbedder:
+        model_name = "fake-384"
+        dim = 384
+
+        def embed(self, texts):
+            raise RuntimeError("embedding failed")
+
+    with pytest.raises(RuntimeError, match="embedding failed"):
+        index_registered_dataset(
+            registry,
+            _make_store(_client()),
+            "tenant-failure",
+            dataset_id,
+            registered["dataset_hash"],
+            FailingEmbedder(),
+        )
+    assert json.loads(metadata_path.read_text())["indexed"] is False
+
+
 def test_sentence_transformer_model_must_return_384_dimensions(monkeypatch):
     class WrongDimensionModel:
         def __init__(self, model_name):
@@ -449,6 +601,49 @@ def test_settings_hide_qdrant_url_and_api_key_from_repr(monkeypatch):
     assert "secret-qdrant-key" not in repr(settings)
 
 
+@pytest.mark.parametrize(
+    ("api_key", "expected"),
+    [("secret-qdrant-key", "secret-qdrant-key"), ("", None), (None, None)],
+)
+def test_qdrant_client_uses_settings_key_and_redacts_failures(
+    api_key, expected, monkeypatch, caplog
+):
+    required_settings = {
+        "LLM_MODEL": "test-llm",
+        "EMBEDDING_MODEL": "test-embedder",
+        "VECTOR_STORE_PATH": ".test-vector-store",
+        "SCHEMA_TOP_K": "4",
+        "VALUE_TOP_K": "3",
+        "VALUE_CARDINALITY_THRESHOLD": "12",
+        "QUERY_TIMEOUT_SECONDS": "6",
+        "MAX_RETRIES": "2",
+    }
+    for name, value in required_settings.items():
+        monkeypatch.setenv(name, value)
+    if api_key is None:
+        monkeypatch.delenv("QDRANT_API_KEY", raising=False)
+    else:
+        monkeypatch.setenv("QDRANT_API_KEY", api_key)
+
+    received = []
+
+    class FakeQdrantClient:
+        def __init__(self, *, url, api_key, timeout):
+            del url, timeout
+            received.append(api_key)
+            raise RuntimeError(f"request failed with {api_key}")
+
+    monkeypatch.setattr(qdrant_store_module, "QdrantClient", FakeQdrantClient)
+    with pytest.raises(QdrantStorageError) as caught:
+        QdrantVectorStore(settings=Settings.from_env())
+
+    assert received == [expected]
+    if api_key:
+        assert api_key not in str(caught.value)
+        assert api_key not in str(caught.value.__cause__)
+        assert api_key not in caplog.text
+
+
 @pytest.fixture
 def docker_qdrant_scope(tmp_path):
     endpoint = os.getenv("QDRANT_INTEGRATION_URL")
@@ -457,11 +652,12 @@ def docker_qdrant_scope(tmp_path):
     suffix = uuid.uuid4().hex
     tenant_ids = (f"nls-test-{suffix}-a", f"nls-test-{suffix}-b")
     dataset_ids = (f"nls-test-{suffix}-a", f"nls-test-{suffix}-b")
-    store = QdrantVectorStore(
-        url=endpoint,
-        api_key=os.getenv("QDRANT_API_KEY") or None,
-        collection_name=os.getenv("QDRANT_COLLECTION", DEFAULT_COLLECTION),
+    settings = replace(
+        Settings.from_env(),
+        qdrant_url=endpoint,
+        qdrant_collection=os.getenv("QDRANT_COLLECTION", DEFAULT_COLLECTION),
     )
+    store = QdrantVectorStore(settings=settings)
     try:
         yield store, tenant_ids, dataset_ids, tmp_path
     finally:
@@ -695,3 +891,38 @@ def test_metadata_mismatch_prevents_master_value_search(tmp_path):
 
     with pytest.raises(QdrantStorageError, match="384 dimensions"):
         store.search_master_value(VECTOR, "tenant-a", "dataset-a", 5, path_a, "model-384", 768)
+
+def test_tenant_isolation_prevents_cross_tenant_reads(tmp_path):
+    """Tenant A can never read tenant B's points, and scope is mandatory."""
+    store = _make_store(_client())
+    path_a = _dataset_metadata(tmp_path, "tenant-a", "dataset-a")
+    path_b = _dataset_metadata(tmp_path, "tenant-b", "dataset-a")
+    store.reindex_dataset(
+        "tenant-a", "dataset-a", [_value_document("regions", "name", "North")],
+        [VECTOR], path_a, "a", "m", 384,
+    )
+    store.reindex_dataset(
+        "tenant-b", "dataset-a", [_value_document("regions", "name", "South")],
+        [VECTOR], path_b, "b", "m", 384,
+    )
+
+    def read(tenant_id, metadata_path):
+        return store.search(
+            VECTOR, tenant_id, "dataset-a", 10,
+            dataset_metadata_path=metadata_path, embedding_model_name="m", dimension=384,
+        )
+
+    assert {item["value"] for item in read("tenant-a", path_a)} == {"North"}
+    assert {item["value"] for item in read("tenant-b", path_b)} == {"South"}
+
+    # Tenant A presenting tenant B's metadata cannot read B's points.
+    with pytest.raises(QdrantStorageError):
+        read("tenant-a", path_b)
+
+    # An empty tenant or dataset is always refused.
+    for tenant_id, dataset_id in (("", "dataset-a"), ("tenant-a", "")):
+        with pytest.raises(ValueError, match="tenant_id and dataset_id"):
+            store.search(
+                VECTOR, tenant_id, dataset_id, 5,
+                dataset_metadata_path=path_a, embedding_model_name="m", dimension=384,
+            )

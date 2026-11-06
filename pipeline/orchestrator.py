@@ -170,7 +170,7 @@ class TextToSQLPipeline:
             if hasattr(self.value_index, "pending_confirmation"):
                 self.value_index.pending_confirmation = None
         if hasattr(self.retriever, "call_counts"):
-            self.retriever.call_counts = {"embedding_calls": 0, "faiss_searches": 0}
+            self.retriever.call_counts = {"embedding_calls": 0, "vector_searches": 0}
 
         def record_run_details() -> None:
             value_counts = getattr(self.value_index, "call_counts", {})
@@ -182,8 +182,8 @@ class TextToSQLPipeline:
             result.call_counts = {
                 "embedding_calls": int(value_counts.get("embedding_calls", 0))
                 + int(schema_counts.get("embedding_calls", 0)),
-                "faiss_searches": int(value_counts.get("faiss_searches", 0))
-                + int(schema_counts.get("faiss_searches", 0)),
+                "vector_searches": int(value_counts.get("vector_searches", 0))
+                + int(schema_counts.get("vector_searches", 0)),
                 **self.adapter.call_counts,
                 "llm_calls": int(result.call_counts.get("llm_calls", 0)),
             }
@@ -271,8 +271,8 @@ class TextToSQLPipeline:
                     examples=examples,
                     correction=correction,
                     hints_path=(
-                        local_store.path / "hints.md"
-                        if local_store is not None
+                        getattr(local_store, "path", None) / "hints.md"
+                        if getattr(local_store, "path", None) is not None
                         else Path(__file__).resolve().parents[1] / "hints.md"
                     ),
                     fallback_hints_path=Path(__file__).resolve().parents[1] / "hints.md",

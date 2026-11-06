@@ -1,4 +1,4 @@
-"""Hybrid schema retrieval with local FAISS embeddings, lexical ranking, and FK expansion."""
+"""Hybrid schema retrieval with Qdrant vectors, lexical ranking, and FK expansion."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import numpy as np
 from config.data_policy import is_blocked, is_masked
 from config.settings import Settings
 from retrieval.embeddings import EmbeddingModel
-from retrieval.local_store import LocalVectorStore
+from retrieval.qdrant_store import QdrantVectorStore
 from schema.metadata import SchemaMetadata, is_internal_table_name
 
 DEFAULT_TOP_K = 8
@@ -31,20 +31,20 @@ def _lexical_tokens(value: str) -> list[str]:
 
 
 class HybridSchemaRetriever:
-    """Rank schema documents using local FAISS vectors and lexical relevance."""
+    """Rank schema documents using Qdrant vectors and lexical relevance."""
 
     def __init__(
         self, 
         metadata: SchemaMetadata, 
         embedding_model: Embedder, 
-        local_store: LocalVectorStore | None = None,
+        local_store: QdrantVectorStore | None = None,
         policy_overrides: dict[str, Any] | None = None,
     ):
         self.metadata = metadata
         self.embedding_model = embedding_model
         self.local_store = local_store
         self.policy_overrides = policy_overrides
-        self.call_counts = {"embedding_calls": 0, "faiss_searches": 0}
+        self.call_counts = {"embedding_calls": 0, "vector_searches": 0}
         self.documents = []
         for table in metadata.tables.values():
             if is_internal_table_name(table.name):
@@ -74,9 +74,16 @@ class HybridSchemaRetriever:
         semantic_results = []
         if self.local_store is not None:
             semantic_results = self.local_store.search_schema(
-                query_vector.tolist(), top_k=max(top_k, MAX_TOP_K), metadata_type="table_ddl"
+                query_vector.tolist(),
+                top_k=max(top_k, MAX_TOP_K),
+                metadata_type="table_ddl",
+                tenant_id=self.local_store.tenant_id,
+                dataset_id=self.local_store.dataset_id,
+                dataset_metadata_path=self.local_store.dataset_metadata_path,
+                embedding_model_name=self.local_store.model_name,
+                dimension=self.local_store.vector_size,
             )
-            self.call_counts["faiss_searches"] += 1
+            self.call_counts["vector_searches"] += 1
         
         # Build a lookup of semantic scores from the search results, keyed by
         # the schema-qualified table name returned by the store.  The store key

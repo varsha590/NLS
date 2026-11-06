@@ -85,7 +85,7 @@ def next_ui_state(
         return new
 
     if event == SUBMIT_OK:
-        new["pending"] = None
+        new["pending"] = state.get("pending")
         new["error"] = None
         new["result"] = {
             "columns": payload["columns"],

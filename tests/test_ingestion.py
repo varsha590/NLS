@@ -191,8 +191,8 @@ def test_sql_upload_hash_skips_unchanged_and_persists_schema(tmp_path, monkeypat
     metadata_path = registry.dataset_directory("tenant-a", result["dataset_id"]) / "dataset.json"
     before_index = json.loads(metadata_path.read_text())
     assert before_index["indexed"] is False
-    assert "dataset_hash" not in before_index
-    assert "embedding_model_name" not in before_index
+    assert before_index["dataset_hash"] == result["dataset_hash"]
+    assert before_index["embedding_model_name"] == "tiny-384"
     assert "vector_dimension" not in before_index
 
     class TinyEmbedder:

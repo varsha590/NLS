@@ -22,7 +22,11 @@ from retrieval.qdrant_retriever import (
     _compute_ambiguity_flag,
     _split_into_tokens,
 )
-from retrieval.qdrant_store import QdrantStorageError, QdrantVectorStore
+from retrieval.qdrant_store import (
+    QdrantIndexNotReadyError,
+    QdrantStorageError,
+    QdrantVectorStore,
+)
 from schema.metadata import SchemaMetadata, TableInfo, ColumnInfo
 
 
@@ -702,6 +706,37 @@ def test_retrieve_passes_document_specific_limits_to_real_store(tmp_path):
                 top_k * 2,
                 min(50, top_k * 2),
             ]
+    finally:
+        client.close()
+
+
+def test_retrieve_does_not_fall_back_for_unindexed_metadata(tmp_path):
+    client = QdrantClient(location=":memory:")
+    store = QdrantVectorStore(client=client)
+    metadata_path = tmp_path / "dataset.json"
+    metadata_path.write_text(json.dumps({
+        "tenant_id": "tenant",
+        "dataset_id": "dataset",
+        "indexed": False,
+        "embedding_model_name": "model-384",
+        "vector_dimension": 384,
+    }))
+    schema = SchemaMetadata({
+        "records": TableInfo("records", "", [ColumnInfo("id", "INTEGER")], [], []),
+    })
+
+    try:
+        with pytest.raises(QdrantIndexNotReadyError):
+            retrieve(
+                schema,
+                "records",
+                query_vector=[1.0] + [0.0] * 383,
+                qdrant_store=store,
+                qdrant_tenant_id="tenant",
+                qdrant_dataset_id="dataset",
+                qdrant_embedding_model_name="model-384",
+                qdrant_dataset_metadata_path=str(metadata_path),
+            )
     finally:
         client.close()
 

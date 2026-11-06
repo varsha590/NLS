@@ -18,7 +18,7 @@ import yaml
 from rapidfuzz import fuzz, process
 
 from db.adapter import DatabaseAdapter
-from retrieval.local_store import LocalVectorStore
+from retrieval.qdrant_store import QdrantVectorStore
 from schema.metadata import SchemaMetadata, is_internal_table_name
 from catalog.classifier import (
     ColumnClass,
@@ -97,7 +97,7 @@ class ValueIndex:
         metadata: SchemaMetadata,
         cardinality_threshold: int = 500,
         embedder: Any = None,
-        local_store: LocalVectorStore | None = None,
+        local_store: QdrantVectorStore | None = None,
         phrase_span_limit: int = 40,
         top_k_per_span: int = 5,
         high_cache_max_values: int = 20000,
@@ -157,11 +157,11 @@ class ValueIndex:
         self.uncacheable_high_columns: set[str] = set()
         self.call_counts = {
             "embedding_calls": 0,
-            "faiss_searches": 0,
+            "vector_searches": 0,
         }
         self.last_call_counts = {
             "embedding_calls": 0,
-            "faiss_searches": 0,
+            "vector_searches": 0,
             "value_lookup_db_calls": 0,
         }
         self.unmatched_high_count = 0
@@ -224,7 +224,7 @@ class ValueIndex:
         self.classify_seconds = 0.0
 
     def reset_question_counts(self) -> None:
-        self.call_counts = {"embedding_calls": 0, "faiss_searches": 0}
+        self.call_counts = {"embedding_calls": 0, "vector_searches": 0}
         self.unmatched_high_count = 0
         self.high_resolution_cache.clear()
 
@@ -782,10 +782,10 @@ class ValueIndex:
         columns: list[str | None],
         top_k: int,
     ) -> list[list[dict[str, Any]]]:
-        """Embed spans once and score only the bounded FAISS shortlist per span."""
+        """Embed spans once and score only the bounded Qdrant shortlist per span."""
         self.last_call_counts = {
             "embedding_calls": 0,
-            "faiss_searches": 0,
+            "vector_searches": 0,
             "value_lookup_db_calls": 0,
         }
         if not mentions:
@@ -825,9 +825,14 @@ class ValueIndex:
                     top_k=search_limit,
                     table=table_filter,
                     column=column_filter,
+                    tenant_id=self.local_store.tenant_id,
+                    dataset_id=self.local_store.dataset_id,
+                    dataset_metadata_path=self.local_store.dataset_metadata_path,
+                    embedding_model_name=self.local_store.model_name,
+                    dimension=self.local_store.vector_size,
                 )
-                self.last_call_counts["faiss_searches"] += 1
-                self.call_counts["faiss_searches"] = self.call_counts.get("faiss_searches", 0) + 1
+                self.last_call_counts["vector_searches"] += 1
+                self.call_counts["vector_searches"] = self.call_counts.get("vector_searches", 0) + 1
                 candidates = []
                 for item in search_results:
                     candidate_column = f"{item['table_name']}.{item['column_name']}"

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -18,7 +19,7 @@ from llm.generator import GroqGenerator
 from pipeline.orchestrator import TextToSQLPipeline
 from retrieval.embeddings import EmbeddingModel
 from retrieval.examples import ExampleStore
-from retrieval.local_store import LocalVectorStore
+from retrieval.qdrant_store import QdrantVectorStore
 from retrieval.schema_retriever import HybridSchemaRetriever
 from retrieval.value_index import ValueIndex
 from schema.documents import (
@@ -179,15 +180,25 @@ def init_app(
     embedding_model = EmbeddingModel(settings.embedding_model)
     overrides_path = Path(settings.vector_store_path) / adapter.namespace() / "overrides.yaml"
     generic_policy_hash = _config_policy_hash(settings.value_cardinality_threshold)
-    local_store = LocalVectorStore(
-        root=settings.vector_store_path,
-        namespace=adapter.namespace(),
-        model_name=embedding_model.model_name,
-        dimension=embedding_model.dim,
-        policy_hash=_namespace_policy_hash(settings.value_cardinality_threshold, overrides_path),
-        example_candidate_limit=settings.example_candidate_limit,
-        clock=clock,
-        embed_cache_max_entries=settings.embed_cache_max_entries,
+    namespace = adapter.namespace()
+    store_root = Path(settings.vector_store_path) / namespace
+    store_root.mkdir(parents=True, exist_ok=True)
+    dataset_metadata_path = store_root / "dataset.json"
+    tenant_id = os.getenv("TENANT_ID", "default") or "default"
+    local_store = QdrantVectorStore(
+        settings=settings,
+        vector_size=getattr(embedding_model, "dim", 384),
+        tenant_id=tenant_id,
+        dataset_id=namespace,
+        dataset_metadata_path=str(dataset_metadata_path),
+        manifest_path=str(store_root / "manifest.json"),
+    )
+    local_store.path = store_root
+    local_store.model_name = getattr(
+        embedding_model, "model_name", settings.embedding_model
+    )
+    local_store.policy_hash = _namespace_policy_hash(
+        settings.value_cardinality_threshold, overrides_path
     )
 
     introspect_started = time.perf_counter()
@@ -384,6 +395,20 @@ def init_app(
         })
 
     index_complete = schema_ok and value_ok and not incomplete_tables
+    dataset_metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    dataset_metadata_path.write_text(
+        json.dumps(
+            {
+                "tenant_id": tenant_id,
+                "dataset_id": namespace,
+                "indexed": bool(index_complete),
+                "embedding_model_name": settings.embedding_model,
+                "vector_dimension": local_store.vector_size,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     if not index_complete:
         LOGGER.warning(
             "Local index build completed with errors",
