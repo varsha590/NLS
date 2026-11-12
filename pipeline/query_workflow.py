@@ -146,7 +146,7 @@ def prepare_query(
         LOGGER.warning("Query retrieval failed: %s", type(error).__name__)
         return QueryRetrievalFailed()
     except Exception as error:
-        LOGGER.warning("Query preparation failed: %s", type(error).__name__)
+        LOGGER.exception("Query preparation failed")
         return QueryRetrievalFailed()
 
     if not retrieval_result.used_qdrant:

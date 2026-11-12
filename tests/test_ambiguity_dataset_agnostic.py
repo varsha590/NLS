@@ -252,6 +252,21 @@ def test_no_dataset_specific_identifiers_in_source():
         "vStaticTypeNot",
         "discount_coupons",
         "eservicetype",
+# Synthetic datasets (school, warehouse, clinic)
+    "students",
+    "courses",
+    "enrollments",
+    "products",
+    "suppliers",
+    "orders",
+    "patients",
+    "appointments",
+    "doctors",
+    "student_id",
+    "course_id",
+    "grade",
+    "product_id",
+    "student_name",
     ]
     root = Path(__file__).resolve().parents[1]
     source_files = [

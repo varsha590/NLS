@@ -31,6 +31,7 @@ def _initial_state() -> dict[str, Any]:
         "pending": None,
         "result": None,
         "error": None,
+        "previous_tenant_id": None,
     }
 
 
@@ -39,6 +40,7 @@ def _copy_state(state: dict[str, Any]) -> dict[str, Any]:
         "pending": state.get("pending"),
         "result": state.get("result"),
         "error": state.get("error"),
+        "previous_tenant_id": state.get("previous_tenant_id"),
     }
 
 

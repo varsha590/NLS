@@ -254,6 +254,7 @@ def test_unindexed_dataset_shows_reindex_prompt(tmp_path, monkeypatch):
     )
 
     at = AppTest.from_file(entrypoint).run()
+    at.text_input(key="tenant_id").set_value("default").run()
 
     assert any(
         element.value == "This dataset is still being prepared. Click Re-index."
@@ -362,6 +363,7 @@ def test_apptest_validated_rerun_flow(monkeypatch):
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py"
     )
     at = AppTest.from_file(entrypoint).run()
+    at.text_input(key="tenant_id").set_value("default").run()
     at.text_input(key="question_input").set_value("show me items")
     [button for button in at.form_submit_button if button.label == "Search"][0].click().run()
 
