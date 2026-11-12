@@ -121,7 +121,7 @@ Simplify and restructure NLS around this flow:
 - `test.db` (tracked in git, 0 bytes): untrack with `git rm --cached` and ignore
 - `reindex.py`, `eval/`, `scripts/`
 - `sql/validator.py` (compatibility wrapper) after migrating `rewrite_case_insensitive_comparisons` and its test; `validation/validator.py` is the live validator
-- Old FAISS code, `data_polhwicy.yaml`, `value_resolution.yaml`, classification/report modules, after migrating their tests
+- Old FAISS code, `data_policy.yaml`, `value_resolution.yaml`, classification/report modules, after migrating their tests
 
 ## Final report must include
 
