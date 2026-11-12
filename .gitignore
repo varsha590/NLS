@@ -3,7 +3,7 @@ datasets/
 uploads/
 qdrant_data/
 .vector_store/
-*.faiss
+test.db
 __pycache__/
 *.py[cod]
 .pytest_cache/

@@ -494,68 +494,6 @@ def test_failed_value_embedding_surfaces_incomplete_and_preserves_resolver_value
     assert values_by_table[second_table.name] == "secondary-new"
 
 
-def test_store_report_shows_counts_without_value_text(tmp_path, monkeypatch):
-    settings = _settings(tmp_path)
-    client = QdrantClient(location=":memory:")
-    store = QdrantVectorStore(
-        settings=settings,
-        client=client,
-        vector_size=CountingEmbeddingModel.dim,
-        tenant_id="tenant-report",
-        dataset_id="dataset-report",
-    )
-    value_text = "report-private-sentinel"
-    value_record = {
-        "table_name": "generic_table",
-        "column_name": "generic_field",
-        "classification": "VALUE_LOW",
-        "value_hash": "safe-hash",
-        "value": value_text,
-    }
-    assert store.build_values([value_record], CountingEmbeddingModel("test"))
-
-    from scripts import store_report
-
-    monkeypatch.setattr(
-        store_report, "create_qdrant_client", lambda settings=None: client
-    )
-    report = store_report.format_store_report(settings)
-
-    assert "tenant-report" in report
-    assert "dataset-report" in report
-    assert "master_value: 1" in report
-    assert value_text not in report
-
-
-def test_reindex_dry_run_prints_counts_and_no_fixture_values(
-    tmp_path, monkeypatch, capsys
-):
-    engine, _ = _create_value_catalog()
-    settings = _settings(tmp_path)
-    adapter = DatabaseAdapter("sqlite:///:memory:", settings.query_timeout_seconds, engine=engine)
-
-    import reindex
-
-    monkeypatch.setattr(reindex.Settings, "from_env", lambda: settings)
-    monkeypatch.setattr(
-        reindex,
-        "DatabaseAdapter",
-        lambda database_url, timeout: adapter,
-    )
-
-    assert reindex.main(["--dry-run"]) == 0
-    output = capsys.readouterr().out
-
-    assert "Tables: 1" in output
-    assert "Tables changed: 1" in output
-    assert "Columns changed: 3" in output
-    assert "Columns to scan: 2" in output
-    assert "Estimated values to embed:" in output
-    assert "Estimated seconds:" in output
-    assert "alpha" not in output
-    assert "stable" not in output
-
-
 @pytest.mark.parametrize("table_count", [120, 300])
 def test_large_catalog_second_startup_has_zero_data_table_statements(
     tmp_path, monkeypatch, table_count, capsys

@@ -40,6 +40,43 @@ class ValueSafetyError(ValueError):
         self.closest = closest
 
 
+def is_string_column(metadata: SchemaMetadata, table_name: str, column_name: str) -> bool:
+    """Return whether a catalog column has a textual type."""
+    table = metadata.tables.get(table_name)
+    if table is None:
+        return False
+    return any(
+        column.name == column_name
+        and any(kind in column.data_type.casefold() for kind in ("char", "text", "string"))
+        for column in table.columns
+    )
+
+
+def rewrite_case_insensitive_comparisons(
+    sql: str, metadata: SchemaMetadata, allowed_tables: set[str]
+) -> str:
+    """Normalize string equality using SQLGlot's generic parser and catalog types."""
+    parsed = sqlglot.parse_one(sql)
+    aliases = {
+        table.alias_or_name.casefold(): table.name
+        for table in parsed.find_all(exp.Table)
+    }
+    for equality in parsed.find_all(exp.EQ):
+        left, right = equality.left, equality.right
+        column = left if isinstance(left, exp.Column) else right if isinstance(right, exp.Column) else None
+        literal = right if column is left else left
+        if column is None or not isinstance(literal, exp.Literal) or not literal.is_string:
+            continue
+        table_name = aliases.get(column.table.casefold(), column.table) if column.table else ""
+        if not table_name and len(allowed_tables) == 1:
+            table_name = next(iter(allowed_tables))
+        if table_name in allowed_tables and is_string_column(metadata, table_name, column.name):
+            left_value = exp.func("LOWER", left.copy())
+            right_value = exp.func("LOWER", right.copy())
+            equality.replace(exp.EQ(this=left_value, expression=right_value))
+    return parsed.sql()
+
+
 def _contains_comment(sql: str) -> bool:
     """Detect SQL comments outside quoted literals and identifiers."""
     quote: str | None = None

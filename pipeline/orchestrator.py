@@ -6,7 +6,6 @@ import logging
 import re
 import time
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
 from typing import Any
 
 import sqlalchemy as sa
@@ -273,9 +272,8 @@ class TextToSQLPipeline:
                     hints_path=(
                         getattr(local_store, "path", None) / "hints.md"
                         if getattr(local_store, "path", None) is not None
-                        else Path(__file__).resolve().parents[1] / "hints.md"
+                        else None
                     ),
-                    fallback_hints_path=Path(__file__).resolve().parents[1] / "hints.md",
                 )
                 generation_started = time.monotonic()
                 try:

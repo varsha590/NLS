@@ -17,14 +17,11 @@ Single source of truth for the restructuring. Read this first in any new session
 
 - Step 1 (validator): DONE and approved.
 - Step 2 (ingestion, `schema.json`, local dataset metadata, Streamlit upload screen): DONE and approved.
-- Step 3 (Qdrant indexing + retrieval): NEXT. Give the file-by-file plan first, then wait.
-- Step 4 (query workflow, credentials form, execution): pending. Querying is unavailable in the UI until Step 4.
-- Step 5 (cleanup, docs, dependencies): pending.
+- Step 3 (Qdrant indexing + retrieval): DONE.
+- Step 4 (query workflow, credentials form, execution): DONE.
+- Step 5 (cleanup, docs, dependencies): DONE.
 
-Known failing tests (both fail on the clean pre-Step-1 baseline, unrelated to the work so far):
-- `tests/test_pipeline_sqlite.py::test_pipeline_retries_unverified_metric_word_as_measure`
-- `tests/test_value_index_resolver.py::test_cue_followed_by_unknown_value_reports_one_not_found`
-Fix or retire them in the cleanup step; do not leave them as permanent known failures.
+The two previously known failing tests now pass; no known test failures remain.
 
 ## Goal
 
@@ -114,7 +111,7 @@ Simplify and restructure NLS around this flow:
   names, scores, flags, document counts and raw errors, or put them in a
   collapsed "Advanced" section. Generated SQL only in a collapsed "Show query".
 
-## Cleanup list (Step 5, needs approval; list reason and references first)
+## Cleanup list (Step 5, DONE)
 
 - `classification_report.md`, `hints.md`
 - `docs/fix_log.md`, `docs/flow.md`, `docs/gap_analysis.md` (rewrite flow.md for the new architecture; move still-open gaps into README "Remaining limitations"; archive history to `docs/legacy/` if kept)

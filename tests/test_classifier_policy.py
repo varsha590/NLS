@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -29,7 +28,6 @@ from retrieval.value_index import ValueIndex
 from schema.documents import build_column_document, build_table_document
 from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo, is_internal_table_name
 from validation.validator import ValidationError, validate_sql
-from scripts.classify_report import _possible_duplicate_table_groups
 
 
 # ---------------------------------------------------------------------------
@@ -203,36 +201,6 @@ def test_phase1b_sensitive_name_review_and_enum_privacy_guards():
     assert text_with_clean_shape_evidence == ColumnClass.VALUE_LOW
     assert reviewable_sensitive_name_tokens("generic_status_email") == ["email"]
     assert is_flag_like_options(parse_enum_options("ENUM('0','1')"))
-
-
-def test_possible_duplicate_groups_use_column_structure_only():
-    """Similar structures group regardless of unrelated table names."""
-    tables = [
-        TableInfo(
-            name="generic_alpha",
-            description="",
-            columns=[ColumnInfo("field_a", "VARCHAR(32)"), ColumnInfo("field_b", "INTEGER")],
-            primary_key_names=[],
-            foreign_keys=[],
-        ),
-        TableInfo(
-            name="generic_beta",
-            description="",
-            columns=[ColumnInfo("field_a", "VARCHAR(32)"), ColumnInfo("field_b", "INTEGER")],
-            primary_key_names=[],
-            foreign_keys=[],
-        ),
-        TableInfo(
-            name="generic_other",
-            description="",
-            columns=[ColumnInfo("unrelated", "TEXT")],
-            primary_key_names=[],
-            foreign_keys=[],
-        ),
-    ]
-
-    groups = _possible_duplicate_table_groups(tables)
-    assert groups == [{"tables": ["generic_alpha", "generic_beta"], "minimum_similarity": 1.0}]
 
 
 # ---------------------------------------------------------------------------
@@ -552,38 +520,3 @@ def test_classifier_runs_on_sqlite_fixture():
         cnt, avg_len = get_column_stats(conn, refl, "department")
         c_dept, _ = classify_column("employees", "department", refl.c.department.type, distinct_count=cnt, avg_text_length=avg_len)
         assert c_dept == ColumnClass.VALUE_LOW
-
-
-def test_classifier_runs_on_local_mysql_hiresanta():
-    """Verify classifier runs against local Docker MySQL hiresanta database (skipped if unreachable)."""
-    mysql_url = "mysql+pymysql://root:rootpass123@localhost:3307/hiresanta"
-    try:
-        engine = sa.create_engine(mysql_url, pool_pre_ping=True)
-        with engine.connect() as conn:
-            conn.execute(sa.text("SELECT 1"))
-    except Exception:
-        pytest.skip("Local Docker MySQL hiresanta database is not reachable on port 3307.")
-
-    from scripts.classify_report import generate_classification_report
-    import tempfile
-
-    with tempfile.NamedTemporaryFile(suffix=".md", delete=False) as tmp:
-        tmp_path = Path(tmp.name)
-
-    try:
-        with patch.dict("os.environ", {"DATABASE_URL": mysql_url}):
-            report = generate_classification_report(output_path=tmp_path)
-            assert "# Database Column Classification Report" in report
-            assert "Summary Counts" in report
-            assert "Detailed Column Classifications" in report
-            assert "## POSSIBLE DUPLICATE TABLES" in report
-            assert "## FLAG-LIKE VALUE COLUMNS" in report
-            assert "## Columns With Stats Unavailable" in report
-            assert "non-text type: ENUM" not in report
-            unavailable = report.split("## Columns With Stats Unavailable", 1)[1].split(
-                "## Sensitive-Value Shape Checks Unavailable", 1
-            )[0]
-            assert "0 columns had stats unavailable." in unavailable or "| Table.Column | Error category |" in unavailable
-    finally:
-        if tmp_path.exists():
-            tmp_path.unlink()

@@ -9,12 +9,10 @@ import re
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 import sqlalchemy as sa
-import yaml
 from rapidfuzz import fuzz, process
 
 from db.adapter import DatabaseAdapter
@@ -30,7 +28,6 @@ from catalog.classifier import (
 from config.data_policy import get_policy_overrides
 
 LOGGER = logging.getLogger(__name__)
-_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "value_resolution.yaml"
 _TOKEN_RE = re.compile(r"[\w'-]+", re.UNICODE)
 _NUMBER_RE = re.compile(r"\d")
 _DATE_WORDS = {
@@ -41,9 +38,55 @@ _DATE_WORDS = {
 }
 
 
-def _load_config() -> dict[str, Any]:
-    with _CONFIG_PATH.open(encoding="utf-8") as config_file:
-        return yaml.safe_load(config_file) or {}
+def _default_config() -> dict[str, Any]:
+    return {
+        "thresholds": {
+            "accept_score": 0.88,
+            "ambiguous_gap": 0.08,
+            "min_score": 0.65,
+            "max_candidates": 5,
+        },
+        "metric_value_names": [
+            "total", "totals", "count", "counts", "counting", "sum", "sums",
+            "average", "averages", "avg", "mean", "means", "median", "medians",
+            "minimum", "minimums", "maximum", "maximums", "min", "max",
+            "percentage", "percent",
+        ],
+        "cued_metric_terms": {},
+        "excluded_terms": [
+            "a", "about", "above", "after", "again", "against", "all", "also",
+            "am", "an", "and", "another", "any", "are", "around", "as", "at",
+            "be", "because", "been", "before", "being", "below", "between",
+            "both", "but", "by", "can", "cannot", "could", "date", "dates",
+            "day", "days", "daily", "each", "either", "else", "even", "ever",
+            "every", "for", "from", "further", "had", "has", "have", "having",
+            "he", "her", "here", "hers", "herself", "him", "himself", "his",
+            "hour", "hours", "how", "i", "if", "in", "into", "is", "it", "its",
+            "itself", "last", "least", "less", "let", "like", "list", "made",
+            "make", "many", "me", "might", "mine", "month", "monthly", "months",
+            "more", "most", "much", "must", "my", "myself", "near", "need",
+            "neither", "never", "no", "nor", "not", "now", "number", "numbers",
+            "of", "off", "on", "once", "one", "only", "onto", "or", "other",
+            "others", "our", "ours", "ourselves", "out", "over", "own", "part",
+            "per", "period", "please", "quarterly", "rather", "same", "second",
+            "seconds", "see", "set", "several", "she", "should", "show",
+            "shows", "since", "so", "some", "something", "soon", "still",
+            "such", "than", "that", "the", "their", "theirs", "them",
+            "themselves", "then", "there", "these", "they", "this", "those",
+            "though", "through", "time", "times", "to", "today", "together",
+            "tomorrow", "too", "under", "until", "up", "us", "use", "used",
+            "very", "was", "we", "week", "weekend", "weekly", "weeks", "were",
+            "what", "when", "where", "which", "while", "who", "whom", "whose",
+            "why", "will", "with", "within", "without", "would", "year",
+            "yearly", "years", "yesterday", "you", "your", "yours", "yourself",
+            "yourselves", "highest", "lowest", "quarter", "quarters", "annual",
+            "annually", "jan", "feb", "mar", "apr", "jun", "jul", "aug", "sep",
+            "sept", "oct", "nov", "dec", "january", "february", "march",
+            "april", "may", "june", "july", "august", "september", "october",
+            "november", "december", "monday", "tuesday", "wednesday",
+            "thursday", "friday", "saturday", "sunday",
+        ],
+    }
 
 
 def _normalize(value: str) -> str:
@@ -116,7 +159,7 @@ class ValueIndex:
         self.embedder = embedder
         self.local_store = local_store
         self.build_success = True
-        self.config = _load_config()
+        self.config = _default_config()
         self.database_overrides = database_overrides or {}
         self.policy_overrides = policy_overrides or (
             get_policy_overrides(self.database_overrides)

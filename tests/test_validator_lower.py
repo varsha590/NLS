@@ -2,7 +2,7 @@
 
 from schema.metadata import ColumnInfo, SchemaMetadata, TableInfo
 from schema.context import build_schema_context
-from sql.validator import rewrite_case_insensitive_comparisons
+from validation.validator import rewrite_case_insensitive_comparisons
 
 
 def _metadata():
