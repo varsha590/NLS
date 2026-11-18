@@ -249,6 +249,51 @@ def test_truncated_and_ambiguous_results_stop_before_context_builder(
     assert embedder.questions == ["active"]
 
 
+def test_ambiguity_returns_options_and_forwards_forced_table(monkeypatch):
+    candidates = ["alpha", "beta", "gamma", "delta"]
+    seen = {}
+
+    def fake_retrieve(*args, **kwargs):
+        seen.update(kwargs)
+        forced = kwargs.get("forced_table")
+        return RetrievalResult(
+            tables=[],
+            used_qdrant=True,
+            ambiguity_flag=not forced,
+            candidate_tables=[] if forced else candidates,
+        )
+
+    monkeypatch.setattr(workflow, "retrieve", fake_retrieve)
+    monkeypatch.setattr(
+        workflow,
+        "build_query_context",
+        lambda *args, **kwargs: "=== SCHEMA === alpha:",
+    )
+    monkeypatch.setattr(
+        workflow,
+        "generate_and_validate_query",
+        lambda *args, **kwargs: pytest.fail("LLM must not run on ambiguity"),
+    )
+
+    arguments = {
+        "question": "show records",
+        "metadata": _schema(),
+        "value_documents": _value_documents(),
+        "embedder": FakeEmbedder(),
+        "qdrant_store": FakeStore(),
+        "tenant_id": "tenant",
+        "dataset_id": "dataset",
+        "dataset_metadata_path": "dataset.json",
+    }
+    outcome = prepare_query(**arguments)
+    assert isinstance(outcome, QueryNeedsTableClarification)
+    assert outcome.options == candidates
+
+    ready = prepare_query(**arguments, forced_table="alpha")
+    assert isinstance(ready, QueryReady)
+    assert seen["forced_table"] == "alpha"
+
+
 def test_qdrant_fallback_returns_retrieval_failed_outcome():
     outcome, _, store = _prepare(
         "active",

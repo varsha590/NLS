@@ -198,6 +198,77 @@ def _execute_pending_query(timeout_seconds: int) -> None:
         )
 
 
+def _process_question(
+    question: str,
+    *,
+    metadata: Any,
+    value_documents: list[dict[str, Any]],
+    tenant_id: str,
+    dataset_id: str,
+    dataset_metadata_path: str,
+    forced_table: str | None = None,
+) -> None:
+    """Run retrieval and generation for one question and record the UI outcome."""
+    try:
+        embedder = get_embedding_model()
+        qdrant_store = build_qdrant_store(tenant_id, dataset_id)
+        retrieval = prepare_query(
+            question=question,
+            metadata=metadata,
+            value_documents=value_documents,
+            embedder=embedder,
+            qdrant_store=qdrant_store,
+            tenant_id=tenant_id,
+            dataset_id=dataset_id,
+            dataset_metadata_path=dataset_metadata_path,
+            settings=Settings.from_env(),
+            forced_table=forced_table,
+        )
+    except Exception as error:
+        LOGGER.exception("Question processing failed: %s", type(error).__name__)
+        st.session_state["last_outcome"] = "unavailable"
+        st.session_state.pop("clarification_options", None)
+        st.info("I could not process that question right now. Please try again.")
+        return
+
+    if not isinstance(retrieval, QueryReady):
+        st.session_state["last_outcome"] = retrieval.status
+        options = list(getattr(retrieval, "options", None) or ())
+        if options:
+            st.session_state["clarification_options"] = options
+            st.session_state["clarification_message"] = retrieval.message
+        else:
+            st.session_state.pop("clarification_options", None)
+            st.info(retrieval.message)
+        return
+
+    st.session_state.pop("clarification_options", None)
+    try:
+        validated = generate_and_validate_query(retrieval)
+    except Exception as error:
+        LOGGER.exception("Question processing failed: %s", type(error).__name__)
+        st.session_state["last_outcome"] = "unavailable"
+        st.info("I could not process that question right now. Please try again.")
+        return
+
+    st.session_state["last_outcome"] = validated.status
+    if not isinstance(validated, ValidatedQuery):
+        st.info(validated.message)
+        return
+
+    st.session_state["ui_state"] = next_ui_state(
+        st.session_state["ui_state"],
+        ASK_VALIDATED,
+        {
+            "tenant_id": tenant_id,
+            "dataset_id": dataset_id,
+            "dialect": metadata.dialect,
+            "sql": validated.sql,
+            "question": question,
+        },
+    )
+
+
 def _run_client_flow() -> None:
     _clear_expired_credentials()
     timeout_seconds = max(1, int(os.getenv("QUERY_TIMEOUT_SECONDS", "15")))
@@ -208,6 +279,10 @@ def _run_client_flow() -> None:
     initial = _initial_ui_state()
     st.session_state.setdefault("ui_state", initial)
     ui_state = st.session_state["ui_state"]
+    st.session_state.setdefault("pending_question", None)
+    st.session_state.setdefault("forced_table", None)
+    st.session_state.setdefault("clarification_options", [])
+    st.session_state.setdefault("retry_question", False)
 
     tenant_id = st.text_input(
         "Tenant label",
@@ -234,6 +309,10 @@ def _run_client_flow() -> None:
         st.session_state["last_sql"] = None
         st.session_state["last_outcome"] = None
         st.session_state["db_creds"] = None
+        st.session_state["pending_question"] = None
+        st.session_state["forced_table"] = None
+        st.session_state["clarification_options"] = []
+        st.session_state["retry_question"] = False
         st.session_state["ui_state"] = next_ui_state(ui_state, DATASET_CHANGED)
 
     registry = DatasetRegistry(os.getenv("DATASET_STORAGE_PATH", "datasets"))
@@ -295,6 +374,10 @@ def _run_client_flow() -> None:
             st.session_state["ui_state"], DATASET_CHANGED
         )
         st.session_state.pop("last_sql", None)
+        st.session_state["pending_question"] = None
+        st.session_state["forced_table"] = None
+        st.session_state["clarification_options"] = []
+        st.session_state["retry_question"] = False
     st.session_state["active_dataset_id"] = selected_id
     st.session_state["selected_dataset_id"] = selected_id
     selected = next(item for item in datasets if item["dataset_id"] == selected_id)
@@ -320,6 +403,20 @@ def _run_client_flow() -> None:
         st.error("The selected dataset could not be loaded. Please select another dataset.")
         return
 
+    if st.session_state.get("retry_question") and st.session_state.get("pending_question"):
+        st.session_state["retry_question"] = False
+        _process_question(
+            st.session_state["pending_question"],
+            metadata=metadata,
+            value_documents=value_documents,
+            tenant_id=tenant_id,
+            dataset_id=selected_id,
+            dataset_metadata_path=str(
+                registry.dataset_directory(tenant_id, selected_id) / "dataset.json"
+            ),
+            forced_table=st.session_state.get("forced_table"),
+        )
+
     with st.form("question-form"):
         question = st.text_input(
             "Search", placeholder="Ask a question about your data", key="question_input"
@@ -331,49 +428,36 @@ def _run_client_flow() -> None:
             st.session_state["ui_state"], NEW_ASK
         )
         st.session_state.pop("last_sql", None)
+        st.session_state["forced_table"] = None
+        st.session_state["clarification_options"] = []
+        st.session_state["retry_question"] = False
         if not question.strip():
             st.info("Enter a question to continue.")
         else:
-            try:
-                embedder = get_embedding_model()
-                qdrant_store = build_qdrant_store(tenant_id, selected_id)
-                retrieval = prepare_query(
-                    question=question,
-                    metadata=metadata,
-                    value_documents=value_documents,
-                    embedder=embedder,
-                    qdrant_store=qdrant_store,
-                    tenant_id=tenant_id,
-                    dataset_id=selected_id,
-                    dataset_metadata_path=str(
-                        registry.dataset_directory(tenant_id, selected_id) / "dataset.json"
-                    ),
-                    settings=Settings.from_env(),
-                )
-                if not isinstance(retrieval, QueryReady):
-                    st.session_state["last_outcome"] = retrieval.status
-                    st.info(retrieval.message)
-                else:
-                    validated = generate_and_validate_query(retrieval)
-                    st.session_state["last_outcome"] = validated.status
-                    if not isinstance(validated, ValidatedQuery):
-                        st.info(validated.message)
-                    else:
-                        st.session_state["ui_state"] = next_ui_state(
-                            st.session_state["ui_state"],
-                            ASK_VALIDATED,
-                            {
-                                "tenant_id": tenant_id,
-                                "dataset_id": selected_id,
-                                "dialect": metadata.dialect,
-                                "sql": validated.sql,
-                                "question": question,
-                            },
-                        )
-            except Exception as error:
-                LOGGER.exception("Question processing failed: %s", type(error).__name__)
-                st.session_state["last_outcome"] = "unavailable"
-                st.info("I could not process that question right now. Please try again.")
+            st.session_state["pending_question"] = question
+            _process_question(
+                question,
+                metadata=metadata,
+                value_documents=value_documents,
+                tenant_id=tenant_id,
+                dataset_id=selected_id,
+                dataset_metadata_path=str(
+                    registry.dataset_directory(tenant_id, selected_id) / "dataset.json"
+                ),
+            )
+
+    options = list(st.session_state.get("clarification_options") or [])
+    if options:
+        st.info(
+            st.session_state.get("clarification_message")
+            or "Please clarify which table you mean."
+        )
+        for index, option in enumerate(options):
+            if st.button(option, key=f"clarification-option-{index}"):
+                st.session_state["forced_table"] = option
+                st.session_state["retry_question"] = True
+                st.session_state["clarification_options"] = []
+                st.rerun()
 
     ui_state = st.session_state.get("ui_state") or _initial_ui_state()
     pending = ui_state.get("pending")
@@ -381,14 +465,15 @@ def _run_client_flow() -> None:
     # SQL preview + download render exactly once per run, before credentials.
     if pending is not None and pending.get("sql"):
         st.info("Your query is ready.")
-        st.code(pending["sql"], language="sql")
-        st.download_button(
-            "Download SQL",
-            data=pending["sql"],
-            file_name="query.sql",
-            mime="text/plain",
-            key="download-query-sql",
-        )
+        with st.expander("Show query", expanded=False, key="show-query-expander"):
+            st.code(pending["sql"], language="sql")
+            st.download_button(
+                "Download SQL",
+                data=pending["sql"],
+                file_name="query.sql",
+                mime="text/plain",
+                key="download-query-sql",
+            )
 
     if ui_state.get("error"):
         st.warning(ui_state["error"])

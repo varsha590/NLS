@@ -31,6 +31,7 @@ MAX_TABLES_GROQ = 8
 DEFAULT_DOMINANCE_RATIO = 2.0
 DEFAULT_UBIQUITOUS_COLUMN_RATIO = 0.5
 DEFAULT_CONTEXT_TOP_TABLES = 3
+AMBIGUITY_CANDIDATE_COUNT = 4
 
 
 @dataclass
@@ -42,6 +43,7 @@ class RetrievalResult:
     used_qdrant: bool = False
     truncated: bool = False
     ambiguity_flag: bool = False
+    candidate_tables: List[str] = field(default_factory=list)
 
 
 def _lexical_tokens(value: str) -> list[str]:
@@ -295,12 +297,14 @@ def retrieve(
     qdrant_dataset_metadata_path: str | None = None,
     query_vector: Sequence[float] | None = None,
     settings: Settings | None = None,
+    forced_table: str | None = None,
 ) -> RetrievalResult:
     """Pure-logic schema retrieval with roll-up scoring and FK expansion.
 
     Uses the supplied question embedding for typed Qdrant searches. Without a
     query vector, retrieval stays on the lexical-only path. Results are scored,
-    selected, and expanded using the local schema metadata.
+    selected, and expanded using the local schema metadata. A forced table skips
+    selection and ambiguity checks and becomes the only context table.
     """
     if exact_value_tables is None:
         exact_value_tables = set()
@@ -433,39 +437,50 @@ def retrieve(
     scored_tables.sort(key=lambda x: (-x[1], x[0]))
 
     # Step 2: Select only the tables that will fit the LLM context.
-    selection_cap = max(1, min(int(max_tables), int(context_top_tables)))
-    selected = select_tables(
-        scored_tables,
-        exact_matches=exact_value_tables,
-        default_k=selected_k,
-        max_k=selection_cap,
-    )
+    if forced_table:
+        selected = [forced_table] if forced_table in metadata.tables else []
+        expanded = list(selected)
+        truncated = False
+        context_tables = list(selected)
+    else:
+        selection_cap = max(1, min(int(max_tables), int(context_top_tables)))
+        selected = select_tables(
+            scored_tables,
+            exact_matches=exact_value_tables,
+            default_k=selected_k,
+            max_k=selection_cap,
+        )
 
-    # Step 3: Expand with FK neighbors
-    expanded, truncated = expand_fk_neighbors(metadata, selected, max_tables=max_tables)
+        # Step 3: Expand with FK neighbors
+        expanded, truncated = expand_fk_neighbors(metadata, selected, max_tables=max_tables)
 
-    # Step 4: Limit the LLM context to the top-scored tables.
-    context_tables = expanded[: max(1, int(context_top_tables))]
+        # Step 4: Limit the LLM context to the top-scored tables.
+        context_tables = expanded[: max(1, int(context_top_tables))]
 
     # Step 5: Build ambiguity flag over the tables actually sent to the LLM.
-    ubiquitous_columns = None
-    if qdrant_search_succeeded:
-        ubiquitous_columns = _dataset_ubiquitous_columns(
-            qdrant_store,
-            qdrant_tenant_id,
-            qdrant_dataset_id,
+    ambiguity_flag = False
+    candidate_tables: List[str] = []
+    if not forced_table:
+        ubiquitous_columns = None
+        if qdrant_search_succeeded:
+            ubiquitous_columns = _dataset_ubiquitous_columns(
+                qdrant_store,
+                qdrant_tenant_id,
+                qdrant_dataset_id,
+                metadata,
+                ubiquitous_ratio,
+            )
+        ambiguity_flag = _compute_ambiguity_flag(
+            query,
             metadata,
-            ubiquitous_ratio,
+            context_tables,
+            scored_tables=scored_tables,
+            ubiquitous_columns=ubiquitous_columns,
+            dominance_ratio=dominance_ratio,
+            ignored_columns=ignored_columns,
         )
-    ambiguity_flag = _compute_ambiguity_flag(
-        query,
-        metadata,
-        context_tables,
-        scored_tables=scored_tables,
-        ubiquitous_columns=ubiquitous_columns,
-        dominance_ratio=dominance_ratio,
-        ignored_columns=ignored_columns,
-    )
+        if ambiguity_flag:
+            candidate_tables = _ambiguity_candidates(scored_tables)
 
     return RetrievalResult(
         tables=context_tables,
@@ -473,6 +488,7 @@ def retrieve(
         used_qdrant=qdrant_search_succeeded,
         truncated=truncated,
         ambiguity_flag=ambiguity_flag,
+        candidate_tables=candidate_tables,
     )
 
 
@@ -663,6 +679,24 @@ def _compute_ambiguity_flag(
                 return False
 
     return True
+
+
+def _ambiguity_candidates(
+    scored_tables: List[Tuple[str, float]],
+    limit: int = AMBIGUITY_CANDIDATE_COUNT,
+) -> List[str]:
+    """Take top distinct table names from already-scored hits (no new retrieval)."""
+    ordered = sorted(scored_tables, key=lambda item: (-float(item[1]), item[0]))
+    candidates: List[str] = []
+    seen: Set[str] = set()
+    for table_name, _score in ordered:
+        if table_name in seen:
+            continue
+        seen.add(table_name)
+        candidates.append(table_name)
+        if len(candidates) >= limit:
+            break
+    return candidates
 
 
 def _has_ambiguous_columns(metadata: SchemaMetadata, table_names: List[str]) -> bool:

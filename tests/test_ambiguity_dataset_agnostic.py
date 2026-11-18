@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from config.settings import Settings
+import retrieval.qdrant_retriever as retriever_module
 from retrieval.qdrant_retriever import (
     _dataset_ubiquitous_columns,
     _normalize_tokens,
@@ -98,7 +99,8 @@ def _settings(**overrides) -> Settings:
 
 
 def _run(metadata: SchemaMetadata, query: str, scores: dict[str, float],
-         mapping: dict[str, list[str]], settings: Settings | None = None):
+         mapping: dict[str, list[str]], settings: Settings | None = None,
+         forced_table: str | None = None):
     hits = {"table": [{"table_name": name, "similarity": score} for name, score in scores.items()]}
     store = FakeStore(hits=hits, schema_payloads=_payloads(mapping))
     return retrieve(
@@ -114,6 +116,7 @@ def _run(metadata: SchemaMetadata, query: str, scores: dict[str, float],
         qdrant_dataset_metadata_path="dataset.json",
         query_vector=[0.0] * 384,
         settings=settings,
+        forced_table=forced_table,
     )
 
 
@@ -296,3 +299,68 @@ def test_normalization_handles_plurals_and_type_prefixes():
     assert _normalize_tokens("vCityName") == ["city", "name"]
     assert _normalize_tokens("iStateId") == ["state", "id"]
     assert _normalize_tokens("e_status") == ["status"]
+
+
+NEAR_TIE_SCORES = {
+    "orders": 0.50,
+    "customers": 0.45,
+    "payments": 0.40,
+    "products": 0.10,
+    "categories": 0.05,
+}
+
+
+def test_ambiguous_query_returns_four_distinct_candidates():
+    result = _run(_schema(SHOP), "list all records", NEAR_TIE_SCORES, SHOP)
+    assert result.ambiguity_flag is True
+    assert result.candidate_tables == ["orders", "customers", "payments", "products"]
+    assert len(result.candidate_tables) == len(set(result.candidate_tables))
+
+
+def test_ambiguous_query_returns_fewer_candidates_when_fewer_tables_exist():
+    mapping = {
+        "alpha": ["id", "alpha_value"],
+        "beta": ["id", "beta_value"],
+        "gamma": ["gamma_key"],
+    }
+    scores = {"alpha": 0.50, "beta": 0.45, "gamma": 0.40}
+    result = _run(
+        _schema(mapping),
+        "list all records",
+        scores,
+        mapping,
+        settings=_settings(ubiquitous_column_ratio=1.0),
+    )
+    assert result.ambiguity_flag is True
+    assert result.candidate_tables == ["alpha", "beta", "gamma"]
+
+
+def test_forced_table_skips_ambiguity_flag_and_uses_only_that_table(monkeypatch):
+    monkeypatch.setattr(
+        retriever_module,
+        "_compute_ambiguity_flag",
+        lambda *args, **kwargs: pytest.fail("ambiguity check must be skipped"),
+    )
+    result = _run(
+        _schema(SHOP),
+        "list all records",
+        NEAR_TIE_SCORES,
+        SHOP,
+        forced_table="payments",
+    )
+    assert result.ambiguity_flag is False
+    assert result.candidate_tables == []
+    assert result.tables == ["payments"]
+    context = build_query_context(_schema(SHOP), result.tables, [])
+    assert "payments:" in context
+    for other in set(SHOP) - {"payments"}:
+        assert f"{other}:" not in context
+
+
+def test_non_ambiguous_query_has_no_candidates_and_keeps_selection():
+    scores = {name: 0.10 for name in SHOP}
+    scores["orders"] = 0.95
+    result = _run(_schema(SHOP), "list all records", scores, SHOP)
+    assert result.ambiguity_flag is False
+    assert result.candidate_tables == []
+    assert result.tables == ["orders", "categories", "customers"]

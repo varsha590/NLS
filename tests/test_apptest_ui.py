@@ -411,3 +411,84 @@ def test_apptest_validated_rerun_flow(monkeypatch):
     assert "db_creds" not in at.session_state
     assert "could not be verified" in at.warning[0].value
     assert any(button.label == "Connect" for button in at.form_submit_button)
+
+
+@pytest.mark.skipif(not HAS_APPTEST, reason="AppTest not available")
+def test_apptest_clarification_buttons_regenerate_sql(monkeypatch, tmp_path):
+    """Ambiguity shows table buttons; clicking one reruns the question with that table."""
+    from ingestion.datasets import DatasetRegistry
+    from pipeline.query_workflow import (
+        QueryNeedsTableClarification,
+        QueryReady,
+        ValidatedQuery,
+    )
+    from retrieval.qdrant_retriever import RetrievalResult
+
+    dataset_root = tmp_path / "datasets"
+    monkeypatch.setenv("DATASET_STORAGE_PATH", str(dataset_root))
+    registry = DatasetRegistry(dataset_root)
+    registered = registry.register(
+        "items.sql",
+        b"CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT);",
+        tenant_id="acme",
+        dialect_override="sqlite",
+        embedding_model_name="test-embedding-model",
+    )
+    metadata_path = registry.dataset_directory("acme", registered["dataset_id"]) / "dataset.json"
+    dataset_metadata = json.loads(metadata_path.read_text())
+    dataset_metadata["indexed"] = True
+    metadata_path.write_text(json.dumps(dataset_metadata))
+
+    candidates = ["alpha", "beta", "gamma", "delta"]
+    forced_seen = []
+    generation_calls = []
+
+    def fake_prepare_query(**kwargs):
+        forced = kwargs.get("forced_table")
+        forced_seen.append(forced)
+        if forced is None:
+            return QueryNeedsTableClarification(options=candidates)
+        return QueryReady(
+            status="ok",
+            context="=== SCHEMA ===",
+            retrieval=RetrievalResult(tables=[forced], used_qdrant=True),
+            value_matches=[],
+            question=kwargs["question"],
+            metadata=kwargs["metadata"],
+        )
+
+    monkeypatch.setattr("ui.app.prepare_query", fake_prepare_query)
+    monkeypatch.setattr(
+        "ui.app.generate_and_validate_query",
+        lambda query: (
+            generation_calls.append(query)
+            or ValidatedQuery(sql="SELECT id, name FROM items")
+        ),
+    )
+    monkeypatch.setattr("ui.app.get_embedding_model", lambda *a, **k: object())
+    monkeypatch.setattr("ui.app.build_qdrant_store", lambda *a, **k: object())
+
+    entrypoint = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py"
+    )
+    at = AppTest.from_file(entrypoint).run()
+    at.text_input(key="tenant_id").set_value("acme").run()
+    at.text_input(key="question_input").set_value("show records")
+    [button for button in at.form_submit_button if button.label == "Search"][0].click().run()
+
+    assert not at.exception
+    assert any(info.value == "Please clarify which table you mean." for info in at.info)
+    assert [button.label for button in at.button if button.label in candidates] == candidates
+    assert generation_calls == []
+    assert at.session_state["pending_question"] == "show records"
+    assert at.session_state["forced_table"] is None
+
+    [button for button in at.button if button.label == candidates[1]][0].click().run()
+
+    assert not at.exception
+    assert forced_seen == [None, "beta"]
+    assert len(generation_calls) == 1
+    assert generation_calls[0].question == "show records"
+    assert at.session_state["forced_table"] == "beta"
+    assert [code.value for code in at.code] == ["SELECT id, name FROM items"]
+    assert at.expander(key="show-query-expander").proto.expanded is False

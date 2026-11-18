@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, Sequence, TypeAlias
 
 from config.settings import Settings
@@ -83,6 +83,7 @@ class QueryNeedsNarrowerQuestion:
 class QueryNeedsTableClarification:
     status: Literal["ambiguity"] = "ambiguity"
     message: str = "Please clarify which table you mean."
+    options: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,7 @@ def prepare_query(
     max_tables: int = 8,
     sensitive_filter: dict[str, Any] | None = None,
     settings: Settings | None = None,
+    forced_table: str | None = None,
 ) -> QueryWorkflowOutcome:
     """Embed once, retrieve with Qdrant, then build context from local matches."""
     try:
@@ -141,6 +143,7 @@ def prepare_query(
             qdrant_dataset_metadata_path=dataset_metadata_path,
             query_vector=query_vector,
             settings=settings,
+            forced_table=forced_table,
         )
     except (QdrantStorageError, ValueError, RuntimeError) as error:
         LOGGER.warning("Query retrieval failed: %s", type(error).__name__)
@@ -154,7 +157,9 @@ def prepare_query(
     if retrieval_result.truncated:
         return QueryNeedsNarrowerQuestion()
     if retrieval_result.ambiguity_flag:
-        return QueryNeedsTableClarification()
+        return QueryNeedsTableClarification(
+            options=list(retrieval_result.candidate_tables)
+        )
 
     try:
         if exact_matches:
