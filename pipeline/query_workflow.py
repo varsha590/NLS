@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, Sequence, TypeAlias
 
+from config.data_policy import allow_all_columns_policy
 from config.settings import Settings
 from llm.generator import GenerationError
 from llm.prompt_builder import build_query_prompt
@@ -170,11 +171,16 @@ def prepare_query(
                 match["label"] = "possible match, unconfirmed"
                 match["confirmed"] = False
 
+        context_policy = (
+            sensitive_filter
+            if sensitive_filter is not None
+            else allow_all_columns_policy()
+        )
         context = build_query_context(
             metadata,
             retrieval_result.tables,
             matches,
-            policy_overrides=sensitive_filter,
+            policy_overrides=context_policy,
         )
     except Exception as error:
         LOGGER.warning("Query context preparation failed: %s", type(error).__name__)
@@ -271,6 +277,7 @@ def generate_and_validate_query(query: QueryReady) -> GeneratedQueryOutcome:
                 sql,
                 metadata=query.metadata,
                 dialect=dialect,
+                policy_overrides=allow_all_columns_policy(),
             )
             return ValidatedQuery(sql=validated_sql)
         except ValidationError as error:

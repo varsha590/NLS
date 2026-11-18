@@ -15,6 +15,7 @@ def main() -> int:
             request["sql_text"],
             request["dialect"],
             request["low_cardinality_max"],
+            request.get("include_all_values", False),
         )
     except (UploadError, KeyError, TypeError, ValueError):
         return 2

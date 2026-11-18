@@ -13,7 +13,12 @@ from sqlglot.optimizer.scope import Scope, traverse_scope
 
 from retrieval.value_index import ValueIndex
 from schema.metadata import SchemaMetadata
-from config.data_policy import is_blocked, is_masked, blocked_columns_for_table
+from config.data_policy import (
+    ALLOW_ALL_COLUMNS_FLAG,
+    blocked_columns_for_table,
+    is_blocked,
+    is_masked,
+)
 
 
 FORBIDDEN_FUNCTIONS = frozenset({
@@ -209,6 +214,10 @@ def _is_value_column(column_key: str, value_index: ValueIndex | None) -> bool:
     if value_index is None:
         return False
     return column_key in value_index.values
+
+
+def _allows_all_columns(policy_overrides: dict[str, Any] | None) -> bool:
+    return bool((policy_overrides or {}).get(ALLOW_ALL_COLUMNS_FLAG))
 
 
 def _column_class(column_key: str, value_index: ValueIndex) -> str:
@@ -418,7 +427,7 @@ def _check_and_rewrite_literals(
                     column_node, scope, value_index.metadata, scope_by_expression, set()
                 )
                 column_class = _column_class(column_key, value_index) if column_key else "SKIP"
-                if column_key and (
+                if column_key and not _allows_all_columns(policy_overrides) and (
                     column_class in {"BLOCKED", "MASKED"}
                     or is_blocked(column_key, policy_overrides=policy_overrides)
                     or is_masked(column_key, policy_overrides=policy_overrides)
@@ -504,7 +513,7 @@ def _check_and_rewrite_literals(
                         column_node, scope, value_index.metadata, scope_by_expression, set()
                     )
                     column_class = _column_class(column_key, value_index) if column_key else "SKIP"
-                    if column_key and (
+                    if column_key and not _allows_all_columns(policy_overrides) and (
                         column_class in {"BLOCKED", "MASKED"}
                         or is_blocked(column_key, policy_overrides=policy_overrides)
                         or is_masked(column_key, policy_overrides=policy_overrides)

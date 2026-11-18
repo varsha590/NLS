@@ -12,17 +12,25 @@ from typing import Any
 from config.data_policy import is_blocked, is_masked
 
 
-def _is_protected(table_name: str, column_name: str) -> bool:
+def _is_protected(
+    table_name: str,
+    column_name: str,
+    policy_overrides: dict[str, Any] | None = None,
+) -> bool:
     column_key = f"{table_name}.{column_name}"
-    return is_blocked(column_key) or is_masked(column_key)
+    return is_blocked(
+        column_key, policy_overrides=policy_overrides
+    ) or is_masked(column_key, policy_overrides=policy_overrides)
 
 
-def build_table_document(table: Any) -> str:
+def build_table_document(
+    table: Any, policy_overrides: dict[str, Any] | None = None
+) -> str:
     """Return the retrievable text for one table, excluding BLOCKED columns and sample values."""
     column_text = [
         f"{column.name} {column.data_type} {column.comment or ''}".strip()
         for column in table.columns
-        if not _is_protected(table.name, column.name)
+        if not _is_protected(table.name, column.name, policy_overrides)
     ]
     parts = [table.name, table.description or f"Table {table.name}"]
     if column_text:
@@ -30,21 +38,29 @@ def build_table_document(table: Any) -> str:
     return " ".join(parts).strip()
 
 
-def build_column_document(table: Any, column: Any) -> str:
+def build_column_document(
+    table: Any, column: Any, policy_overrides: dict[str, Any] | None = None
+) -> str:
     """Return the retrievable text for one column, excluding sample values."""
-    if _is_protected(table.name, column.name):
+    if _is_protected(table.name, column.name, policy_overrides):
         return ""
     parts = [table.name, column.name, column.data_type, column.comment or ""]
     return " ".join(part for part in parts if part).strip()
 
 
-def build_relationship_document(table: Any, relation: dict[str, Any]) -> str:
+def build_relationship_document(
+    table: Any,
+    relation: dict[str, Any],
+    policy_overrides: dict[str, Any] | None = None,
+) -> str:
     """Return the retrievable text for one foreign-key relationship."""
     local = relation.get("column") or relation.get("local_column") or ""
     remote_table = relation.get("remote_table") or ""
     remote_column = relation.get("remote_column") or ""
-    if (local and _is_protected(table.name, local)) or (
-        remote_table and remote_column and _is_protected(remote_table, remote_column)
+    if (local and _is_protected(table.name, local, policy_overrides)) or (
+        remote_table
+        and remote_column
+        and _is_protected(remote_table, remote_column, policy_overrides)
     ):
         return ""
     return " ".join(

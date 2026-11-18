@@ -594,3 +594,162 @@ def test_apptest_clarification_buttons_regenerate_sql(monkeypatch, tmp_path):
     assert at.session_state["forced_table"] == "beta"
     assert [code.value for code in at.code] == ["SELECT id, name FROM items"]
     assert at.expander(key="show-query-expander").proto.expanded is False
+
+
+def test_allow_all_policy_includes_sensitive_columns_in_context_and_documents(tmp_path):
+    from config.data_policy import allow_all_columns_policy
+    from ingestion.datasets import DatasetRegistry
+    from retrieval.dataset_indexer import build_embedding_documents
+    from schema.context import build_query_context
+
+    registry = DatasetRegistry(tmp_path / "datasets")
+    registered = registry.register(
+        "customers.sql",
+        b"CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, email TEXT);",
+        tenant_id="default",
+        dialect_override="sqlite",
+        embedding_model_name="test-embedding-model",
+    )
+    metadata = registry.load_schema("default", registered["dataset_id"])
+    policy = allow_all_columns_policy()
+
+    context = build_query_context(metadata, ["customers"], [], policy_overrides=policy)
+    assert "email" in context
+
+    documents = build_embedding_documents(metadata, [], policy)
+    assert any(
+        item["table_name"] == "customers" and item["column_name"] == "email"
+        for item in documents
+    )
+
+
+def test_allow_all_policy_still_rejects_non_select(tmp_path):
+    from config.data_policy import allow_all_columns_policy
+    from ingestion.datasets import DatasetRegistry
+    from validation.validator import ValidationError, validate_sql
+
+    registry = DatasetRegistry(tmp_path / "datasets")
+    registered = registry.register(
+        "customers.sql",
+        b"CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT);",
+        tenant_id="default",
+        dialect_override="sqlite",
+        embedding_model_name="test-embedding-model",
+    )
+    metadata = registry.load_schema("default", registered["dataset_id"])
+
+    with pytest.raises(ValidationError):
+        validate_sql(
+            "DELETE FROM customers",
+            metadata,
+            dialect="sqlite",
+            policy_overrides=allow_all_columns_policy(),
+        )
+
+
+@pytest.mark.skipif(not HAS_APPTEST, reason="AppTest not available")
+def test_apptest_sensitive_column_query_returns_rows(monkeypatch, tmp_path):
+    """A connected user can query and see a sensitive-looking column."""
+    db_fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(db_fd)
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, email TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO customers (name, email) VALUES ('Ada', 'ada@example.com')"
+    )
+    conn.commit()
+    conn.close()
+
+    dataset_root = tmp_path / "datasets"
+    monkeypatch.setenv("DATASET_STORAGE_PATH", str(dataset_root))
+    from ingestion.datasets import DatasetRegistry
+    from retrieval.qdrant_retriever import VECTOR_SIZE
+    import pipeline.query_workflow as query_workflow
+
+    registry = DatasetRegistry(dataset_root)
+    registered = registry.register(
+        "customers.sql",
+        b"CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, email TEXT);",
+        tenant_id="default",
+        dialect_override="sqlite",
+        embedding_model_name="test-embedding-model",
+    )
+    metadata_path = registry.dataset_directory("default", registered["dataset_id"]) / "dataset.json"
+    dataset_metadata = json.loads(metadata_path.read_text())
+    dataset_metadata.update({
+        "indexed": True,
+        "embedding_model_name": "test-embedding-model",
+        "vector_dimension": VECTOR_SIZE,
+    })
+    metadata_path.write_text(json.dumps(dataset_metadata))
+
+    generated_sql = iter([
+        "SELECT email FROM customers",
+        "SELECT name FROM customers",
+    ])
+    monkeypatch.setattr(
+        query_workflow,
+        "generate_sql_from_messages",
+        lambda messages, validation_error=None: next(generated_sql),
+    )
+
+    import ui.app as appmod
+
+    class FakeEmbedder:
+        model_name = "test-embedding-model"
+        dim = VECTOR_SIZE
+
+        def embed_single(self, text: str):
+            return [0.0] * VECTOR_SIZE
+
+    class FakeQdrantStore:
+        client = object()
+
+        def search_table(self, *args, **kwargs):
+            return []
+
+        def search_column(self, *args, **kwargs):
+            return []
+
+        def search_relationship(self, *args, **kwargs):
+            return []
+
+        def search_master_value(self, *args, **kwargs):
+            return []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(appmod, "get_embedding_model", lambda *a, **k: FakeEmbedder())
+    monkeypatch.setattr(appmod, "build_qdrant_store", lambda *a, **k: FakeQdrantStore())
+
+    entrypoint = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py"
+    )
+    at = AppTest.from_file(entrypoint).run()
+    at.text_input(key="tenant_id").set_value("default").run()
+    [field for field in at.text_input if field.label == "Database"][0].set_value(db_path)
+    [button for button in at.form_submit_button if button.label == "Connect"][0].click().run()
+
+    assert not at.exception
+    assert any(element.value == f"Connected to {db_path}" for element in at.success)
+
+    at.text_input(key="question_input").set_value("show email addresses of customers")
+    [button for button in at.form_submit_button if button.label == "Search"][0].click().run()
+
+    assert not at.exception
+    sensitive_sql = at.session_state["ui_state"]["pending"]["sql"]
+    assert "email" in sensitive_sql.casefold()
+    assert "from customers" in sensitive_sql.casefold()
+    assert "ada@example.com" in str(at.dataframe[0].value)
+
+    at.text_input(key="question_input").set_value("show customer names")
+    [button for button in at.form_submit_button if button.label == "Search"][0].click().run()
+
+    assert not at.exception
+    ordinary_sql = at.session_state["ui_state"]["pending"]["sql"]
+    assert "name" in ordinary_sql.casefold()
+    assert "from customers" in ordinary_sql.casefold()
+    assert "Ada" in str(at.dataframe[0].value)

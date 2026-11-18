@@ -7,6 +7,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+ALLOW_ALL_COLUMNS_FLAG = "force_allow_all"
+
 SENSITIVE_COLUMN_PATTERNS = (
     "password",
     "passwd",
@@ -87,6 +89,11 @@ def get_policy_overrides(database_overrides: dict[str, Any] | None = None) -> di
     return overrides
 
 
+def allow_all_columns_policy() -> dict[str, Any]:
+    """Return overrides that disable code-defined column blocking and masking."""
+    return {ALLOW_ALL_COLUMNS_FLAG: True}
+
+
 def classify_column(
     column_key: str,
     sql_type: Any = "TEXT",
@@ -94,8 +101,10 @@ def classify_column(
 ) -> str:
     """Return 'block', 'mask', or 'allow' using whole identifier tokens."""
     del sql_type
-    column_name = column_key.rsplit(".", 1)[-1]
     overrides = policy_overrides or {}
+    if overrides.get(ALLOW_ALL_COLUMNS_FLAG):
+        return "allow"
+    column_name = column_key.rsplit(".", 1)[-1]
     if _matches_patterns(column_name, SENSITIVE_COLUMN_PATTERNS):
         return "block"
     if _matches_patterns(column_name, tuple(overrides.get("patterns", {}).get("block", ()))):

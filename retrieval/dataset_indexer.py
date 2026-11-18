@@ -23,6 +23,7 @@ class Embedder(Protocol):
 def build_embedding_documents(
     schema: SchemaMetadata,
     value_documents: list[dict[str, Any]],
+    policy_overrides: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Create table, column, relationship, and low-cardinality value documents."""
     documents: list[dict[str, Any]] = []
@@ -31,10 +32,10 @@ def build_embedding_documents(
             "document_type": "table",
             "table_name": table.name,
             "column_name": None,
-            "content": build_table_document(table),
+            "content": build_table_document(table, policy_overrides),
         })
         for column in table.columns:
-            content = build_column_document(table, column)
+            content = build_column_document(table, column, policy_overrides)
             if content:
                 documents.append({
                     "document_type": "column",
@@ -51,10 +52,20 @@ def build_embedding_documents(
             local_name = ", ".join(str(name) for name in local_columns)
             remote_name = ", ".join(str(name) for name in remote_columns)
             protected = any(
-                is_blocked(f"{table.name}.{name}") or is_masked(f"{table.name}.{name}")
+                is_blocked(
+                    f"{table.name}.{name}", policy_overrides=policy_overrides
+                )
+                or is_masked(
+                    f"{table.name}.{name}", policy_overrides=policy_overrides
+                )
                 for name in local_columns
             ) or any(
-                is_blocked(f"{remote_table}.{name}") or is_masked(f"{remote_table}.{name}")
+                is_blocked(
+                    f"{remote_table}.{name}", policy_overrides=policy_overrides
+                )
+                or is_masked(
+                    f"{remote_table}.{name}", policy_overrides=policy_overrides
+                )
                 for name in remote_columns
             )
             if protected:
@@ -84,6 +95,7 @@ def index_registered_dataset(
     dataset_id: str,
     dataset_hash: str,
     embedding_model: Embedder,
+    policy_overrides: dict[str, Any] | None = None,
 ) -> int:
     """Embed and re-index one dataset, committing indexed metadata only on success."""
     registry.mark_not_indexed(tenant_id, dataset_id)
@@ -93,7 +105,7 @@ def index_registered_dataset(
         )
     schema = registry.load_schema(tenant_id, dataset_id)
     value_documents = registry.load_value_documents(tenant_id, dataset_id)
-    documents = build_embedding_documents(schema, value_documents)
+    documents = build_embedding_documents(schema, value_documents, policy_overrides)
     vectors = embedding_model.embed([document["content"] for document in documents])
     if vectors.ndim != 2 or vectors.shape != (len(documents), store.vector_size):
         found_dimension = vectors.shape[-1] if vectors.ndim else 0

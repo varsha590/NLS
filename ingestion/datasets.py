@@ -379,6 +379,7 @@ def _parse_sql_content(
     sql_text: str,
     dialect: str,
     low_cardinality_max: int,
+    include_all_values: bool = False,
 ) -> tuple[SchemaMetadata, list[dict[str, str]], list[str]]:
     statements = [
         node
@@ -422,12 +423,16 @@ def _parse_sql_content(
             continue
         if column_key in unknown_value_columns:
             continue
-        if any(is_pii_shaped_value(value) or _LONG_ID_PATTERN.fullmatch(value) for value in distinct_values):
-            warnings.append(f"Skipped PII-shaped values in {table_name}.{column_name}.")
-            continue
+        if not include_all_values:
+            if any(
+                is_pii_shaped_value(value) or _LONG_ID_PATTERN.fullmatch(value)
+                for value in distinct_values
+            ):
+                warnings.append(f"Skipped PII-shaped values in {table_name}.{column_name}.")
+                continue
         if len(distinct_values) > low_cardinality_max:
             continue
-        if is_blocked(column_key) or is_masked(column_key):
+        if not include_all_values and (is_blocked(column_key) or is_masked(column_key)):
             warnings.append(f"Skipped restricted value column {table_name}.{column_name}.")
             continue
         for value in sorted(distinct_values, key=str.casefold):
@@ -445,7 +450,7 @@ def _parse_sql_content(
         for node in statement.find_all(exp.Literal)
         if node.is_string
     )
-    if (
+    if not include_all_values and (
         _EMAIL_PATTERN.search(sql_text)
         or _LONG_ID_PATTERN.search(sql_text)
         or any(is_pii_shaped_value(value) for value in upload_literals)
@@ -459,6 +464,7 @@ def parse_sql_dump(
     dialect: str | None = None,
     parse_timeout_seconds: float = DEFAULT_PARSE_TIMEOUT_SECONDS,
     low_cardinality_max: int | None = None,
+    include_all_values: bool = False,
 ) -> tuple[SchemaMetadata, list[dict[str, str]], list[str]]:
     """Parse only CREATE TABLE/FK ALTER/literal INSERT AST nodes; never execute SQL."""
     selected_dialect = (dialect or detect_sql_dialect(sql_text)).casefold()
@@ -477,6 +483,7 @@ def parse_sql_dump(
                 "sql_text": sql_text,
                 "dialect": selected_dialect,
                 "low_cardinality_max": selected_low_max,
+                "include_all_values": include_all_values,
             }),
         parse_timeout_seconds,
         Path(__file__).resolve().parents[1],
@@ -566,6 +573,7 @@ def extract_sqlite_value_documents(
     database_path: str | Path,
     metadata: SchemaMetadata,
     low_cardinality_max: int = DEFAULT_LOW_CARDINALITY_MAX,
+    include_all_values: bool = False,
 ) -> tuple[list[dict[str, str]], list[str]]:
     """Collect only bounded low-cardinality values using read-only SELECT DISTINCT."""
     path = Path(database_path)
@@ -593,8 +601,13 @@ def extract_sqlite_value_documents(
                         is_primary_key=column.is_primary_key,
                         is_foreign_key=column.is_foreign_key,
                     )
-                    or is_blocked(f"{table.name}.{column.name}")
-                    or is_masked(f"{table.name}.{column.name}")
+                    or (
+                        not include_all_values
+                        and (
+                            is_blocked(f"{table.name}.{column.name}")
+                            or is_masked(f"{table.name}.{column.name}")
+                        )
+                    )
                 ):
                     continue
                 quoted_column = '"' + column.name.replace('"', '""') + '"'
@@ -606,7 +619,7 @@ def extract_sqlite_value_documents(
                 if len(rows) > low_cardinality_max:
                     continue
                 values = [str(row[0]) for row in rows]
-                if any(
+                if not include_all_values and any(
                     is_pii_shaped_value(value) or _LONG_ID_PATTERN.fullmatch(value)
                     for value in values
                 ):
@@ -708,6 +721,7 @@ class DatasetRegistry:
         parse_timeout_seconds: float | None = None,
         low_cardinality_max: int | None = None,
         embedding_model_name: str | None = None,
+        include_all_values: bool = False,
     ) -> dict[str, Any]:
         selected_tenant = tenant_id or os.getenv("TENANT_ID", "default")
         if not selected_tenant.strip():
@@ -792,6 +806,7 @@ class DatasetRegistry:
                 dialect,
                 timeout,
                 low_cardinality_max=low_max,
+                include_all_values=include_all_values,
             )
         else:
             if dialect_override and dialect_override.casefold() != "sqlite":
@@ -807,6 +822,7 @@ class DatasetRegistry:
                     temporary_db,
                     schema,
                     low_cardinality_max=low_max,
+                    include_all_values=include_all_values,
                 )
             except Exception:
                 temporary_db.unlink(missing_ok=True)
@@ -815,7 +831,7 @@ class DatasetRegistry:
         dataset_dir.mkdir(parents=True, exist_ok=True)
         if temporary_db is not None:
             os.replace(temporary_db, dataset_dir / "source.db")
-        upload_pii = suffix == ".sql" and bool(
+        upload_pii = suffix == ".sql" and not include_all_values and bool(
             _EMAIL_PATTERN.search(sql_text) or _LONG_ID_PATTERN.search(sql_text)
         )
         if upload_pii and "Upload contains PII-shaped content; matching value columns are excluded." not in warnings:

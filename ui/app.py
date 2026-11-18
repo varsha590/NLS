@@ -12,6 +12,7 @@ from typing import Any
 
 import streamlit as st
 
+from config.data_policy import allow_all_columns_policy
 from db.credentials import (
     DbConnectionError,
     DbCredentials,
@@ -130,6 +131,7 @@ def _index_dataset(
         str(dataset["dataset_id"]),
         dataset_hash,
         get_embedding_model(),
+        policy_overrides=allow_all_columns_policy(),
     )
 
 
@@ -339,6 +341,7 @@ def _run_client_flow() -> None:
                         tenant_id=tenant_id,
                         max_upload_mb=int(os.getenv("MAX_UPLOAD_MB", "200")),
                         embedding_model_name=os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2"),
+                        include_all_values=True,
                     )
                     st.session_state["selected_dataset_id"] = result["dataset_id"]
                     if result.get("indexed") is not True:

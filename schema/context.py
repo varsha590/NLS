@@ -27,9 +27,17 @@ def build_column_line(col: ColumnInfo) -> str:
     return f"{col.name} {' '.join(flags)}".strip()
 
 
-def build_table_line(table: TableInfo) -> str:
+def build_table_line(
+    table: TableInfo, policy_overrides: dict[str, Any] | None = None
+) -> str:
     """Format a table as a compact one-liner with all non-blocked columns."""
-    allowed_cols = [col for col in table.columns if not is_blocked(f"{table.name}.{col.name}")]
+    allowed_cols = [
+        col
+        for col in table.columns
+        if not is_blocked(
+            f"{table.name}.{col.name}", policy_overrides=policy_overrides
+        )
+    ]
     col_lines = [build_column_line(col) for col in allowed_cols]
     return f"{table.name}({', '.join(col_lines)})"
 
@@ -53,6 +61,7 @@ def build_schema_context(
     table_names: List[str],
     include_business_rules: bool = True,
     value_hints: Optional[str] = None,
+    policy_overrides: dict[str, Any] | None = None,
 ) -> str:
     """
     Build the complete schema context string for the LLM.
@@ -87,7 +96,13 @@ def build_schema_context(
         if not table:
             continue
         # Filter out blocked columns
-        allowed_cols = [c for c in table.columns if not is_blocked(f"{table_name}.{c.name}")]
+        allowed_cols = [
+            c
+            for c in table.columns
+            if not is_blocked(
+                f"{table_name}.{c.name}", policy_overrides=policy_overrides
+            )
+        ]
         if not allowed_cols:
             continue
         # Build table line with only allowed columns
@@ -141,6 +156,7 @@ def build_full_context(
     metadata: SchemaMetadata,
     retrieved_table_names: List[str],
     value_hints: Optional[str] = None,
+    policy_overrides: dict[str, Any] | None = None,
 ) -> tuple[str, List[str]]:
     """
     Build complete context from retrieved tables.
@@ -149,7 +165,12 @@ def build_full_context(
         (schema_context_string, expanded_table_names)
     """
     expanded = get_expanded_table_names(metadata, retrieved_table_names)
-    context = build_schema_context(metadata, expanded, value_hints=value_hints)
+    context = build_schema_context(
+        metadata,
+        expanded,
+        value_hints=value_hints,
+        policy_overrides=policy_overrides,
+    )
     return context, expanded
 
 
