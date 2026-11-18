@@ -608,3 +608,80 @@ def test_db_factory_tripwire_on_every_path():
 
     # Verify outcome is not None (covers the DialectMissing case)
     assert outcome is not None
+
+
+def test_llm_prompt_never_contains_db_credentials(monkeypatch):
+    """The messages sent to the LLM contain no DB host, username, or password."""
+    import json
+
+    from db.credentials import DbCredentials
+    from llm.generator import GroqGenerator
+    from pipeline.query_workflow import ValidatedQuery, generate_and_validate_query
+
+    credentials = DbCredentials(
+        dialect="postgresql",
+        host="db.internal.example",
+        port=5432,
+        username="reporting_user",
+        password="s3cr3t-pass",
+        database="warehouse",
+    )
+    captured = []
+
+    def fake_generate(self, messages):
+        captured.append(messages)
+        return "SELECT record_id FROM records"
+
+    monkeypatch.setattr(GroqGenerator, "generate", fake_generate)
+    monkeypatch.setattr(workflow, "validate_sql", lambda sql, **kwargs: sql)
+    monkeypatch.setenv("GROQ_API_KEY", "")
+
+    query = QueryReady(
+        status="ok",
+        context="=== SCHEMA === records: record_id INTEGER",
+        retrieval=None,
+        value_matches=[],
+        question="show me records",
+        metadata=_schema(),
+    )
+    outcome = generate_and_validate_query(query)
+
+    assert isinstance(outcome, ValidatedQuery)
+    assert captured
+    prompt_text = json.dumps(captured)
+    for value in (credentials.host, credentials.username, credentials.password):
+        assert value not in prompt_text
+
+
+def test_llm_path_functions_accept_no_credentials_argument():
+    import inspect
+
+    from ask import ask_question
+    from llm.generator import GroqGenerator
+    from llm.prompt_builder import build_prompt, build_query_prompt
+    from llm.sql_generator import generate_sql
+    from pipeline.query_workflow import (
+        generate_and_validate_query,
+        generate_sql_from_messages as workflow_generate_sql_from_messages,
+        prepare_query,
+    )
+
+    functions = (
+        ask_question,
+        prepare_query,
+        generate_and_validate_query,
+        workflow_generate_sql_from_messages,
+        build_prompt,
+        build_query_prompt,
+        generate_sql,
+        GroqGenerator.generate,
+        GroqGenerator._complete,
+        GroqGenerator.summarize,
+    )
+    forbidden = ("credential", "password", "host", "username")
+    for function in functions:
+        parameters = inspect.signature(function).parameters
+        assert not any(
+            any(term in name.casefold() for term in forbidden)
+            for name in parameters
+        ), function

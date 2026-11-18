@@ -207,6 +207,26 @@ def test_connection(
             connection.close()
 
 
+def _execution_dialect(dialect: str) -> str:
+    return PG_DIALECT if dialect.casefold() in {"postgres", "postgresql"} else dialect
+
+
+def verify_connection(
+    credentials: DbCredentials,
+    dataset_dialect: str | None = None,
+    timeout_seconds: int = 15,
+) -> None:
+    """Check the dataset dialect, then verify read-only access with SELECT 1."""
+    if dataset_dialect:
+        expected = _execution_dialect(dataset_dialect)
+        if credentials.dialect != expected:
+            raise DbConnectionError(
+                f"Database dialect '{credentials.dialect}' does not match the "
+                f"uploaded dataset dialect '{dataset_dialect}'."
+            )
+    test_connection(credentials, timeout_seconds)
+
+
 def execute_validated(
     sql: str,
     credentials: DbCredentials,

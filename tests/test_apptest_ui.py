@@ -269,7 +269,7 @@ def test_unindexed_dataset_shows_reindex_prompt(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(not HAS_APPTEST, reason="AppTest not available")
 def test_apptest_validated_rerun_flow(monkeypatch):
-    """Validated SQL precedes connection; rows persist and page without re-execution."""
+    """Connect first; validated SQL executes once and results page without re-execution."""
     db_fd, db_path = tempfile.mkstemp(suffix=".db")
     os.close(db_fd)
     conn = sqlite3.connect(db_path)
@@ -282,6 +282,7 @@ def test_apptest_validated_rerun_flow(monkeypatch):
     dataset_root = os.path.join(os.path.dirname(db_path), "datasets")
     monkeypatch.setenv("DATASET_STORAGE_PATH", dataset_root)
     monkeypatch.setenv("PAGE_SIZE", "1")
+    from db.credentials import DbCredentials, DbConnectionError
     from ingestion.datasets import DatasetRegistry
     from pipeline.query_workflow import QueryReady, ValidatedQuery
     from retrieval.qdrant_retriever import RetrievalResult
@@ -291,7 +292,7 @@ def test_apptest_validated_rerun_flow(monkeypatch):
         "items.sql",
         b"CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL);",
         tenant_id="default",
-        dialect_override="mysql",
+        dialect_override="sqlite",
         embedding_model_name="test-embedding-model",
     )
     metadata_path = registry.dataset_directory("default", registered["dataset_id"]) / "dataset.json"
@@ -322,12 +323,12 @@ def test_apptest_validated_rerun_flow(monkeypatch):
     calls = []
     logged_sql = []
 
-    def fake_test_connection(credentials, timeout_seconds):
-        calls.append(("connect", credentials.database))
+    def fake_verify(credentials, dataset_dialect=None, timeout_seconds=15):
+        calls.append(("verify", credentials.database, dataset_dialect))
         if credentials.database == "bad":
-            from db.credentials import DbConnectionError
-
-            raise DbConnectionError("connection rejected")
+            raise DbConnectionError(
+                "The connection could not be verified. Check the connection details."
+            )
 
     def fake_execute_validated(
         sql, credentials, stored_dialect=None, timeout_seconds=15
@@ -351,7 +352,7 @@ def test_apptest_validated_rerun_flow(monkeypatch):
         def close(self):
             pass
 
-    monkeypatch.setattr(appmod, "test_connection", fake_test_connection)
+    monkeypatch.setattr(appmod, "verify_connection", fake_verify)
     monkeypatch.setattr(appmod, "execute_validated", fake_execute_validated)
     monkeypatch.setattr(
         appmod, "log_query", lambda *args, **kwargs: logged_sql.append(kwargs["sql"])
@@ -364,31 +365,38 @@ def test_apptest_validated_rerun_flow(monkeypatch):
     )
     at = AppTest.from_file(entrypoint).run()
     at.text_input(key="tenant_id").set_value("default").run()
-    at.text_input(key="question_input").set_value("show me items")
-    [button for button in at.form_submit_button if button.label == "Search"][0].click().run()
 
-    query = at.session_state["ui_state"]["pending"]["sql"]
-    assert [code.value for code in at.code] == [query]
-    assert query == "SELECT id, name, price FROM items"
-    assert any(button.label == "Connect" for button in at.form_submit_button)
-    assert not any(element.value == "Connected" for element in at.success)
-    assert at.expander(key="query-execution-expander").proto.expanded is False
-    assert at.download_button[0].label == "Download SQL"
-    at.download_button[0].click().run()
-    assert at.session_state["ui_state"]["pending"]["sql"] == query
-    assert at.session_state["ui_state"]["result"] is None
-    assert [code.value for code in at.code] == [query]
+    assert {"Host", "Username", "Password", "Database"} <= {
+        field.label for field in at.text_input
+    }
+    assert at.text_input(key="question_input").proto.disabled is True
+    assert [button for button in at.form_submit_button if button.label == "Connect"]
 
     [field for field in at.text_input if field.label == "Password"][0].set_value("test-secret")
     [field for field in at.text_input if field.label == "Database"][0].set_value(db_path)
     [button for button in at.form_submit_button if button.label == "Connect"][0].click().run()
 
-    assert calls == [("connect", db_path), ("execute", "SELECT id, name, price FROM items")]
+    assert not at.exception
+    assert calls == [("verify", db_path, "sqlite")]
+    assert any(element.value == f"Connected to {db_path}" for element in at.success)
+    assert [button.label for button in at.button if button.label == "Disconnect"] == ["Disconnect"]
+    assert not [button for button in at.form_submit_button if button.label == "Connect"]
+    assert at.text_input(key="question_input").proto.disabled is False
+    assert isinstance(at.session_state["db_creds"], DbCredentials)
+    assert at.session_state["db_creds"].database == db_path
+    assert "test-secret" not in repr(at.session_state["db_creds"])
+    assert "test-secret" not in str(at.session_state["db_creds"])
+
+    at.text_input(key="question_input").set_value("show me items")
+    [button for button in at.form_submit_button if button.label == "Search"][0].click().run()
+
+    query = at.session_state["ui_state"]["pending"]["sql"]
+    assert calls == [("verify", db_path, "sqlite"), ("execute", query)]
     assert logged_sql == [query]
-    assert any(element.value == "Connected" for element in at.success)
-    assert "widget" in str(at.dataframe[0].value)
     assert [code.value for code in at.code] == [query]
-    assert at.session_state["ui_state"]["pending"]["sql"] == query
+    assert at.expander(key="show-query-expander").proto.expanded is False
+    assert "widget" in str(at.dataframe[0].value)
+    assert not [button for button in at.form_submit_button if button.label == "Connect"]
     [button for button in at.button if button.label == "Next"][0].click().run()
     assert at.session_state["ui_state"]["pending"]["sql"] == query
     assert [code.value for code in at.code] == [query]
@@ -397,20 +405,99 @@ def test_apptest_validated_rerun_flow(monkeypatch):
     at.run()
     assert len(calls) == 2
     assert "gadget" in str(at.dataframe[0].value)
-    assert at.session_state["db_creds"]["credentials"].database == db_path
     assert at.session_state["ui_state"]["result"]["rows"]
 
-    monkeypatch.setenv("DB_IDLE_TIMEOUT_SECONDS", "60")
-    at.session_state["db_creds"]["last_used"] = time.time() - 61
-    at.run()
+    [button for button in at.button if button.label == "Disconnect"][0].click().run()
     assert "db_creds" not in at.session_state
-    assert any(button.label == "Connect" for button in at.form_submit_button)
+    assert "db_connected_at" not in at.session_state
+    assert any(
+        info.value == "Disconnected. Connect again to run a query." for info in at.info
+    )
+    assert [button for button in at.form_submit_button if button.label == "Connect"]
+    assert at.text_input(key="question_input").proto.disabled is True
+    assert not at.code
+    assert not at.dataframe
 
     [field for field in at.text_input if field.label == "Database"][0].set_value("bad")
     [button for button in at.form_submit_button if button.label == "Connect"][0].click().run()
     assert "db_creds" not in at.session_state
-    assert "could not be verified" in at.warning[0].value
-    assert any(button.label == "Connect" for button in at.form_submit_button)
+    assert any("could not be verified" in warning.value for warning in at.warning)
+    assert [button for button in at.form_submit_button if button.label == "Connect"]
+
+    [field for field in at.text_input if field.label == "Database"][0].set_value(db_path)
+    [button for button in at.form_submit_button if button.label == "Connect"][0].click().run()
+    monkeypatch.setenv("DB_IDLE_TIMEOUT_SECONDS", "60")
+    at.session_state["db_connected_at"] = time.time() - 61
+    at.run()
+    assert "db_creds" not in at.session_state
+    assert any("connection expired" in info.value for info in at.info)
+    assert [button for button in at.form_submit_button if button.label == "Connect"]
+
+
+@pytest.mark.skipif(not HAS_APPTEST, reason="AppTest not available")
+def test_apptest_credentials_cleared_on_tenant_and_dataset_change(monkeypatch, tmp_path):
+    """A connected session forgets credentials when tenant or dataset changes."""
+    from db.credentials import DbCredentials
+    from ingestion.datasets import DatasetRegistry
+
+    dataset_root = tmp_path / "datasets"
+    monkeypatch.setenv("DATASET_STORAGE_PATH", str(dataset_root))
+    registry = DatasetRegistry(dataset_root)
+    dataset_ids: dict[str, list[str]] = {}
+    for tenant, filenames in (
+        ("tenant-a", ["a.sql"]),
+        ("tenant-b", ["b-one.sql", "b-two.sql"]),
+    ):
+        dataset_ids[tenant] = []
+        for name in filenames:
+            registered = registry.register(
+                name,
+                b"CREATE TABLE items (id INTEGER PRIMARY KEY);",
+                tenant_id=tenant,
+                dialect_override="sqlite",
+                embedding_model_name="test-embedding-model",
+            )
+            dataset_ids[tenant].append(registered["dataset_id"])
+            metadata_path = (
+                registry.dataset_directory(tenant, registered["dataset_id"]) / "dataset.json"
+            )
+            metadata = json.loads(metadata_path.read_text())
+            metadata["indexed"] = True
+            metadata_path.write_text(json.dumps(metadata))
+
+    import ui.app as appmod
+
+    monkeypatch.setattr(appmod, "verify_connection", lambda *args, **kwargs: None)
+
+    entrypoint = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app.py"
+    )
+    at = AppTest.from_file(entrypoint).run()
+    at.text_input(key="tenant_id").set_value("tenant-a").run()
+    [field for field in at.text_input if field.label == "Database"][0].set_value(":memory:")
+    [button for button in at.form_submit_button if button.label == "Connect"][0].click().run()
+
+    assert isinstance(at.session_state.get("db_creds"), DbCredentials)
+
+    at.text_input(key="tenant_id").set_value("tenant-b").run()
+    assert "db_creds" not in at.session_state
+    assert "db_connected_at" not in at.session_state
+    assert [button for button in at.form_submit_button if button.label == "Connect"]
+
+    [field for field in at.text_input if field.label == "Database"][0].set_value(":memory:")
+    [button for button in at.form_submit_button if button.label == "Connect"][0].click().run()
+    assert isinstance(at.session_state.get("db_creds"), DbCredentials)
+
+    active_dataset_id = at.session_state["active_dataset_id"]
+    other_dataset_id = next(
+        value
+        for value in dataset_ids["tenant-b"]
+        if value != active_dataset_id
+    )
+    at.selectbox(key="dataset-select").select(other_dataset_id).run()
+    assert "db_creds" not in at.session_state
+    assert "db_connected_at" not in at.session_state
+    assert [button for button in at.form_submit_button if button.label == "Connect"]
 
 
 @pytest.mark.skipif(not HAS_APPTEST, reason="AppTest not available")
@@ -465,6 +552,19 @@ def test_apptest_clarification_buttons_regenerate_sql(monkeypatch, tmp_path):
             or ValidatedQuery(sql="SELECT id, name FROM items")
         ),
     )
+    import ui.app as appmod
+
+    monkeypatch.setattr(appmod, "verify_connection", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        appmod,
+        "execute_validated",
+        lambda *args, **kwargs: {
+            "columns": [],
+            "rows": [],
+            "row_count": 0,
+            "duration_ms": 1,
+        },
+    )
     monkeypatch.setattr("ui.app.get_embedding_model", lambda *a, **k: object())
     monkeypatch.setattr("ui.app.build_qdrant_store", lambda *a, **k: object())
 
@@ -473,6 +573,8 @@ def test_apptest_clarification_buttons_regenerate_sql(monkeypatch, tmp_path):
     )
     at = AppTest.from_file(entrypoint).run()
     at.text_input(key="tenant_id").set_value("acme").run()
+    [field for field in at.text_input if field.label == "Database"][0].set_value(":memory:")
+    [button for button in at.form_submit_button if button.label == "Connect"][0].click().run()
     at.text_input(key="question_input").set_value("show records")
     [button for button in at.form_submit_button if button.label == "Search"][0].click().run()
 

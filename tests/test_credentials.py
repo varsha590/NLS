@@ -21,6 +21,7 @@ from db.credentials import (
     log_query,
     page_rows,
     test_connection as verify_connection,
+    verify_connection as verify_dataset_connection,
 )
 
 
@@ -149,6 +150,34 @@ def test_file_backed_sqlite_connection_is_read_only(tmp_path):
             connection.exec_driver_sql("INSERT INTO records VALUES (2)")
     finally:
         connection.close()
+
+
+def test_verify_connection_rejects_dialect_mismatch(tmp_path):
+    credentials = DbCredentials(
+        dialect="mysql",
+        host="localhost",
+        port=3306,
+        username="user",
+        password="pw",
+        database="mydb",
+    )
+    with pytest.raises(DbConnectionError, match="does not match"):
+        verify_dataset_connection(credentials, dataset_dialect="sqlite", timeout_seconds=2)
+
+
+def test_verify_connection_accepts_matching_dialect(tmp_path):
+    database_path = tmp_path / "verify.db"
+    with sa.create_engine(f"sqlite:///{database_path}").begin() as connection:
+        connection.exec_driver_sql("SELECT 1")
+    credentials = DbCredentials(
+        dialect="sqlite",
+        host="",
+        port=None,
+        username="",
+        password="",
+        database=str(database_path),
+    )
+    verify_dataset_connection(credentials, dataset_dialect="sqlite", timeout_seconds=2)
 
 
 # --- log_query: literals masked, no credentials ---

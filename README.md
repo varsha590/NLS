@@ -1,42 +1,37 @@
 # Natural Language to SQL
 
-## Current status
+A Streamlit text-to-SQL app using local sentence-transformer embeddings, Qdrant, Groq, SQLGlot, and SQLAlchemy. The current flow is: register a `.sql` schema → select the dataset → connect once to the live database → ask a question → review the validated SQL → see executed results.
 
-The dataset-backed workflow is available in Streamlit: register a dataset, ask a question, validate the generated SQL locally, then execute it read-only against a database connection. Dataset registration accepts `.sql` schema dumps and SQLite `.db` uploads. SQL files are parsed, never executed; SQLite uploads are inspected read-only. A `.sql` upload provides schema metadata but does not create a live database, so query execution still needs a separate read-only connection.
+## Current client flow
 
-For `.sql` files, the current parser extracts `CREATE TABLE`, foreign-key `ALTER TABLE`, and literal multi-row `INSERT ... VALUES` statements. MySQL `INSERT IGNORE` and version comments are tolerated. PostgreSQL `COPY FROM stdin` blocks are skipped, not imported. Procedure, trigger, view, `DELIMITER`, `SET`, and `LOCK` statements are ignored. Low-cardinality literal insert values are persisted only after sensitive-name and PII-shape checks. SQLite `.db` files use read-only inspection plus bounded `SELECT DISTINCT` scans (`LOW_CARDINALITY_MAX + 1` maximum rows per eligible text column); high-cardinality, key, sensitive, and PII-shaped values are not stored.
+1. **Enter a tenant label.** The label scopes local dataset files and Qdrant points. It is not authentication; tenant and dataset IDs are allowlisted to `A-Za-z0-9_-` with a 64-character maximum.
+2. **Register a dataset.** If the tenant has no datasets, the app asks for a `.sql` upload. The file is parsed in a timed child process and is never executed. `CREATE TABLE`, foreign-key `ALTER TABLE`, and literal multi-row `INSERT ... VALUES` statements are extracted; low-cardinality literal values are persisted only after key-column, sensitive-name, and PII-shape checks. The resulting `schema.json`, `value_documents.json`, and `dataset.json` are stored under the tenant's dataset directory, then schema/column/relationship/value documents are embedded into tenant- and dataset-scoped Qdrant points.
+3. **Select the dataset.** Returning clients pick an existing dataset by filename. Changing the tenant or dataset clears the DB connection and any pending question/result state. If a dataset is not indexed, the app shows **Re-index dataset**; a failed re-index leaves it unindexed so it can be retried.
+4. **Connect once per session.** After the dataset metadata loads, a form asks for Host, Port, Username, Password, and Database. For SQLite, only the Database path is used and it is opened read-only; the other fields are ignored. The app rejects a dialect that does not match the uploaded `.sql` and verifies access with a read-only `SELECT 1`. On success it shows `Connected to <host>/<db>` and enables the question box. Credentials are held only in `st.session_state` as a `DbCredentials` object (password masked in `str`/`repr`), expire after `DB_IDLE_TIMEOUT_SECONDS` of inactivity (default 1800), and are cleared by **Disconnect**, tenant change, or dataset change.
+5. **Ask a question.** The app embeds the question, matches registered low-cardinality values, retrieves tenant/dataset-scoped schema context from Qdrant, and may ask the client to clarify the table when matches are ambiguous. Only the question and local schema context are sent to Groq; credentials and query result rows are never sent. Generated SQL is validated locally with SQLGlot against the stored `schema.json`: one read-only `SELECT`, no live database inspection, and no `EXPLAIN`. One retry with sanitized feedback is allowed after a validation failure.
+6. **Review and execute.** Validated SQL appears once in the collapsed **Show query** expander with a **Download SQL** button. It then executes automatically against the session connection with read-only settings; the connection is closed afterward. Rows are fetched once and paginated with **Previous**/**Next** using `PAGE_SIZE` (default 50, maximum 500); an empty result shows **No matching records found**. The query log records tenant, dataset, row count, duration, and SQL with all literals replaced by `?`; it never records credentials or row data.
 
-Upload configuration: `TENANT_ID` (default tenant scope, not authentication), `DATASET_STORAGE_PATH` (default `datasets`), `MAX_UPLOAD_MB` (default 25), `SQL_PARSE_TIMEOUT_SECONDS` (default 10), and `LOW_CARDINALITY_MAX` (default 50). The SQL parser runs in a timed child process with a restricted environment that excludes database URLs, API keys, and other unapproved variables.
+The Streamlit file uploader currently exposes `.sql` only. `DatasetRegistry.register()` also supports SQLite `.db` files programmatically via read-only inspection and bounded `SELECT DISTINCT` scans, but the UI does not offer that path.
 
-A Streamlit text-to-SQL application using SQLAlchemy, local sentence-transformer embeddings, Qdrant, Groq, and SQLGlot. Schema and value vectors and verified examples are stored in Qdrant; the target database is read-only.
+## Configure the app
 
-## Configure a database
+Use Python 3.10 or newer. Copy `.env.example` to `.env`, set `GROQ_API_KEY`, and install the SQLAlchemy driver matching the dialect. SQLite needs no external server. `Settings.from_env()` also requires `LLM_MODEL`, `EMBEDDING_MODEL`, `VECTOR_STORE_PATH`, `SCHEMA_TOP_K`, `VALUE_TOP_K`, `VALUE_CARDINALITY_THRESHOLD`, `QUERY_TIMEOUT_SECONDS`, and `MAX_RETRIES`; the example file supplies all of them.
 
-Use Python 3.10 or newer. Copy `.env.example` to `.env`, add `GROQ_API_KEY`, and install the SQLAlchemy driver matching the dialect. SQLite requires no external server:
+- Upload: `DATASET_STORAGE_PATH` (default `datasets`), `MAX_UPLOAD_MB` (code default 200 MB; `.env.example` sets 500), `SQL_PARSE_TIMEOUT_SECONDS` (code default 10 seconds; `.env.example` sets 1000), `LOW_CARDINALITY_MAX` (default 50). `TENANT_ID` is only a programmatic fallback; the UI tenant label wins.
+- Retrieval/index: `QDRANT_URL`, `QDRANT_API_KEY`, `QDRANT_COLLECTION`, `EMBEDDING_MODEL` (384-dimensional sentence-transformer), `SCHEMA_TOP_K`, `VALUE_TOP_K`, `VALUE_CARDINALITY_THRESHOLD`, `EXAMPLE_CANDIDATE_LIMIT` (default 500). Optional comma-separated lists: `ALLOWED_SCHEMAS`, `EXCLUDED_TABLES`.
+- Execution/session: `QUERY_TIMEOUT_SECONDS` (default 15), `DB_IDLE_TIMEOUT_SECONDS` (default 1800), `PAGE_SIZE` (default 50, capped at 500).
 
-At startup the application reads the Qdrant collection before schema inspection. It bulk-reflects metadata where supported and fingerprints each table. When fingerprints, settings, and refresh timestamps match, it loads the cached schema/value index without scanning data tables or calling the embedding model. Otherwise it scans only changed or stale tables, with one bounded query per eligible non-ENUM/SET column. It does not create, alter, seed, or write target database objects, and it collects no introspection samples. Schema vectors, VALUE_LOW value vectors, count-only classifications, and verified examples live in Qdrant, scoped per tenant and dataset.
-
-Qdrant uses cosine search over the embedding model's vectors (384 dimensions for the default model). Every read and write carries a mandatory `tenant_id` + `dataset_id` filter, so one tenant can never read another tenant's points. The manifest tracks model/dimension/policy compatibility, global and per-table schema fingerprints, and `last_value_scan_at` timestamps. The classification cache stores class/reason and counts only. Unchanged content reuses cached embeddings; model/dimension changes re-embed from valid local metadata without value rescans. Only VALUE_LOW canonical values are stored in the value index; BLOCKED, MASKED, and VALUE_HIGH values are not embedded or persisted. Failed table scans preserve that table's last-known-good entries and surface an incomplete index state.
-
-`INDEX_REFRESH_TTL_HOURS` defaults to 24; set it to `0` to rescan eligible values at every startup. `INDEX_SCAN_WORKERS` defaults to 1 and is capped at 8. `EMBED_CACHE_MAX_ENTRIES` defaults to 250000. Use **Re-index dataset** in the sidebar to force a full rebuild that ignores the refresh window. Verified examples and hints are retained. To reset a namespace completely, stop the app and delete its dataset directory under `datasets/`.
-
-`EMBEDDING_MODEL`, `VECTOR_STORE_PATH`, `SCHEMA_TOP_K`, `VALUE_TOP_K`, `VALUE_CARDINALITY_THRESHOLD`, `EXAMPLE_CANDIDATE_LIMIT`, `INDEX_REFRESH_TTL_HOURS`, `INDEX_SCAN_WORKERS`, `EMBED_CACHE_MAX_ENTRIES`, `QUERY_TIMEOUT_SECONDS`, and `MAX_RETRIES` configure indexing, retrieval, and execution. `EXAMPLE_CANDIDATE_LIMIT` defaults to 500 most recently saved examples before lexical ranking. `ALLOWED_SCHEMAS` and `EXCLUDED_TABLES` are optional comma-separated lists.
-
-The sidebar shows index age and per-stage status; each query's **Run details** includes the same counts and timings. These diagnostics contain metadata and aggregates only, never row values.
+The SQL parser runs with an allowlisted environment (`PATH`, locale settings, temp directories) so database URLs, API keys, and other secrets are not passed into the child process. MySQL `INSERT IGNORE` and version comments are tolerated. PostgreSQL `COPY FROM stdin` blocks are skipped, not imported. Procedure, trigger, view, `DELIMITER`, `SET`, and `LOCK` statements are ignored. Qdrant uses cosine search over the embedding model's 384-dimensional vectors; every read and write carries a mandatory `tenant_id` + `dataset_id` filter, so one tenant cannot read another tenant's points.
 
 ## Security boundary
 
-**Credentials must be supplied at runtime** via the connection form. Startup and query execution use only metadata reads, `SELECT`, `EXPLAIN`, and supported read-only or timeout session settings. Database permissions remain the authoritative boundary; application validation is an additional layer. Credentials are excluded from local namespaces and masked in displayed URLs.
+Registration and validation never connect to the target database, run DDL, or execute uploaded SQL. There is no startup scan of the live database; schema and value context come from the registered dataset files. The application does not create, alter, seed, or write target database objects.
 
-The result set is held in memory for paging very large results use a lot of memory. Keep PAGE_SIZE small (default 50, max 500) to avoid excessive memory usage.
+Credentials are supplied only at runtime through the connection form. They are never written to `.env`, files, logs, Qdrant, dataset storage, or prompts. The connection layer sets `SET TRANSACTION READ ONLY` plus `statement_timeout` for PostgreSQL, `MAX_EXECUTION_TIME` plus `SET TRANSACTION READ ONLY` for MySQL, and `mode=ro` plus `PRAGMA query_only=ON` for SQLite. Database permissions remain the authoritative boundary; application validation is an additional layer.
 
-The application no longer provisions or uses PostgreSQL vector tables. If an older PostgreSQL database still contains application-created `system_*` tables, review and drop them manually with an administrator after confirming they are no longer needed. The app does not drop them.
+Result sets are fetched fully into memory for pagination, so very large results can consume significant memory. Keep `PAGE_SIZE` small.
 
-## Hints and examples
-
-Optional dataset-specific guidance can be placed at `.vector_store/<namespace>/hints.md`. Keep hints free of row data and credentials. After reviewing a successful query, **This was correct** saves the question and SQL to the namespace's local `examples.sqlite`; the UI reports failure if persistence fails.
-
-Table comments are read as schema metadata. `catalog.describe.describe_catalog` and `db/init_db.py` are developer utilities; application startup does not import or run them. The legacy `CatalogStore` is used only by the optional description utility and is not the application index store.
+The application does not provision or use PostgreSQL vector tables. If an older PostgreSQL database still contains application-created `system_*` tables, review and drop them manually with an administrator after confirming they are no longer needed. The app does not drop them.
 
 ## Install and run
 
@@ -58,15 +53,16 @@ python -m pip install pyodbc              # SQL Server; also needs Microsoft's O
 
 ```bash
 python -m pytest tests/ -v
-streamlit run app.py
 ```
 
-The SQLite pipeline tests use a mocked LLM. Optional MySQL read-only integration tests use `NLS_READONLY_MYSQL_URL` and skip when the SELECT-only database is unavailable.
+Tests use a mocked LLM and do not call Groq. Optional MySQL read-only integration tests use `NLS_READONLY_MYSQL_URL` and skip when the SELECT-only database is unavailable.
 
 ## Remaining limitations
 
-- `TENANT_ID` and dataset IDs are scopes, not authentication. Anyone who can run the app can select another tenant or dataset visible to it.
+- Tenant labels and dataset IDs are scopes, not authentication. Anyone who can run the app can select another tenant or dataset visible to it.
 - A `.sql` upload provides schema and reference-value metadata only; it is not a live database and cannot execute queries.
+- The UI registers `.sql` files only; SQLite `.db` registration is available through `DatasetRegistry` API, not the UI.
+- There is no live `EXPLAIN` or database-backed validation before execution; validation is against the uploaded schema only.
 - Qdrant data and dataset files are stored locally; this is not a hosted multi-tenant deployment.
 - PostgreSQL `COPY FROM stdin` data is skipped during upload, so reference values from that form are not indexed.
 - Result sets are fetched fully into memory for pagination; very large results can consume significant memory.

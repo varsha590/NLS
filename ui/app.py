@@ -18,7 +18,7 @@ from db.credentials import (
     execute_validated,
     log_query,
     page_rows,
-    test_connection,
+    verify_connection,
 )
 from ingestion.datasets import DatasetRegistry, UploadError
 from retrieval.dataset_indexer import index_registered_dataset
@@ -141,27 +141,31 @@ def _execution_dialect(dialect: str) -> str:
     return "postgresql" if dialect.casefold() in {"postgres", "postgresql"} else dialect
 
 
+def _clear_db_credentials() -> None:
+    st.session_state.pop("db_creds", None)
+    st.session_state.pop("db_connected_at", None)
+    st.session_state.pop("connection_notice", None)
+
+
 def _clear_expired_credentials() -> None:
-    stored = st.session_state.get("db_creds")
-    if not stored:
+    if st.session_state.get("db_creds") is None:
         return
+    connected_at = float(st.session_state.get("db_connected_at", time.time()))
     timeout = max(1, int(os.getenv("DB_IDLE_TIMEOUT_SECONDS", "1800")))
-    now = time.time()
-    if now - float(stored.get("last_used", now)) >= timeout:
-        del st.session_state["db_creds"]
+    if time.time() - connected_at >= timeout:
+        _clear_db_credentials()
         st.session_state["connection_notice"] = "Your connection expired. Please connect again."
-    elif now - float(stored.get("last_used", now)) >= 0:
-        stored["last_used"] = now
+    else:
+        st.session_state["db_connected_at"] = time.time()
 
 
 def _execute_pending_query(timeout_seconds: int) -> None:
     state = st.session_state.get("ui_state") or _initial_ui_state()
     pending = state.get("pending")
-    stored = st.session_state.get("db_creds")
-    if pending is None or stored is None:
+    credentials = st.session_state.get("db_creds")
+    if pending is None or credentials is None:
         return
 
-    credentials = stored["credentials"]
     st.session_state["last_sql"] = pending["sql"]
     try:
         result = execute_validated(
@@ -177,7 +181,7 @@ def _execute_pending_query(timeout_seconds: int) -> None:
             row_count=result["row_count"],
             duration_ms=result["duration_ms"],
         )
-        stored["last_used"] = time.time()
+        st.session_state["db_connected_at"] = time.time()
         st.session_state["ui_state"] = next_ui_state(
             state,
             SUBMIT_OK,
@@ -190,11 +194,10 @@ def _execute_pending_query(timeout_seconds: int) -> None:
         )
     except Exception as error:
         LOGGER.warning("Query execution failed: %s", type(error).__name__)
-        st.session_state.pop("db_creds", None)
         st.session_state["ui_state"] = next_ui_state(
             state,
             SUBMIT_FAIL,
-            {"message": "The connection could not be used. Please connect again."},
+            {"message": "The query could not be run. Please try again."},
         )
 
 
@@ -206,6 +209,7 @@ def _process_question(
     tenant_id: str,
     dataset_id: str,
     dataset_metadata_path: str,
+    timeout_seconds: int,
     forced_table: str | None = None,
 ) -> None:
     """Run retrieval and generation for one question and record the UI outcome."""
@@ -267,6 +271,7 @@ def _process_question(
             "question": question,
         },
     )
+    _execute_pending_query(timeout_seconds)
 
 
 def _run_client_flow() -> None:
@@ -308,7 +313,7 @@ def _run_client_flow() -> None:
         st.session_state["active_dataset_id"] = None
         st.session_state["last_sql"] = None
         st.session_state["last_outcome"] = None
-        st.session_state["db_creds"] = None
+        _clear_db_credentials()
         st.session_state["pending_question"] = None
         st.session_state["forced_table"] = None
         st.session_state["clarification_options"] = []
@@ -363,6 +368,7 @@ def _run_client_flow() -> None:
         "Dataset",
         dataset_ids,
         index=default_index,
+        key="dataset-select",
         format_func=lambda value: next(
             (item.get("filename") or value for item in datasets if item["dataset_id"] == value),
             value,
@@ -374,6 +380,7 @@ def _run_client_flow() -> None:
             st.session_state["ui_state"], DATASET_CHANGED
         )
         st.session_state.pop("last_sql", None)
+        _clear_db_credentials()
         st.session_state["pending_question"] = None
         st.session_state["forced_table"] = None
         st.session_state["clarification_options"] = []
@@ -403,6 +410,81 @@ def _run_client_flow() -> None:
         st.error("The selected dataset could not be loaded. Please select another dataset.")
         return
 
+    connected = st.session_state.get("db_creds") is not None
+    if connected:
+        credentials = st.session_state["db_creds"]
+        location = (
+            f"{credentials.host}/{credentials.database}"
+            if credentials.host
+            else credentials.database
+        )
+        st.success(f"Connected to {location}")
+        if st.button("Disconnect", key="disconnect-db", icon=":material/link_off:"):
+            _clear_db_credentials()
+            st.session_state["ui_state"] = next_ui_state(
+                st.session_state["ui_state"], DATASET_CHANGED
+            )
+            st.session_state["pending_question"] = None
+            st.session_state["forced_table"] = None
+            st.session_state["clarification_options"] = []
+            st.session_state["retry_question"] = False
+            st.session_state["connection_notice"] = "Disconnected. Connect again to run a query."
+            st.rerun()
+    else:
+        notice = st.session_state.pop("connection_notice", None)
+        if notice:
+            st.info(notice)
+        error_message = st.session_state.pop("connection_error", None)
+        if error_message:
+            st.warning(error_message)
+        with st.form("db-connection-form"):
+            host = st.text_input("Host", value="localhost")
+            port = st.number_input(
+                "Port",
+                min_value=1,
+                value=(
+                    3306 if metadata.dialect == "mysql"
+                    else 5432 if metadata.dialect in {"postgres", "postgresql"}
+                    else 1
+                ),
+            )
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            database = st.text_input(
+                "Database",
+                help="For SQLite, enter the path to the read-only database file.",
+            )
+            connect = st.form_submit_button("Connect", type="primary")
+        if connect:
+            dialect = _execution_dialect(metadata.dialect)
+            new_credentials = DbCredentials(
+                dialect=dialect,
+                host="" if dialect == "sqlite" else host,
+                port=None if dialect == "sqlite" else int(port),
+                username="" if dialect == "sqlite" else username,
+                password="" if dialect == "sqlite" else password,
+                database=database,
+            )
+            try:
+                verify_connection(
+                    new_credentials,
+                    dataset_dialect=dialect,
+                    timeout_seconds=timeout_seconds,
+                )
+            except Exception as error:
+                LOGGER.warning("Connection verification failed: %s", type(error).__name__)
+                message = (
+                    str(error)
+                    if isinstance(error, DbConnectionError)
+                    else "The connection could not be verified. Check the details and try again."
+                )
+                st.session_state["connection_error"] = message
+            else:
+                st.session_state["db_creds"] = new_credentials
+                st.session_state["db_connected_at"] = time.time()
+                st.session_state.pop("connection_error", None)
+            st.rerun()
+
     if st.session_state.get("retry_question") and st.session_state.get("pending_question"):
         st.session_state["retry_question"] = False
         _process_question(
@@ -414,14 +496,20 @@ def _run_client_flow() -> None:
             dataset_metadata_path=str(
                 registry.dataset_directory(tenant_id, selected_id) / "dataset.json"
             ),
+            timeout_seconds=timeout_seconds,
             forced_table=st.session_state.get("forced_table"),
         )
 
     with st.form("question-form"):
         question = st.text_input(
-            "Search", placeholder="Ask a question about your data", key="question_input"
+            "Search",
+            placeholder="Ask a question about your data",
+            key="question_input",
+            disabled=not connected,
         )
-        submitted = st.form_submit_button("Search", type="primary")
+        submitted = st.form_submit_button(
+            "Search", type="primary", disabled=not connected
+        )
 
     if submitted:
         st.session_state["ui_state"] = next_ui_state(
@@ -444,6 +532,7 @@ def _run_client_flow() -> None:
                 dataset_metadata_path=str(
                     registry.dataset_directory(tenant_id, selected_id) / "dataset.json"
                 ),
+                timeout_seconds=timeout_seconds,
             )
 
     options = list(st.session_state.get("clarification_options") or [])
@@ -462,7 +551,7 @@ def _run_client_flow() -> None:
     ui_state = st.session_state.get("ui_state") or _initial_ui_state()
     pending = ui_state.get("pending")
 
-    # SQL preview + download render exactly once per run, before credentials.
+    # SQL preview + download render exactly once per run, before results.
     if pending is not None and pending.get("sql"):
         st.info("Your query is ready.")
         with st.expander("Show query", expanded=False, key="show-query-expander"):
@@ -478,82 +567,6 @@ def _run_client_flow() -> None:
     if ui_state.get("error"):
         st.warning(ui_state["error"])
 
-    stored = st.session_state.get("db_creds")
-    if stored:
-        st.success("Connected")
-        if st.button("Disconnect", key="disconnect-db", icon=":material/link_off:"):
-            st.session_state.pop("db_creds", None)
-            st.session_state["connection_notice"] = "Disconnected. Connect again to run a query."
-            st.rerun()
-    elif pending is not None:
-        notice = st.session_state.pop("connection_notice", None)
-        if notice:
-            st.info(notice)
-        with st.expander(
-            "Run this query on your database (optional)",
-            expanded=False,
-            key="query-execution-expander",
-        ):
-            with st.form("db-credentials-form"):
-                host = st.text_input("Host", value="localhost", key="db-host")
-                port = st.number_input(
-                    "Port",
-                    min_value=1,
-                    value=(
-                        3306 if metadata.dialect == "mysql"
-                        else 5432 if metadata.dialect in {"postgres", "postgresql"}
-                        else 1
-                    ),
-                    key="db-port",
-                )
-                username = st.text_input("Username", key="db-username")
-                password = st.text_input("Password", type="password", key="db-password")
-                database = st.text_input(
-                    "Database",
-                    help="For SQLite, enter the path to the read-only database file.",
-                    key="db-database",
-                )
-                connect = st.form_submit_button("Connect", type="primary")
-        if connect:
-            dialect = _execution_dialect(metadata.dialect)
-            credentials = DbCredentials(
-                dialect=dialect,
-                host="" if dialect == "sqlite" else host,
-                port=None if dialect == "sqlite" else int(port),
-                username="" if dialect == "sqlite" else username,
-                password="" if dialect == "sqlite" else password,
-                database=database,
-            )
-            try:
-                test_connection(credentials, timeout_seconds)
-                st.session_state["db_creds"] = {
-                    "credentials": credentials,
-                    "last_used": time.time(),
-                }
-                _execute_pending_query(timeout_seconds)
-            except DbConnectionError:
-                st.session_state.pop("db_creds", None)
-                st.session_state["ui_state"] = next_ui_state(
-                    ui_state,
-                    SUBMIT_FAIL,
-                    {"message": "The connection could not be verified. Check the details and try again."},
-                )
-            except Exception as error:
-                LOGGER.warning("Connection verification failed: %s", type(error).__name__)
-                st.session_state.pop("db_creds", None)
-                st.session_state["ui_state"] = next_ui_state(
-                    ui_state,
-                    SUBMIT_FAIL,
-                    {"message": "The connection could not be verified. Check the details and try again."},
-                )
-            st.rerun()
-
-    if stored and pending is not None and ui_state.get("result") is None:
-        with st.spinner("Running your query..."):
-            _execute_pending_query(timeout_seconds)
-        st.rerun()
-
-    ui_state = st.session_state.get("ui_state") or _initial_ui_state()
     result = ui_state.get("result")
     if result is not None:
         rows = result["rows"]

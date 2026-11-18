@@ -84,9 +84,9 @@ Simplify and restructure NLS around this flow:
 - No EXPLAIN and no DB connection during validation (schema.json only).
 
 ## 6. Execution and credentials (Step 4)
-- Ask for host, port, database name, username, password in an `st.form` ONLY after validation passes. No widget `key=` for credential fields (keys store values in `st.session_state`).
-- Support sqlite (read-only file), mysql (pymysql), postgres (psycopg) via runtime-built URLs.
-- Never store credentials in `.env`, session state after submission, logs, Qdrant, or prompts. Mask them in exception messages. Close the connection after use.
+- Ask for host, port, database name, username, password in an `st.form` after tenant and dataset selection, before any question. No widget `key=` for credential fields (keys store values in `st.session_state`).
+- Support sqlite (read-only file), mysql (pymysql), postgres (psycopg) via runtime-built URLs. Reject a dialect that does not match the uploaded `.sql`.
+- Keep credentials only in `st.session_state` as a `DbCredentials` object during the connected session. Never write them to `.env`, files, logs, Qdrant, or prompts. Mask them in exception messages and `str`/`repr`. Clear on Disconnect, tenant change, and dataset change. Close the connection after use.
 - Read-only transaction and query timeout (Postgres `SET TRANSACTION READ ONLY` + `statement_timeout`; MySQL `max_execution_time`; SQLite `mode=ro` + `PRAGMA query_only`). Paginate results in the UI. README must tell users to connect with a SELECT-only DB role.
 - Show result rows in the UI. Never send rows to Groq. Any summary uses only column names and row count.
 - Log each executed query: tenant, dataset, SQL with literals replaced by placeholders, timestamp, row count, duration. Never log credentials or row data.
@@ -107,7 +107,7 @@ Simplify and restructure NLS around this flow:
 - Embeddings: prefer `fastembed` (384-dim) over `sentence-transformers` unless the project already depends on the latter.
 - Final UI must be client friendly, not developer friendly: show only what a
   client can use (upload, question box, results table, plain-language
-  messages, credentials form after validation). Hide dialect override, model
+  messages, connection form before questions). Hide dialect override, model
   names, scores, flags, document counts and raw errors, or put them in a
   collapsed "Advanced" section. Generated SQL only in a collapsed "Show query".
 

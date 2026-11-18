@@ -53,7 +53,7 @@ def test_fresh_load_shows_only_tenant_label(monkeypatch, tmp_path):
 
 
 @pytest.mark.skipif(not HAS_APPTEST, reason="AppTest is not available")
-def test_pending_sql_renders_once_and_credentials_only_after(monkeypatch, tmp_path):
+def test_pending_sql_renders_once_with_connection_first(monkeypatch, tmp_path):
     from ingestion.datasets import DatasetRegistry
 
     dataset_root = tmp_path / "datasets"
@@ -99,4 +99,9 @@ def test_pending_sql_renders_once_and_credentials_only_after(monkeypatch, tmp_pa
     assert [code.value for code in at.code] == ["SELECT * FROM items"]
     labels = {widget.label for widget in at.text_input}
     assert {"Host", "Username", "Password", "Database"} <= labels
-    assert any(button.label == "Connect" for button in at.form_submit_button)
+    assert [button for button in at.form_submit_button if button.label == "Connect"]
+    search_buttons = [
+        button for button in at.form_submit_button if button.label == "Search"
+    ]
+    assert search_buttons[0].proto.disabled is True
+    assert at.text_input(key="question_input").proto.disabled is True
